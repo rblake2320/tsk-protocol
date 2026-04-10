@@ -8,7 +8,7 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "test": "npx jest --experimental-vm-modules",
+    "test": "npx tsx test-suite.mts && npx tsx attack-suite.mts && npx tsx adversarial-proof.mts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {

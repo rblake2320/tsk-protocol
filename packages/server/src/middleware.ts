@@ -88,9 +88,21 @@ export async function verifyTSKRequest(
     });
   }
 
-  // 7. Advance HOTP counters on success
+  // 7. Advance HOTP counters on success — use CAS (consumeCounter) when available
+  // to prevent replay under concurrent requests. Fall back to updateCounters.
   if (result.ok && result.counterUpdates && result.counterUpdates.size > 0) {
-    await store.updateCounters(clientIdRaw, result.counterUpdates);
+    if (store.consumeCounter) {
+      for (const [segmentId, newCounter] of result.counterUpdates) {
+        // CAS: expectedCounter is newCounter - 1 (the value before validation)
+        const cas = await store.consumeCounter(clientIdRaw, segmentId, newCounter - 1);
+        if (!cas) {
+          // Counter was already consumed by a concurrent request — treat as replay
+          return { ok: false, error: 'TSK_HOTP_REPLAY_DETECTED', clientId: clientIdRaw };
+        }
+      }
+    } else {
+      await store.updateCounters(clientIdRaw, result.counterUpdates);
+    }
   }
 
   if (!result.ok) {

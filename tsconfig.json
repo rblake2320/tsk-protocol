@@ -10,7 +10,14 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "outDir": "dist"
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": {
+      "@tsk/core": ["packages/core/src/index.ts"],
+      "@tsk/server": ["packages/server/src/index.ts"],
+      "@tsk/client": ["packages/client-sdk/src/index.ts"],
+      "@tsk/bpc-bridge": ["packages/bpc-bridge/src/index.ts"]
+    }
   },
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }
