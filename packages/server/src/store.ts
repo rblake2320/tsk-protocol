@@ -20,7 +20,17 @@ export interface TumblerMapStore {
   list(): Promise<string[]>;
   /** Update HOTP counter values after successful validation */
   updateCounters(clientId: string, updates: Map<string, number>): Promise<void>;
-  /** Optional CAS for HOTP counter — prevents replay under concurrency */
+  /**
+   * Atomic compare-and-swap for HOTP counter — prevents replay under concurrency.
+   * Returns true if counter was at expectedCounter and has been atomically advanced.
+   * Returns false if counter has already moved (concurrent duplicate request = replay).
+   *
+   * PRODUCTION REQUIREMENT: implement this on all stores used in multi-server or
+   * high-concurrency deployments. Without it, the middleware falls back to the
+   * non-atomic updateCounters(), which has a validate→update race window.
+   * MemoryTumblerStore implements it. PgTumblerStore should use SELECT FOR UPDATE.
+   * RedisTumblerStore should use a Lua CAS script.
+   */
   consumeCounter?(clientId: string, segmentId: string, expectedCounter: number): Promise<boolean>;
 }
 

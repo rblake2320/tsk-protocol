@@ -47,8 +47,8 @@ export interface UltraVerifyResult {
 export interface UltraVerifyOptions {
   tskStore: TumblerMapStore;
   tskConfig?: TSKServerConfig;
-  /** Optional: resolve pairId -> expected TSK clientId. If provided, mismatch = rejection. */
-  identityBinding?: {
+  /** Required: resolve BPC pairId -> expected TSK clientId. Mismatch = rejection. */
+  identityBinding: {
     resolve: (pairId: string) => Promise<string | null>;
   };
 }
@@ -63,7 +63,7 @@ export interface UltraVerifyOptions {
  * Example:
  *   const result = await verifyUltraRequest(req,
  *     (r) => verifyBPCRequest(r, registry, nonceStore, anomaly, bpcConfig),
- *     { tskStore }
+ *     { tskStore, identityBinding }
  *   );
  */
 export async function verifyUltraRequest(
@@ -92,17 +92,26 @@ export async function verifyUltraRequest(
     };
   }
 
-  // Identity binding: verify BPC pairId and TSK clientId belong to the same principal
-  if (options.identityBinding && bpcResult.pairId && tskResult.clientId) {
-    const expectedClientId = await options.identityBinding.resolve(bpcResult.pairId);
-    if (expectedClientId !== tskResult.clientId) {
-      return {
-        ok: false,
-        pairId: bpcResult.pairId,
-        error: 'IDENTITY_BINDING_MISMATCH',
-        layers: ['bpc', 'tsk'],
-      };
-    }
+  // Identity binding: BPC and TSK must resolve to the same principal.
+  if (!bpcResult.pairId || !tskResult.clientId) {
+    return {
+      ok: false,
+      pairId: bpcResult.pairId,
+      clientId: tskResult.clientId,
+      error: 'IDENTITY_BINDING_UNAVAILABLE',
+      layers: ['bpc', 'tsk'],
+    };
+  }
+
+  const expectedClientId = await options.identityBinding.resolve(bpcResult.pairId);
+  if (expectedClientId !== tskResult.clientId) {
+    return {
+      ok: false,
+      pairId: bpcResult.pairId,
+      clientId: tskResult.clientId,
+      error: 'IDENTITY_BINDING_MISMATCH',
+      layers: ['bpc', 'tsk'],
+    };
   }
 
   return {
