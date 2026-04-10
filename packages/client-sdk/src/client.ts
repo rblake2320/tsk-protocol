@@ -87,9 +87,10 @@ export class TSKClient {
       }
     }
 
-    // Build key: concatenate segment values in segment order, then checksum
-    const segmentParts = this.payload.clientSegments
-      .map(seg => values.get(seg.segmentId) ?? '');
+    // Build key: use segmentOrder for correct positional assembly (if available)
+    const orderedSegmentIds = this.payload.segmentOrder ??
+      this.payload.clientSegments.map(s => s.segmentId);
+    const segmentParts = orderedSegmentIds.map(id => values.get(id) ?? '');
     const keyWithoutChecksum = segmentParts.join('');
     const checksum = hmacFn(this.sharedSecret, `checksum:${keyWithoutChecksum}`).slice(0, 8);
     const key = keyWithoutChecksum + checksum;

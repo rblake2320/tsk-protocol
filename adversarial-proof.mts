@@ -26,7 +26,7 @@ const map = generateTumblerMap({ keyLength: 52, minTumblers: 2, maxTumblers: 4 }
 const NOW = Date.now();
 
 // Generate a valid key at time NOW
-function validKey(nowMs = NOW): string {
+async function validKey(nowMs = NOW): Promise<string> {
   const { generateKeyFromMap } = await import('./packages/core/src/key-gen.js');
   return generateKeyFromMap(map, nowMs);
 }
@@ -115,7 +115,7 @@ console.log('\n[Attack 5] Stolen Key Structural Analysis — attacker tries to i
   const { generateKeyFromMap } = await import('./packages/core/src/key-gen.js');
   // Generate two keys 30 seconds apart — attacker XORs to find which chars changed
   const key1 = generateKeyFromMap(map, NOW);
-  const key2 = generateKeyFromMap(map, NOW + 60_000); // 60s later
+  const key2 = generateKeyFromMap(map, NOW + 5 * 60_000); // 5 minutes later
 
   // Which positions changed?
   const changedPositions: number[] = [];
@@ -129,7 +129,7 @@ console.log('\n[Attack 5] Stolen Key Structural Analysis — attacker tries to i
   ).join('');
 
   // At NOW+60000, key1's segments are expired — hybrid key with old rotating values should fail
-  const result = validateTSKKey(hybridKey, { map, nowMs: NOW + 60_000 });
+  const result = validateTSKKey(hybridKey, { map, nowMs: NOW + 5 * 60_000 });
   assert('Hybrid key with expired rotating segments rejected', !result.ok,
     'Structural analysis + replay attempt correctly blocked');
 }

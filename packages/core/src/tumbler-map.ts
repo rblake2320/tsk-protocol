@@ -6,6 +6,7 @@
  * and timing parameters (not the positions), which is the "structural secrecy" property.
  */
 
+import { randomInt } from 'node:crypto';
 import type { TumblerMap, SegmentConfig, TSKProvisionPayload, ClientSegmentConfig } from './types.js';
 import { generateSharedSecret, generateSegmentId, generateClientId } from './crypto.js';
 import { hmac } from './crypto.js';
@@ -37,7 +38,7 @@ export function generateTumblerMap(
   const sharedSecret = generateSharedSecret();
 
   // Decide how many rotating segments (between min and max)
-  const numTumblers = minTumblers + Math.floor(Math.random() * (maxTumblers - minTumblers + 1));
+  const numTumblers = minTumblers + randomInt(0, maxTumblers - minTumblers + 1);
 
   // Reserve last 8 chars for checksum
   const checksumLen = 8;
@@ -58,8 +59,8 @@ export function generateTumblerMap(
       };
     }
     // Randomly assign TOTP or HOTP
-    const isTotp = Math.random() > 0.3; // 70% TOTP, 30% HOTP
-    const windowSec = allowedWindows[Math.floor(Math.random() * allowedWindows.length)];
+    const isTotp = randomInt(0, 10) > 2; // 70% TOTP, 30% HOTP (values 3-9 = true)
+    const windowSec = allowedWindows[randomInt(0, allowedWindows.length)];
     return {
       segmentId: segId,
       position: pos,
@@ -85,10 +86,14 @@ export function generateTumblerMap(
  * This is what gets delivered to the client at provisioning.
  */
 export function toProvisionPayload(map: TumblerMap): TSKProvisionPayload {
+  // Sort segments by position to get correct assembly order
+  const sortedSegments = [...map.segments].sort((a, b) => a.position[0] - b.position[0]);
+
   const clientSegments: ClientSegmentConfig[] = map.segments.map(seg => {
     const cs: ClientSegmentConfig = {
       segmentId: seg.segmentId,
       type: seg.type,
+      length: seg.position[1] - seg.position[0],  // segment length in chars
     };
     if (seg.type === 'totp') cs.windowSec = seg.windowSec;
     if (seg.type === 'hotp') cs.initialCounter = seg.counter ?? 0;
@@ -99,6 +104,7 @@ export function toProvisionPayload(map: TumblerMap): TSKProvisionPayload {
     clientId: map.clientId,
     clientSegments,
     keyLength: map.keyLength,
+    segmentOrder: sortedSegments.map(s => s.segmentId),  // segmentIds in position order
     createdAt: map.createdAt,
     version: '1',
   };
@@ -134,7 +140,7 @@ function randomNonOverlappingSegments(
     const ideal = i * baseSize;
     // Jitter ±25% of base size but keep at least 2 chars per segment
     const maxJitter = Math.floor(baseSize * 0.25);
-    const jitter = Math.floor(Math.random() * (maxJitter * 2 + 1)) - maxJitter;
+    const jitter = randomInt(0, maxJitter * 2 + 1) - maxJitter;
     const boundary = Math.max(boundaries[i - 1] + 2, Math.min(totalLength - (count - i) * 2, ideal + jitter));
     boundaries.push(boundary);
   }
@@ -143,7 +149,7 @@ function randomNonOverlappingSegments(
   // Shuffle boundaries (except 0 and end) to randomize which segment gets which slot
   const midBoundaries = boundaries.slice(1, -1);
   for (let i = midBoundaries.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = randomInt(0, i + 1);
     [midBoundaries[i], midBoundaries[j]] = [midBoundaries[j], midBoundaries[i]];
   }
   // Re-sort to maintain valid non-overlapping ranges
