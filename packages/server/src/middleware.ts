@@ -1,0 +1,107 @@
+/**
+ * TSK Protocol — Server Validation Middleware
+ *
+ * Validates an inbound TSK key from the X-TSK-Key header.
+ * This is the primary server-side entry point.
+ *
+ * Header format:
+ *   X-TSK-Client-ID: tsk_<clientId>
+ *   X-TSK-Key: <assembled key string>
+ *   X-TSK-Version: 1
+ */
+
+import { validateTSKKey, type TSKConfig } from '@tsk/core';
+import type { TumblerMapStore } from './store.js';
+import type { AnomalyEngine } from './anomaly.js';
+
+export const TSK_HEADERS = {
+  CLIENT_ID: 'x-tsk-client-id',
+  KEY: 'x-tsk-key',
+  VERSION: 'x-tsk-version',
+} as const;
+
+export const TSK_PROTOCOL_VERSION = '1';
+export const TSK_MAX_KEY_HEADER_BYTES = 1024;
+
+export interface TSKRequestData {
+  headers: Record<string, string | string[] | undefined>;
+}
+
+export interface TSKServerConfig {
+  config?: TSKConfig;
+  anomaly?: AnomalyEngine;
+  ipAddress?: string;
+}
+
+export interface TSKVerifyResult {
+  ok: boolean;
+  clientId?: string;
+  error?: string;
+}
+
+/**
+ * Verify a TSK request.
+ * Pure function — no side effects except anomaly recording and HOTP counter updates.
+ */
+export async function verifyTSKRequest(
+  req: TSKRequestData,
+  store: TumblerMapStore,
+  options: TSKServerConfig = {},
+): Promise<TSKVerifyResult> {
+  const { config, anomaly, ipAddress } = options;
+
+  // 1. Check required headers
+  const clientIdRaw = getHeader(req, TSK_HEADERS.CLIENT_ID);
+  const keyRaw = getHeader(req, TSK_HEADERS.KEY);
+  const versionRaw = getHeader(req, TSK_HEADERS.VERSION);
+
+  if (!clientIdRaw || !keyRaw) {
+    return { ok: false, error: 'TSK_HEADERS_MISSING' };
+  }
+
+  // 2. Protocol version
+  if (versionRaw && versionRaw !== TSK_PROTOCOL_VERSION) {
+    return { ok: false, error: 'TSK_VERSION_UNSUPPORTED' };
+  }
+
+  // 3. Size guard (prevent oversized header DoS)
+  if (keyRaw.length > TSK_MAX_KEY_HEADER_BYTES) {
+    return { ok: false, error: 'TSK_KEY_TOO_LARGE' };
+  }
+
+  // 4. Look up tumbler map
+  const map = await store.get(clientIdRaw);
+  if (!map) {
+    return { ok: false, error: 'TSK_CLIENT_NOT_FOUND' };
+  }
+
+  // 5. Validate key
+  const result = validateTSKKey(keyRaw, { map, config });
+
+  // 6. Record anomaly if failed
+  if (!result.ok && anomaly && result.segmentResults) {
+    anomaly.record({
+      clientId: clientIdRaw,
+      timestamp: Date.now(),
+      segmentResults: result.segmentResults,
+      ipAddress,
+    });
+  }
+
+  // 7. Advance HOTP counters on success
+  if (result.ok && result.counterUpdates && result.counterUpdates.size > 0) {
+    await store.updateCounters(clientIdRaw, result.counterUpdates);
+  }
+
+  if (!result.ok) {
+    return { ok: false, error: result.error ?? 'TSK_VALIDATION_FAILED', clientId: clientIdRaw };
+  }
+
+  return { ok: true, clientId: result.clientId };
+}
+
+function getHeader(req: TSKRequestData, name: string): string | undefined {
+  const val = req.headers[name];
+  if (Array.isArray(val)) return val[0];
+  return val;
+}

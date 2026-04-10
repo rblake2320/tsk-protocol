@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "paths": {
+      "@tsk/core": ["../core/src/index.ts"],
+      "@tsk/server": ["../server/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*"]
+}
