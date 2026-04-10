@@ -12,7 +12,8 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "npx tsx ../../ultra-bridge-test.mts"
   },
   "dependencies": {
     "@tsk/core": "*",
