@@ -20,6 +20,8 @@ export interface TumblerMapStore {
   list(): Promise<string[]>;
   /** Update HOTP counter values after successful validation */
   updateCounters(clientId: string, updates: Map<string, number>): Promise<void>;
+  /** Optional CAS for HOTP counter — prevents replay under concurrency */
+  consumeCounter?(clientId: string, segmentId: string, expectedCounter: number): Promise<boolean>;
 }
 
 /**
@@ -53,5 +55,14 @@ export class MemoryTumblerStore implements TumblerMapStore {
         seg.counter = newCounter;
       }
     }
+  }
+
+  async consumeCounter(clientId: string, segmentId: string, expectedCounter: number): Promise<boolean> {
+    const map = this.maps.get(clientId);
+    if (!map) return false;
+    const seg = map.segments.find(s => s.segmentId === segmentId);
+    if (!seg || seg.counter !== expectedCounter) return false;
+    seg.counter = expectedCounter + 1;
+    return true;
   }
 }

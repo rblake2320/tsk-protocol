@@ -47,6 +47,8 @@ export interface TSKProvisionPayload {
   clientSegments: ClientSegmentConfig[];
   /** Total key length (client needs this to allocate the buffer) */
   keyLength: number;
+  /** segmentIds in position order — for correct positional key assembly on the client */
+  segmentOrder?: string[];
   /** Provisioned at timestamp */
   createdAt: number;
   /** Version */
@@ -61,6 +63,8 @@ export interface ClientSegmentConfig {
   windowSec?: number;
   /** Initial HOTP counter (increments on each use) */
   initialCounter?: number;
+  /** Segment length in characters */
+  length?: number;
 }
 
 export interface TSKValidationResult {
