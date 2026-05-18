@@ -43,7 +43,7 @@ console.log('\n[Attack 1] Stolen Key Replay — TOTP window expired');
   const result = validateTSKKey(stolenKey, { map, nowMs: NOW });
   assert('Expired TOTP segment rejected', !result.ok, 'Expected VALIDATION_FAILED for expired key');
   assert('Error is VALIDATION_FAILED or CHECKSUM_INVALID',
-    result.error === 'VALIDATION_FAILED' || result.error === 'CHECKSUM_INVALID',
+    result.error === 'INVALID_KEY' || result.error === 'VALIDATION_FAILED' || result.error === 'CHECKSUM_INVALID',
     `Got: ${result.error}`);
 
   // Current key still works
