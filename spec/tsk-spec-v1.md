@@ -99,9 +99,9 @@ interface TumblerMap {
 The client receives a **provision payload** that contains:
 - `clientId`
 - Segment IDs, types, and timing parameters
-- **Positions are omitted**
+- **Positions, lengths, and segment ordering are strictly omitted**
 
-The server uses its stored positions to validate incoming keys. The client generates segment values and the server maps them to positions. An attacker who compromises the client only learns which segments exist and their types — not where they appear in the key string.
+The server uses its stored positions to validate incoming keys. The client generates segment values as an unordered map and the server assembles them. An attacker who compromises the client only learns which segments exist and their types — not where they appear in the key string, nor their lengths.
 
 ### 4.2 Tumbler Map Generation
 
@@ -172,7 +172,7 @@ All comparisons use constant-time byte comparison (Node.js `crypto.timingSafeEqu
 ## 8. Security Properties
 
 ### 8.1 Replay Attack Resistance
-TOTP segments expire after their window (30-300 seconds). HOTP segments can only be used once. A key captured and replayed after the shortest segment's window expires is rejected.
+TOTP segments expire after their window (30-300 seconds). HOTP segments can only be used once. A key captured and replayed after the shortest segment's window expires is rejected. The HOTP implementation uses an atomic Compare-And-Swap (CAS) operation (`consumeCounter`) to ensure that concurrent replay attacks (e.g., submitting the same valid HOTP key simultaneously across multiple threads) are blocked.
 
 ### 8.2 Partial Key Leakage
 An attacker who learns part of the key cannot reconstruct the full key. Without knowing segment positions, they cannot determine which characters are live vs. expired vs. static.
@@ -181,7 +181,7 @@ An attacker who learns part of the key cannot reconstruct the full key. Without 
 The format of the key — which positions rotate, at what rate, how many segments exist — is a server-side secret. This is a novel security property with no equivalent in existing standards.
 
 ### 8.4 Brute Force Resistance
-An attacker must correctly guess both the segment values (HMAC output space) and their correct positions (O(keyLength^numSegments) combinations). For a 52-char key with 3 segments, there are ~17,000+ positional arrangements, each requiring a correct HMAC value.
+An attacker must correctly guess both the segment values (HMAC output space) and their correct positions. The number of valid positional arrangements is given by `C(L - S + N, N)` where `L` is key length, `S` is sum of segment lengths, and `N` is number of segments. For a 512-character key with 5 segments, the search space for positions alone is massive. Furthermore, the checksum validation (12 chars = 72 bits of entropy) rejects `1 - (1/2^72)` of all brute force attempts with a single HMAC operation, preventing the attacker from forcing the server to perform expensive per-segment positional brute-forcing.
 
 ### 8.5 Stolen Key Detection via Anomaly Analysis
 Per-segment validation results feed the anomaly engine:
@@ -269,6 +269,7 @@ The secret should be stored in:
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-04-09 | Initial specification |
+| 1.1 | 2026-05-18 | IL4/5/6/7 Hardening: Fixed structural secrecy (removed lengths/order from payload), upgraded checksum to 72 bits, added checksum-first validation, added atomic HOTP CAS, added bounded memory and IP tracking to anomaly engine. |
 
 ---
 

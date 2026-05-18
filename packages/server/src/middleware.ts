@@ -92,16 +92,23 @@ export async function verifyTSKRequest(
   // to prevent replay under concurrent requests. Fall back to updateCounters.
   if (result.ok && result.counterUpdates && result.counterUpdates.size > 0) {
     if (store.consumeCounter) {
-      for (const [segmentId, newCounter] of result.counterUpdates) {
-        // CAS: expectedCounter is newCounter - 1 (the value before validation)
-        const cas = await store.consumeCounter(clientIdRaw, segmentId, newCounter - 1);
+      for (const [segmentId, update] of result.counterUpdates) {
+        // CAS: use matchedCounter as expectedCounter (the exact value that was matched
+        // during validation). This correctly handles lookahead scenarios where the
+        // matched counter may be > storedCounter (e.g., counter+3 matched with stored=0).
+        const cas = await store.consumeCounter(clientIdRaw, segmentId, update.matchedCounter);
         if (!cas) {
           // Counter was already consumed by a concurrent request — treat as replay
           return { ok: false, error: 'TSK_HOTP_REPLAY_DETECTED', clientId: clientIdRaw };
         }
       }
     } else {
-      await store.updateCounters(clientIdRaw, result.counterUpdates);
+      // Fallback: build a plain Map<string, number> for updateCounters
+      const plainUpdates = new Map<string, number>();
+      for (const [segmentId, update] of result.counterUpdates) {
+        plainUpdates.set(segmentId, update.newCounter);
+      }
+      await store.updateCounters(clientIdRaw, plainUpdates);
     }
   }
 

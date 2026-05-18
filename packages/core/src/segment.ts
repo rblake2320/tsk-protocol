@@ -1,5 +1,5 @@
 /**
- * TSK Protocol — Segment Value Generation
+ * TSK Protocol — Segment Value Generation (IL4/5/6/7 Hardened)
  *
  * Each segment in the tumbler map derives its value from HMAC(sharedSecret, derivationInput).
  * The derivation input encodes the segment type and its temporal/counter factor.
@@ -9,9 +9,14 @@
  * HOTP:    derivationInput = "hotp:<segmentId>:<counter>"  (counter increments per use)
  *
  * The segment value is a slice of the HMAC output, sized to fill the segment's position range.
+ *
+ * SECURITY FIX (IL4/5/6/7): padOrTruncate now uses hmacRaw with the original secret Buffer
+ * instead of calling hmac(hmacOutput, ...) which would fail secret validation (HMAC output
+ * is base64url, not a valid 64-char hex secret). The original implementation had a latent
+ * bug where the recursive padding call used the HMAC output as the key — now fixed to always
+ * use the original sharedSecret for all HMAC operations.
  */
-
-import { hmac } from './crypto.js';
+import { hmac, hmacRaw, validateHexSecret } from './crypto.js';
 import type { SegmentConfig } from './types.js';
 
 /**
@@ -25,7 +30,6 @@ export function deriveSegmentValue(
 ): string {
   const segLen = seg.position[1] - seg.position[0];
   let derivationInput: string;
-
   if (seg.type === 'static') {
     derivationInput = `static:${seg.segmentId}`;
   } else if (seg.type === 'totp') {
@@ -37,10 +41,9 @@ export function deriveSegmentValue(
     const counter = seg.counter ?? 0;
     derivationInput = `hotp:${seg.segmentId}:${counter}`;
   }
-
-  const full = hmac(sharedSecret, derivationInput);
-  // Wrap around if segment is longer than one HMAC output by hashing again
-  return padOrTruncate(full, segLen);
+  const secretBuf = toSecretBuf(sharedSecret);
+  const full = hmacRaw(secretBuf, derivationInput);
+  return padOrTruncate(secretBuf, full, segLen);
 }
 
 /**
@@ -54,7 +57,8 @@ export function deriveSegmentForWindow(
 ): string {
   const segLen = seg.position[1] - seg.position[0];
   const derivationInput = `totp:${seg.segmentId}:${T}`;
-  return padOrTruncate(hmac(sharedSecret, derivationInput), segLen);
+  const secretBuf = toSecretBuf(sharedSecret);
+  return padOrTruncate(secretBuf, hmacRaw(secretBuf, derivationInput), segLen);
 }
 
 /**
@@ -68,19 +72,37 @@ export function deriveSegmentForCounter(
 ): string {
   const segLen = seg.position[1] - seg.position[0];
   const derivationInput = `hotp:${seg.segmentId}:${counter}`;
-  return padOrTruncate(hmac(sharedSecret, derivationInput), segLen);
+  const secretBuf = toSecretBuf(sharedSecret);
+  return padOrTruncate(secretBuf, hmacRaw(secretBuf, derivationInput), segLen);
+}
+
+/**
+ * Convert a validated hex secret string to a Buffer.
+ * Validates the secret first to prevent silent key collapse.
+ */
+function toSecretBuf(sharedSecret: string): Buffer {
+  validateHexSecret(sharedSecret);
+  return Buffer.from(sharedSecret, 'hex');
 }
 
 /**
  * Pad or truncate a base64url string to exactly `length` characters.
  * base64url uses [A-Za-z0-9_-] — safe for key strings.
+ *
+ * SECURITY FIX: Uses the original sharedSecret Buffer for all HMAC operations
+ * in the padding loop, NOT the HMAC output (which is not a valid hex secret).
+ * This ensures consistent key material across all padding rounds.
  */
-function padOrTruncate(s: string, length: number): string {
+function padOrTruncate(secretBuf: Buffer, s: string, length: number): string {
   if (s.length >= length) return s.slice(0, length);
-  // Need more chars: repeat hash
+  // Need more chars: chain HMAC rounds using the original secret
+  // Each round: hmacRaw(originalSecret, "pad:<round>:<previousOutput>")
+  // This is deterministic, uses the original key, and produces high-entropy output.
   let result = s;
+  let round = 0;
   while (result.length < length) {
-    result += hmac(s, result);
+    result += hmacRaw(secretBuf, `pad:${round}:${result}`);
+    round++;
   }
   return result.slice(0, length);
 }

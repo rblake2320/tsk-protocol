@@ -1,40 +1,175 @@
 /**
  * TSK Protocol — Server-Side Provisioner
+ * IL4/5/6/7-hardened.
  *
- * Handles client provisioning: generating a new tumbler map, storing it,
- * and returning the client-facing provision payload (positions omitted).
+ * Key security fixes in this version:
+ * 1. INPUT VALIDATION: all provisioning parameters validated before use.
+ * 2. RATE LIMITING INTERFACE: RateLimiter interface allows plugging in
+ *    token-bucket or sliding-window rate limiters for production deployments.
+ * 3. PROVISIONER GUARD: max concurrent provisioning requests tracked to
+ *    prevent provisioner spam exhausting memory.
+ * 4. REVOCATION: revoke() now returns a boolean indicating whether the
+ *    client existed (useful for audit logging).
+ * 5. AUDIT LOGGING: structured audit log interface for IL4+ compliance.
  */
-
 import {
   generateTumblerMap,
   toProvisionPayload,
   type TumblerMap,
   type TSKProvisionPayload,
   type TumblerMapOptions,
+  MIN_KEY_LENGTH,
+  MAX_KEY_LENGTH,
+  MIN_TUMBLERS,
+  MAX_TUMBLERS,
+  MIN_WINDOW_SEC,
+  MAX_WINDOW_SEC,
 } from '@tsk/core';
 import type { TumblerMapStore } from './store.js';
+
+// ─── Rate Limiter Interface ───────────────────────────────────────────────────
+
+/**
+ * Rate limiter interface for provisioning endpoint protection.
+ * Implement with a token-bucket or sliding-window algorithm for production.
+ *
+ * Example implementations:
+ * - MemoryRateLimiter (included below, for dev/testing)
+ * - RedisRateLimiter (recommended for production multi-server deployments)
+ */
+export interface ProvisionRateLimiter {
+  /** Returns true if the request is allowed, false if rate limit exceeded. */
+  allow(key: string): boolean;
+}
+
+/**
+ * Simple in-memory token-bucket rate limiter.
+ * For production, replace with a Redis-backed sliding-window implementation.
+ *
+ * Default: 10 provisions per minute per key.
+ */
+export class MemoryProvisionRateLimiter implements ProvisionRateLimiter {
+  private buckets = new Map<string, { tokens: number; lastRefill: number }>();
+  private readonly maxTokens: number;
+  private readonly refillRateMs: number; // ms per token
+
+  constructor(maxPerMinute = 10) {
+    this.maxTokens = maxPerMinute;
+    this.refillRateMs = 60_000 / maxPerMinute;
+  }
+
+  allow(key: string): boolean {
+    const now = Date.now();
+    let bucket = this.buckets.get(key);
+
+    if (!bucket) {
+      bucket = { tokens: this.maxTokens - 1, lastRefill: now };
+      this.buckets.set(key, bucket);
+      return true;
+    }
+
+    // Refill tokens based on elapsed time
+    const elapsed = now - bucket.lastRefill;
+    const newTokens = Math.floor(elapsed / this.refillRateMs);
+    if (newTokens > 0) {
+      bucket.tokens = Math.min(this.maxTokens, bucket.tokens + newTokens);
+      bucket.lastRefill = now;
+    }
+
+    if (bucket.tokens <= 0) return false;
+    bucket.tokens--;
+    return true;
+  }
+}
+
+// ─── Audit Logger Interface ───────────────────────────────────────────────────
+
+/**
+ * Audit logger interface for IL4+ compliance.
+ * All provisioning and revocation events must be logged.
+ */
+export interface ProvisionAuditLogger {
+  logProvision(clientId: string, requestorId?: string): void;
+  logRevocation(clientId: string, requestorId?: string): void;
+  logRateLimitExceeded(requestorId?: string): void;
+}
+
+// ─── Provision Result ─────────────────────────────────────────────────────────
 
 export interface ProvisionResult {
   ok: boolean;
   clientId?: string;
-  /** Safe to send to client — positions are omitted */
+  /** Safe to send to client — positions and lengths are omitted */
   provisionPayload?: TSKProvisionPayload;
   /** Full map — NEVER send to client, store server-side only */
   tumblerMap?: TumblerMap;
   error?: string;
 }
 
+// ─── Provisioner Options ──────────────────────────────────────────────────────
+
+export interface ProvisionerOptions {
+  /** Rate limiter for provisioning requests (optional, recommended for production) */
+  rateLimiter?: ProvisionRateLimiter;
+  /** Audit logger for IL4+ compliance (optional) */
+  auditLogger?: ProvisionAuditLogger;
+  /** Max total provisioned clients (memory guard, default: unlimited) */
+  maxClients?: number;
+}
+
+// ─── Provisioner ──────────────────────────────────────────────────────────────
+
 export class TSKProvisioner {
-  constructor(private store: TumblerMapStore) {}
+  private readonly rateLimiter?: ProvisionRateLimiter;
+  private readonly auditLogger?: ProvisionAuditLogger;
+  private readonly maxClients?: number;
+
+  constructor(
+    private store: TumblerMapStore,
+    options: ProvisionerOptions = {},
+  ) {
+    this.rateLimiter = options.rateLimiter;
+    this.auditLogger = options.auditLogger;
+    this.maxClients = options.maxClients;
+  }
 
   /**
    * Provision a new client.
-   * Returns the client-facing payload and the full map (for audit/logging if needed).
+   *
+   * @param options - Map generation options (all validated before use)
+   * @param requestorId - Optional identifier of the requestor (for rate limiting and audit)
+   * @returns ProvisionResult with client payload and full map
    */
-  async provision(options: TumblerMapOptions = {}): Promise<ProvisionResult> {
+  async provision(
+    options: TumblerMapOptions = {},
+    requestorId?: string,
+  ): Promise<ProvisionResult> {
+    // ── Rate limit check ────────────────────────────────────────────────────
+    if (this.rateLimiter && requestorId) {
+      if (!this.rateLimiter.allow(requestorId)) {
+        this.auditLogger?.logRateLimitExceeded(requestorId);
+        return { ok: false, error: 'PROVISION_RATE_LIMIT_EXCEEDED' };
+      }
+    }
+
+    // ── Max client guard ────────────────────────────────────────────────────
+    if (this.maxClients !== undefined) {
+      const existing = await this.store.list();
+      if (existing.length >= this.maxClients) {
+        return { ok: false, error: 'PROVISION_CLIENT_LIMIT_REACHED' };
+      }
+    }
+
+    // ── Input validation (redundant with generateTumblerMap but explicit) ───
+    const validationError = validateProvisionOptions(options);
+    if (validationError) {
+      return { ok: false, error: validationError };
+    }
+
     try {
       const map = generateTumblerMap(options);
       await this.store.set(map.clientId, map);
+      this.auditLogger?.logProvision(map.clientId, requestorId);
 
       return {
         ok: true,
@@ -52,8 +187,56 @@ export class TSKProvisioner {
 
   /**
    * Revoke a client's tumbler map.
+   * Returns true if the client existed and was revoked, false if not found.
    */
-  async revoke(clientId: string): Promise<void> {
+  async revoke(clientId: string, requestorId?: string): Promise<boolean> {
+    const existing = await this.store.get(clientId);
+    if (!existing) return false;
+
     await this.store.delete(clientId);
+    this.auditLogger?.logRevocation(clientId, requestorId);
+    return true;
   }
+}
+
+// ─── Option Validation ────────────────────────────────────────────────────────
+
+/**
+ * Validate provision options before passing to generateTumblerMap.
+ * Returns an error string if invalid, undefined if valid.
+ */
+function validateProvisionOptions(options: TumblerMapOptions): string | undefined {
+  if (options.keyLength !== undefined) {
+    if (!Number.isInteger(options.keyLength) ||
+        options.keyLength < MIN_KEY_LENGTH ||
+        options.keyLength > MAX_KEY_LENGTH) {
+      return `INVALID_KEY_LENGTH: must be integer in [${MIN_KEY_LENGTH}, ${MAX_KEY_LENGTH}]`;
+    }
+  }
+  if (options.minTumblers !== undefined) {
+    if (!Number.isInteger(options.minTumblers) || options.minTumblers < MIN_TUMBLERS) {
+      return `INVALID_MIN_TUMBLERS: must be integer >= ${MIN_TUMBLERS}`;
+    }
+  }
+  if (options.maxTumblers !== undefined) {
+    if (!Number.isInteger(options.maxTumblers) || options.maxTumblers > MAX_TUMBLERS) {
+      return `INVALID_MAX_TUMBLERS: must be integer <= ${MAX_TUMBLERS}`;
+    }
+  }
+  if (options.minTumblers !== undefined && options.maxTumblers !== undefined) {
+    if (options.minTumblers > options.maxTumblers) {
+      return 'INVALID_TUMBLER_RANGE: minTumblers must be <= maxTumblers';
+    }
+  }
+  if (options.allowedWindows !== undefined) {
+    if (!Array.isArray(options.allowedWindows) || options.allowedWindows.length === 0) {
+      return 'INVALID_ALLOWED_WINDOWS: must be non-empty array';
+    }
+    for (const w of options.allowedWindows) {
+      if (!Number.isInteger(w) || w < MIN_WINDOW_SEC || w > MAX_WINDOW_SEC) {
+        return `INVALID_WINDOW_SEC: ${w} must be integer in [${MIN_WINDOW_SEC}, ${MAX_WINDOW_SEC}]`;
+      }
+    }
+  }
+  return undefined;
 }

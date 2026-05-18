@@ -41,21 +41,34 @@ export interface TumblerMap {
 }
 
 export interface TSKProvisionPayload {
-  /** Encrypted/sealed tumbler map delivered to client at provisioning */
+  /** Client identifier */
   clientId: string;
-  /** Segments the client needs to regenerate keys (excludes position info — client only needs types + timing, server holds positions) */
+  /**
+   * Segments the client needs to regenerate values (excludes positions and lengths).
+   * STRUCTURAL SECRECY: The client only knows segment IDs, types, and timing.
+   * It cannot reconstruct positions from this payload.
+   */
   clientSegments: ClientSegmentConfig[];
-  /** Total key length (client needs this to allocate the buffer) */
+  /**
+   * Total key length — provided only for HTTP header size validation.
+   * The client does NOT use this to infer segment positions or lengths.
+   */
   keyLength: number;
-  /** segmentIds in position order — for correct positional key assembly on the client */
-  segmentOrder?: string[];
+  /**
+   * segmentOrder is intentionally ABSENT.
+   * Providing ordered segment IDs would allow position reconstruction.
+   * The server assembles the key from raw client segment values.
+   */
   /** Provisioned at timestamp */
   createdAt: number;
   /** Version */
   version: '1';
 }
 
-/** What the client receives — positions OMITTED (structural secrecy) */
+/**
+ * What the client receives — positions and lengths OMITTED (structural secrecy).
+ * The client can only derive segment values; it cannot reconstruct the key layout.
+ */
 export interface ClientSegmentConfig {
   segmentId: string;
   type: SegmentType;
@@ -63,16 +76,23 @@ export interface ClientSegmentConfig {
   windowSec?: number;
   /** Initial HOTP counter (increments on each use) */
   initialCounter?: number;
-  /** Segment length in characters */
-  length?: number;
+  /**
+   * length is intentionally ABSENT from this interface.
+   * Providing segment lengths would allow clients to reconstruct positions
+   * by computing cumulative sums — defeating structural secrecy.
+   */
 }
 
 export interface TSKValidationResult {
   ok: boolean;
   clientId?: string;
   error?: TSKError;
-  /** Per-segment validation details (for anomaly detection) */
-  segmentResults?: { segmentId: string; valid: boolean }[];
+  /**
+   * Per-segment validation details (for anomaly detection).
+   * Includes segment type so anomaly engine can use type-safe detection
+   * instead of fragile name-prefix heuristics.
+   */
+  segmentResults?: { segmentId: string; type: SegmentType; valid: boolean }[];
 }
 
 export type TSKError =
@@ -82,6 +102,8 @@ export type TSKError =
   | 'CHECKSUM_INVALID'
   | 'VALIDATION_FAILED'
   | 'HOTP_COUNTER_EXHAUSTED'
+  | 'MAP_INVALID_NO_SEGMENTS'
+  | 'MAP_INVALID_ZERO_LENGTH_SEGMENT'
   | 'INTERNAL_ERROR';
 
 export interface TSKConfig {
@@ -98,6 +120,6 @@ export interface TSKConfig {
 export const DEFAULT_TSK_CONFIG: Required<TSKConfig> = {
   totpToleranceWindows: 1,
   hotpLookahead: 5,
-  maxKeyLength: 256,
-  minKeyLength: 16,
+  maxKeyLength: 512,  // Updated to match MAX_KEY_LENGTH in tumbler-map.ts
+  minKeyLength: 20,   // Updated to match MIN_KEY_LENGTH in tumbler-map.ts
 };
