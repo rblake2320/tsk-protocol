@@ -86,7 +86,22 @@ export interface ClientSegmentConfig {
 export interface TSKValidationResult {
   ok: boolean;
   clientId?: string;
+  /**
+   * External-facing error code.
+   * TSK-06 FIX: All authentication failures return 'INVALID_KEY'.
+   * Structural errors (MAP_INVALID_*) and length errors are returned as-is
+   * since they reveal no exploitable information about key structure.
+   * Never expose CHECKSUM_INVALID, VALIDATION_FAILED, or HOTP_COUNTER_EXHAUSTED
+   * to the client — use internalError for server-side diagnostics.
+   */
   error?: TSKError;
+  /**
+   * Internal diagnostic code — server-side anomaly engine use ONLY.
+   * Must NEVER be returned to the client or included in HTTP responses.
+   * TSK-06 FIX: Preserves diagnostic detail for server logs while hiding
+   * structural information from external observers.
+   */
+  internalError?: TSKInternalError;
   /**
    * Per-segment validation details (for anomaly detection).
    * Includes segment type so anomaly engine can use type-safe detection
@@ -95,15 +110,22 @@ export interface TSKValidationResult {
   segmentResults?: { segmentId: string; type: SegmentType; valid: boolean }[];
 }
 
+/** External-facing TSK error codes. */
 export type TSKError =
   | 'CLIENT_NOT_FOUND'
   | 'KEY_LENGTH_MISMATCH'
-  | 'SEGMENT_EXPIRED'
+  | 'MAP_INVALID_NO_SEGMENTS'
+  | 'MAP_INVALID_ZERO_LENGTH_SEGMENT'
+  | 'INVALID_KEY';   // TSK-06: generic external error for all auth failures
+
+/**
+ * Internal TSK error codes — server-side anomaly engine use ONLY.
+ * Never expose to clients.
+ */
+export type TSKInternalError =
   | 'CHECKSUM_INVALID'
   | 'VALIDATION_FAILED'
   | 'HOTP_COUNTER_EXHAUSTED'
-  | 'MAP_INVALID_NO_SEGMENTS'
-  | 'MAP_INVALID_ZERO_LENGTH_SEGMENT'
   | 'INTERNAL_ERROR';
 
 export interface TSKConfig {

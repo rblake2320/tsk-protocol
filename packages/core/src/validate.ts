@@ -7,6 +7,14 @@
  * - HOTP counter exhaustion detection
  * - Type-safe segment result reporting (for anomaly engine)
  * - counterUpdates stores {newCounter, matchedCounter} for correct CAS in middleware
+ *
+ * TSK-06 FIX — Error Oracle:
+ * All external-facing failure modes now return the generic error code 'INVALID_KEY'.
+ * Previously, 'CHECKSUM_INVALID' vs 'VALIDATION_FAILED' allowed an attacker to
+ * determine exactly where the checksum boundary was in the key structure.
+ * Internal error codes (CHECKSUM_INVALID, VALIDATION_FAILED, etc.) are preserved
+ * in the internalError field for server-side anomaly engine use ONLY — they must
+ * never be returned to the client.
  */
 import { constantTimeEqual } from './crypto.js';
 import { DEFAULT_TSK_CONFIG } from './types.js';
@@ -93,9 +101,12 @@ export function validateTSKKey(
   const keyWithoutChecksum = providedKey.slice(0, csStart);
   const expectedChecksum = computeChecksum(map.sharedSecret, keyWithoutChecksum);
   if (!constantTimeEqual(providedChecksum, expectedChecksum)) {
+    // TSK-06 FIX: Return generic INVALID_KEY externally.
+    // internalError is for server-side anomaly engine only — never send to client.
     return {
       ok: false,
-      error: 'CHECKSUM_INVALID',
+      error: 'INVALID_KEY',
+      internalError: 'CHECKSUM_INVALID',
       clientId: map.clientId,
     };
   }
@@ -131,9 +142,11 @@ export function validateTSKKey(
       const storedCounter = seg.counter ?? 0;
       // Check for counter exhaustion before lookahead
       if (storedCounter > MAX_HOTP_COUNTER) {
+        // TSK-06 FIX: Generic external error; internal code for anomaly engine.
         return {
           ok: false,
-          error: 'HOTP_COUNTER_EXHAUSTED',
+          error: 'INVALID_KEY',
+          internalError: 'HOTP_COUNTER_EXHAUSTED',
           clientId: map.clientId,
           segmentResults,
         };
@@ -158,9 +171,11 @@ export function validateTSKKey(
   }
 
   if (!allValid) {
+    // TSK-06 FIX: Generic external error; internal code for anomaly engine.
     return {
       ok: false,
-      error: 'VALIDATION_FAILED',
+      error: 'INVALID_KEY',
+      internalError: 'VALIDATION_FAILED',
       clientId: map.clientId,
       segmentResults,
     };
