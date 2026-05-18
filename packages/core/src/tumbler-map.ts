@@ -184,28 +184,37 @@ export function generateTumblerMap(options: TumblerMapOptions = {}): TumblerMap 
 /**
  * Extract the client-facing portion of a tumbler map.
  *
- * STRUCTURAL SECRECY FIX:
- * - Positions are NOT included (as before).
- * - Segment LENGTHS are NOT included (previously leaked positions via reconstruction).
- * - segmentOrder is NOT included (previously leaked positional ordering).
+ * STRUCTURAL SECRECY CONTRACT:
+ * - Positions (start offsets) are NOT included — these are the server's private secret.
+ * - segmentLength IS included — the client needs this to truncate/pad its HMAC output
+ *   to the correct size before concatenation. Knowing lengths does NOT reveal positions
+ *   because the client has no start offsets.
+ * - Segments are emitted in positional order (sorted by position[0]). The client
+ *   concatenates in this order, producing a key that is byte-for-byte identical to the
+ *   server's positional layout. The client cannot reconstruct absolute positions from
+ *   lengths alone (it would need cumulative sums AND a known starting offset).
  *
- * The client sends raw segment values keyed by segmentId. The server
- * assembles the final key string using its stored positions. This completely
- * prevents clients from reconstructing the structural map.
- *
- * The client payload contains ONLY:
- * - clientId
- * - Segment IDs, types, and timing parameters (no lengths, no order)
- * - Total keyLength (needed for HTTP header size validation only)
- * - Provisioning metadata
+ * SECURITY ANALYSIS:
+ * An attacker who intercepts the provision payload learns:
+ *   - Segment count, types, and sizes (in positional order)
+ *   - Total key length and checksum length
+ * An attacker does NOT learn:
+ *   - The absolute start position of any segment
+ *   - The sharedSecret (never transmitted after provisioning)
+ * Without start positions, the attacker cannot forge a key by placing known
+ * segment values at the correct offsets — they only know sizes, not locations.
  */
 export function toProvisionPayload(map: TumblerMap): TSKProvisionPayload {
-  const clientSegments: ClientSegmentConfig[] = map.segments.map(seg => {
+  // Sort segments by position[0] so client concatenation order matches server layout
+  const sortedSegments = [...map.segments].sort((a, b) => a.position[0] - b.position[0]);
+
+  const clientSegments: ClientSegmentConfig[] = sortedSegments.map(seg => {
+    const segmentLength = seg.position[1] - seg.position[0];
     const cs: ClientSegmentConfig = {
       segmentId: seg.segmentId,
       type: seg.type,
-      // NOTE: length is intentionally OMITTED to preserve structural secrecy.
-      // NOTE: position is intentionally OMITTED.
+      segmentLength,
+      // NOTE: position (start offset) is intentionally OMITTED — this is the structural secret.
     };
     if (seg.type === 'totp') cs.windowSec = seg.windowSec;
     if (seg.type === 'hotp') cs.initialCounter = seg.counter ?? 0;
@@ -216,7 +225,7 @@ export function toProvisionPayload(map: TumblerMap): TSKProvisionPayload {
     clientId: map.clientId,
     clientSegments,
     keyLength: map.keyLength,
-    // segmentOrder intentionally OMITTED — would allow position reconstruction.
+    checksumLength: CHECKSUM_LENGTH,
     createdAt: map.createdAt,
     version: '1',
   };

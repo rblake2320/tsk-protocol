@@ -22,7 +22,7 @@ function assert(name: string, condition: boolean, detail: string) {
 }
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
-const map = generateTumblerMap({ keyLength: 52, minTumblers: 2, maxTumblers: 4 });
+const map = generateTumblerMap({ keyLength: 96, minTumblers: 2, maxTumblers: 4 });
 const NOW = Date.now();
 
 // Generate a valid key at time NOW
@@ -156,7 +156,7 @@ console.log('\n[Attack 6] Missing TSK Headers — request without TSK layer reje
 console.log('\n[Full Flow] Provision → Generate → Validate → HOTP counter advance → replay rejected');
 {
   const { store, provisioner } = createTSKServer();
-  const provision = await provisioner.provision({ keyLength: 52 });
+  const provision = await provisioner.provision({ keyLength: 96 });
   assert('Provisioning succeeded', provision.ok, `Error: ${provision.error}`);
 
   const fullMap = await store.get(provision.clientId!);

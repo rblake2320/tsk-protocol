@@ -2,24 +2,24 @@
  * TSK Protocol — Client SDK
  * IL4/5/6/7-hardened.
  *
- * Key security fixes in this version:
- * 1. HOTP COUNTER COMMIT-AFTER-SUCCESS: counters are only advanced after a
+ * Key security properties in this version:
+ * 1. CORRECT KEY ASSEMBLY: generateHeaders() uses generateKeyFromClientPayload()
+ *    which truncates/pads each segment value to its provisioned segmentLength before
+ *    concatenation. This produces a key byte-for-byte identical to the server's
+ *    positional layout.
+ * 2. STRUCTURAL SECRECY COMPLIANCE: The client knows segment lengths but NOT
+ *    start positions. It cannot reconstruct the structural map from the provision
+ *    payload alone.
+ * 3. HOTP COUNTER COMMIT-AFTER-SUCCESS: counters are only advanced after a
  *    successful HTTP response (2xx). Network failures no longer desynchronize
  *    the client counter from the server counter.
- * 2. STRUCTURAL SECRECY COMPLIANCE: generateHeaders() no longer uses
- *    segmentOrder (which was removed from the provision payload). The client
- *    sends raw segment values keyed by segmentId; the server assembles the key.
- * 3. COUNTER PERSISTENCE: counters are persisted to storage after each
+ * 4. COUNTER PERSISTENCE: counters are persisted to storage after each
  *    successful use, preventing desync after process restarts.
- * 4. INITIALIZATION GUARD: all methods throw if called before init().
- * 5. CONCURRENT REQUEST SAFETY: pending HOTP counter increments are tracked
- *    to prevent double-spending under concurrent requests.
+ * 5. INITIALIZATION GUARD: all methods throw if called before init().
  */
 import {
-  generateClientSegmentValues,
-  hmac as hmacFn,
+  generateKeyFromClientPayload,
   type TSKProvisionPayload,
-  type ClientSegmentConfig,
 } from '@tsk/core';
 import type { TSKClientStorage } from './storage.js';
 import { TSK_HEADERS, TSK_PROTOCOL_VERSION } from './constants.js';
@@ -76,9 +76,14 @@ export class TSKClient {
   /**
    * Generate TSK headers for a request.
    *
-   * STRUCTURAL SECRECY: The client generates raw segment values keyed by
-   * segmentId. It does NOT know positions or lengths. The server assembles
-   * the final key using its stored tumbler map.
+   * KEY ASSEMBLY: Uses generateKeyFromClientPayload() which:
+   *   1. Derives HMAC values for each segment using the shared secret
+   *   2. Truncates/pads each value to its provisioned segmentLength
+   *   3. Concatenates in positional order (matching server layout)
+   *   4. Appends checksumLength-char HMAC checksum
+   *
+   * STRUCTURAL SECRECY: The client knows segment lengths but NOT start positions.
+   * The server validates the key using its stored positional map.
    *
    * HOTP SAFETY: Counters are NOT advanced here. They are advanced only after
    * a successful HTTP response via commitHOTPCounters(). This prevents
@@ -97,23 +102,16 @@ export class TSKClient {
     const payload = this.payload!;
     const sharedSecret = this.sharedSecret!;
 
-    // Snapshot current counters (do NOT advance yet)
+    // Snapshot current counters (do NOT advance yet — commit-after-success pattern)
     const snapshotCounters = new Map(this.counters);
 
-    // Generate segment values using snapshot counters
-    const values = generateClientSegmentValues(
+    // Generate the full key using the client payload (with segmentLength per segment)
+    const key = generateKeyFromClientPayload(
       sharedSecret,
-      payload.clientSegments,
+      payload,
       snapshotCounters,
       nowMs,
     );
-
-    // Build key: concatenate segment values in clientSegments order
-    // (The server re-maps these to positions using its stored tumbler map)
-    const segmentParts = payload.clientSegments.map(seg => values.get(seg.segmentId) ?? '');
-    const keyWithoutChecksum = segmentParts.join('');
-    const checksum = hmacFn(sharedSecret, `checksum:${keyWithoutChecksum}`).slice(0, 12);
-    const key = keyWithoutChecksum + checksum;
 
     const headers: Record<string, string> = {
       [TSK_HEADERS.CLIENT_ID]: this.config.clientId,

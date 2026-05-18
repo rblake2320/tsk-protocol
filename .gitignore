@@ -6,3 +6,4 @@ debug-hotp*.mts
 debug-prov.mts
 patch_*.py
 redteam-concurrency-diag.mts
+debug-e2e.mts

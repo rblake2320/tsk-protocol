@@ -44,21 +44,31 @@ export interface TSKProvisionPayload {
   /** Client identifier */
   clientId: string;
   /**
-   * Segments the client needs to regenerate values (excludes positions and lengths).
-   * STRUCTURAL SECRECY: The client only knows segment IDs, types, and timing.
-   * It cannot reconstruct positions from this payload.
+   * Segments the client needs to regenerate values.
+   *
+   * STRUCTURAL SECRECY CONTRACT:
+   * - Each entry includes segmentLength so the client can truncate/pad its HMAC
+   *   output to the correct size before concatenation.
+   * - Entries are in the same order as the server's positional layout, so the
+   *   client's concatenated output is byte-for-byte identical to the server's
+   *   expected key layout.
+   * - The client knows LENGTHS but NOT POSITIONS (start offsets). Without knowing
+   *   where each segment starts in the key, the client cannot reconstruct the
+   *   structural map — it only knows "I have N segments of these sizes in this order."
+   * - The server holds the absolute positions privately. An attacker who intercepts
+   *   the provision payload learns segment sizes and order, but NOT the absolute
+   *   positions within the key (which is the structural secret).
    */
   clientSegments: ClientSegmentConfig[];
   /**
-   * Total key length — provided only for HTTP header size validation.
-   * The client does NOT use this to infer segment positions or lengths.
+   * Total key length — needed for HTTP header size validation and key assembly.
    */
   keyLength: number;
   /**
-   * segmentOrder is intentionally ABSENT.
-   * Providing ordered segment IDs would allow position reconstruction.
-   * The server assembles the key from raw client segment values.
+   * Checksum length in characters (always CHECKSUM_LENGTH = 12).
+   * Included so the client knows how many chars to append as checksum.
    */
+  checksumLength: number;
   /** Provisioned at timestamp */
   createdAt: number;
   /** Version */
@@ -66,21 +76,26 @@ export interface TSKProvisionPayload {
 }
 
 /**
- * What the client receives — positions and lengths OMITTED (structural secrecy).
- * The client can only derive segment values; it cannot reconstruct the key layout.
+ * What the client receives per segment.
+ *
+ * STRUCTURAL SECRECY:
+ * - segmentLength: included so client can truncate/pad HMAC output to correct size.
+ *   Knowing lengths does NOT reveal positions — the client has no start offsets.
+ * - position: intentionally ABSENT — this is the server's private structural secret.
  */
 export interface ClientSegmentConfig {
   segmentId: string;
   type: SegmentType;
+  /**
+   * Number of characters this segment occupies in the assembled key.
+   * The client uses this to truncate/pad its HMAC output before concatenation.
+   * Knowing the length does NOT reveal the segment's position (start offset) in the key.
+   */
+  segmentLength: number;
   /** TOTP window in seconds */
   windowSec?: number;
   /** Initial HOTP counter (increments on each use) */
   initialCounter?: number;
-  /**
-   * length is intentionally ABSENT from this interface.
-   * Providing segment lengths would allow clients to reconstruct positions
-   * by computing cumulative sums — defeating structural secrecy.
-   */
 }
 
 export interface TSKValidationResult {
