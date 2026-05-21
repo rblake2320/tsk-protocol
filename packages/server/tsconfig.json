@@ -5,7 +5,8 @@
     "baseUrl": ".",
     "paths": {
       "@tsk/core": ["../core/src/index.ts"]
-    }
+    },
+    "rootDirs": ["./src", "../core/src"]
   },
   "include": ["src/**/*", "../core/src/**/*"]
 }
