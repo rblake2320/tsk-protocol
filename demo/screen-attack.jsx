@@ -36,6 +36,7 @@ function ScreenAttack() {
         setCaptured(cap);
         label = 'Capture live key';
         result = { verdict: 'observed', results: {} };
+        trackEvent('attack_capture', { screen: 'attack' });
         setAttempts(a => [{ t, kind, label, result }, ...a].slice(0, 12));
         setFiring(false);
         return;
@@ -144,6 +145,7 @@ function ScreenAttack() {
       }
 
       if (eventKind) setEvents(ev => [...ev, { t, kind: eventKind }]);
+      trackEvent('attack_fired', { kind, verdict: result.verdict, status: result.status });
       setAttempts(a => [{ t, kind, label, result }, ...a].slice(0, 12));
       await refreshAnomaly();
     } catch (err) {

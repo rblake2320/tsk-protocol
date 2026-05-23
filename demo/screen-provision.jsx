@@ -45,6 +45,7 @@ function ScreenProvision() {
       clearInterval(interval);
       setStep(steps.length);
       setMap(newMap);
+      trackEvent('provision_complete', { keyLength, rotatingCount, clientId: newMap.clientId });
       setStage('done');
       setTimeout(() => setStage('ready'), 1500);
     } catch (err) {

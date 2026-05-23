@@ -14,6 +14,7 @@ const SCREENS = [
   { id: 'attack',    label: 'Attack Lab',    group: 'Protocol',    comp: 'ScreenAttack',    hint: 'Replay · forge · anomaly' },
   { id: 'provision', label: 'Provisioning',  group: 'Protocol',    comp: 'ScreenProvision', hint: 'Mint clients' },
   { id: 'stack',     label: '8-Layer Stack', group: 'Architecture',comp: 'ScreenStack',     hint: 'BPC + TSK + Active Defense' },
+  { id: 'about',     label: 'About',         group: 'Info',        comp: 'ScreenAbout',     hint: 'Protocol · inventor · access' },
 ];
 
 function App() {
@@ -51,14 +52,19 @@ function App() {
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
 
-  // Keyboard nav: g + v/a/p/s/o
+  // Track screen views
+  useEffect(() => {
+    if (typeof trackEvent === 'function') trackEvent('screen_view', { screen: route });
+  }, [route]);
+
+  // Keyboard nav: g + v/a/p/s/o/b
   useEffect(() => {
     let waiting = false;
     const onKey = e => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
       if (e.key === 'g' || e.key === 'G') { waiting = true; setTimeout(() => (waiting = false), 1000); return; }
       if (!waiting) return;
-      const m = { o: 'overview', v: 'vault', a: 'attack', p: 'provision', s: 'stack' };
+      const m = { o: 'overview', v: 'vault', a: 'attack', p: 'provision', s: 'stack', b: 'about' };
       if (m[e.key]) { goto(m[e.key]); waiting = false; }
     };
     window.addEventListener('keydown', onKey);

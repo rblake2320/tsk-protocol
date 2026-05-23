@@ -9,7 +9,7 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, appendFileSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -17,8 +17,15 @@ import {
   verifyTSKRequest,
 } from '../packages/server/src/index.ts';
 
-const PORT     = 3200;
-const DEMO_DIR = dirname(fileURLToPath(import.meta.url));
+const PORT      = 3200;
+const DEMO_DIR  = dirname(fileURLToPath(import.meta.url));
+const EVENT_LOG = join(DEMO_DIR, 'analytics.ndjson');
+
+// ── In-memory analytics store ────────────────────────────────────────────────
+interface AnalyticsEvent {
+  event: string; session: string; ts: number; site: string; [k: string]: unknown;
+}
+const analyticsEvents: AnalyticsEvent[] = [];
 
 const { store, provisioner, anomaly } = createTSKServer();
 
@@ -203,6 +210,48 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       }
       log(method, path, `PASS client=${result.clientId}`);
       json(res, 200, { done: true, clientId: result.clientId });
+      return;
+    }
+
+    // ── Analytics: POST /analytics/event ────────────────────────────────────
+    if (method === 'POST' && path === '/analytics/event') {
+      const rawBody = await readBody(req);
+      try {
+        const evt = JSON.parse(rawBody.toString()) as AnalyticsEvent;
+        evt.serverTs = Date.now();
+        evt.ip = ip;
+        analyticsEvents.push(evt);
+        // Persist to NDJSON log (survives server restarts)
+        appendFileSync(EVENT_LOG, JSON.stringify(evt) + '\n');
+        cors(res);
+        res.writeHead(204);
+        res.end();
+      } catch {
+        json(res, 400, { error: 'invalid_json' });
+      }
+      return;
+    }
+
+    // ── Analytics: GET /analytics ────────────────────────────────────────────
+    if (method === 'GET' && path === '/analytics') {
+      // Summarize events by type
+      const counts: Record<string, number> = {};
+      const screens: Record<string, number> = {};
+      const sessions = new Set<string>();
+      for (const e of analyticsEvents) {
+        counts[e.event] = (counts[e.event] || 0) + 1;
+        if (e.event === 'screen_view' && e.screen) {
+          screens[e.screen as string] = (screens[e.screen as string] || 0) + 1;
+        }
+        if (e.session) sessions.add(e.session);
+      }
+      json(res, 200, {
+        totalEvents: analyticsEvents.length,
+        uniqueSessions: sessions.size,
+        eventCounts: counts,
+        screenViews: screens,
+        recentEvents: analyticsEvents.slice(-20).reverse(),
+      });
       return;
     }
 
