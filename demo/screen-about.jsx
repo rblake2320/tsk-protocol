@@ -102,6 +102,85 @@ function ScreenAbout({ goto }) {
         </div>
       </div>
 
+      {/* Industry verticals */}
+      <div>
+        <div className="upper" style={{ color: 'var(--dim)', marginBottom: 16 }}>Designed for regulated industries</div>
+        <div className="g2" style={{ gap: 16 }}>
+          <div className="card" style={{ padding: 20, borderLeft: '3px solid #3dd68c' }}>
+            <div className="upper" style={{ color: '#3dd68c', marginBottom: 10 }}>Healthcare · HIPAA</div>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>PHI APIs, medical device auth, health data pipelines</div>
+            <p style={{ fontSize: 12.5, lineHeight: 1.6 }}>
+              TSK's rotating key structure means a compromised credential is self-expiring — no manual rotation required. Static segment anchors the device identity (HIPAA §164.312(d)); TOTP segment creates a time-bounded access window; HOTP provides one-shot event receipts. Position map secrecy prevents reverse-engineering even from captured traffic.
+            </p>
+            <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
+              {['HIPAA §164.312(d)', 'HITECH', 'NIST IA-3'].map(t => (
+                <span key={t} className="mono" style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'var(--bg-2)', color: 'var(--muted)' }}>{t}</span>
+              ))}
+            </div>
+          </div>
+          <div className="card" style={{ padding: 20, borderLeft: '3px solid var(--primary)' }}>
+            <div className="upper" style={{ color: 'var(--primary)', marginBottom: 10 }}>Fintech · PCI-DSS · SOC 2</div>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>Payment APIs, open banking, fraud-sensitive data access</div>
+            <p style={{ fontSize: 12.5, lineHeight: 1.6 }}>
+              HOTP counter-rotation means each successful authentication produces a new credential state — replaying a captured payment API key fails immediately. TOTP window prevents offline brute-force. Anomaly fingerprinting detects stolen-key patterns (static passes, rotating fails) before fraud can execute.
+            </p>
+            <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
+              {['PCI-DSS Req 8.3.9', 'SOC 2 CC6.3', 'PCI-DSS Req 10.2.1'].map(t => (
+                <span key={t} className="mono" style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'var(--bg-2)', color: 'var(--muted)' }}>{t}</span>
+              ))}
+            </div>
+          </div>
+          <div className="card" style={{ padding: 20, borderLeft: '3px solid var(--warning)' }}>
+            <div className="upper" style={{ color: 'var(--warning)', marginBottom: 10 }}>Government · FedRAMP IL4/5 · NIST 800-53</div>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>Federal agency APIs, CUI access, contractor credential management</div>
+            <p style={{ fontSize: 12.5, lineHeight: 1.6 }}>
+              Positional map never transmitted after provisioning — SC-28 (protection of information at rest) by design. Atomic HOTP CAS prevents concurrent credential reuse across threads. 72-bit checksum validates key integrity before any segment processing — DoS-resistant by construction, not by rate limit.
+            </p>
+            <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
+              {['NIST SC-28', 'FedRAMP IL4/5', 'NIST IA-5(1)(f)'].map(t => (
+                <span key={t} className="mono" style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'var(--bg-2)', color: 'var(--muted)' }}>{t}</span>
+              ))}
+            </div>
+          </div>
+          <div className="card" style={{ padding: 20, borderLeft: '3px solid var(--dim)' }}>
+            <div className="upper" style={{ color: 'var(--dim)', marginBottom: 10 }}>Enterprise SaaS · SOC 2 · ISO 27001</div>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>B2B API platforms, multi-tenant SaaS, developer ecosystems</div>
+            <p style={{ fontSize: 12.5, lineHeight: 1.6 }}>
+              Per-client tumbler maps mean a breach at one tenant never exposes others — there is no shared key material. Structural secrecy (server-only position map) means developer SDK access does not reduce security. Pair with BPC for a full 8-layer stack: two orthogonal attack surfaces, one audit trail.
+            </p>
+            <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
+              {['SOC 2 CC6.2', 'ISO 27001 A.9', 'Zero-trust compatible'].map(t => (
+                <span key={t} className="mono" style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'var(--bg-2)', color: 'var(--muted)' }}>{t}</span>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Self-service integration */}
+      <div className="card">
+        <h3 style={{ marginBottom: 6 }}>Self-service integration — no support team required</h3>
+        <p className="muted" style={{ fontSize: 13, marginBottom: 20 }}>Three steps from zero to TSK-verified requests.</p>
+        <div className="g3" style={{ gap: 12, marginBottom: 16 }}>
+          {[
+            { n: '1', title: 'Install', code: 'npm i @tsk/server @tsk/core' },
+            { n: '2', title: 'Server', code: 'createTSKServer() + verifyTSKRequest() wraps any endpoint.' },
+            { n: '3', title: 'Provision', code: 'POST /tsk/provision → tumbler map sealed. Client receives payload. Done.' },
+          ].map(s => (
+            <div key={s.n} style={{ padding: 16, borderRadius: 10, background: 'var(--bg-2)', border: '1px solid var(--border)' }}>
+              <div className="row" style={{ gap: 8, marginBottom: 8 }}>
+                <span style={{ width: 22, height: 22, borderRadius: '50%', background: 'var(--primary)', color: 'var(--bg)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 700, flexShrink: 0 }}>{s.n}</span>
+                <span style={{ fontSize: 13, fontWeight: 600 }}>{s.title}</span>
+              </div>
+              <code className="mono" style={{ fontSize: 11, color: 'var(--muted)', lineHeight: 1.5 }}>{s.code}</code>
+            </div>
+          ))}
+        </div>
+        <div style={{ padding: '12px 14px', borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)', fontSize: 12, lineHeight: 1.6 }}>
+          <strong style={{ color: 'var(--text)' }}>Zero-fail error design:</strong> Every rejection returns a typed error — <code className="mono">tsk_key_invalid</code>, <code className="mono">tsk_checksum_fail</code>, <code className="mono">tsk_order_mismatch</code>, <code className="mono">tsk_window_expired</code> — with HTTP status. No silent failures. Every code maps to an anomaly event.
+        </div>
+      </div>
+
       {/* Three-site architecture */}
       <div className="card">
         <h3 style={{ marginBottom: 4 }}>Three demo deployments</h3>
