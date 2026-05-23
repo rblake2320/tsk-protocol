@@ -1,0 +1,6 @@
+{
+  "name": "tsk-demo-server",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "npx tsx server.ts" }
+}
