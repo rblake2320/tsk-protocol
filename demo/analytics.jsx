@@ -12,8 +12,13 @@ const SESSION_START = Date.now();
 const _queue = [];
 let _flushing = false;
 
+// Defer first flush until page is fully loaded — prevents boot-window
+// races where analytics POSTs arrive before the server finishes startup.
+let _pageReady = document.readyState === 'complete';
+if (!_pageReady) window.addEventListener('load', () => { _pageReady = true; _flush(); }, { once: true });
+
 async function _flush() {
-  if (_flushing || _queue.length === 0) return;
+  if (!_pageReady || _flushing || _queue.length === 0) return;
   _flushing = true;
   while (_queue.length > 0) {
     const evt = _queue[0];
