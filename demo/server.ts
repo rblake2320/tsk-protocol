@@ -54,6 +54,7 @@ function log(method: string, path: string, result: string): void {
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js':   'application/javascript',
+  '.jsx':  'application/javascript',
   '.css':  'text/css',
   '.svg':  'image/svg+xml',
   '.png':  'image/png',
@@ -105,6 +106,11 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       const file = join(DEMO_DIR, path);
       if (serveFile(res, file)) return;
     }
+    // Serve JSX files and other demo assets
+    if (method === 'GET' && path.endsWith('.jsx')) {
+      const file = join(DEMO_DIR, path.replace(/^\//, ''));
+      if (serveFile(res, file)) return;
+    }
 
     // ── Provision ────────────────────────────────────────────────────────────
     if (method === 'POST' && path === '/tsk/provision') {
@@ -120,6 +126,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         clientId: result.clientId,
         provisionPayload: result.provisionPayload,
         sharedSecret: result.tumblerMap!.sharedSecret,
+        serverMap: result.tumblerMap,
       });
       return;
     }
