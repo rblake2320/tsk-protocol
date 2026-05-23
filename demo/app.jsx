@@ -25,6 +25,7 @@ function App() {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const [mapReady, setMapReady] = useState(!!window.DEMO_MAP);
   const [serverStatus, setServerStatus] = useState('checking'); // checking | ok | error
+  const [bpcStatus, setBpcStatus] = useState('checking'); // checking | ok | offline
 
   // Wait for DEMO_MAP to be provisioned
   useEffect(() => {
@@ -33,6 +34,16 @@ function App() {
       if (map) { setMapReady(true); setServerStatus('ok'); }
       else setServerStatus('error');
     });
+  }, []);
+
+  // Probe BPC server at :3101 (BPC-only demo) for real status
+  useEffect(() => {
+    const ctrl = new AbortController();
+    fetch('http://localhost:3101/', { signal: ctrl.signal, cache: 'no-store' })
+      .then(r => setBpcStatus(r.ok || r.status < 500 ? 'ok' : 'offline'))
+      .catch(() => setBpcStatus('offline'))
+      .finally(() => {});
+    return () => ctrl.abort();
   }, []);
 
   // Sync body attrs for tweak themes
@@ -127,8 +138,13 @@ function App() {
             <span className="mono" style={{ fontSize: 11, color: 'var(--muted)' }}>full-stack :3100</span>
           </div>
           <div className="row" style={{ gap: 8 }}>
-            <span className="live-dot" style={{ background: 'var(--warning)', boxShadow: '0 0 10px var(--warning)' }} />
-            <span className="mono" style={{ fontSize: 11, color: 'var(--muted)' }}>bpc-bridge degraded</span>
+            <span className="live-dot" style={{
+              background: bpcStatus === 'ok' ? 'var(--success)' : bpcStatus === 'offline' ? 'var(--border-2)' : 'var(--warning)',
+              boxShadow: bpcStatus === 'ok' ? '0 0 10px var(--success)' : 'none',
+            }} />
+            <span className="mono" style={{ fontSize: 11, color: 'var(--muted)' }}>
+              bpc-bridge :3101 {bpcStatus === 'ok' ? '✓' : bpcStatus === 'offline' ? 'offline' : '…'}
+            </span>
           </div>
           {mapReady && window.DEMO_MAP && (
             <div style={{ marginTop: 10 }}>

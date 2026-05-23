@@ -226,6 +226,7 @@ function ScreenAttack() {
             <AttackCard
               kind="replay-now" label="Replay immediately"
               desc="Submit captured key to real server. If HOTP counter already advanced on first use, this fails."
+              hint={!captured ? null : "Tip: click 'Use ↻' in Live Vault first to advance the HOTP counter — then replay here to see the reject."}
               disabled={!captured || firing} onFire={() => fire('replay-now')} />
             <AttackCard
               kind="replay-30s" label="Replay expired key"
@@ -352,7 +353,7 @@ function ScreenAttack() {
   );
 }
 
-function AttackCard({ label, desc, disabled, danger, highValue, onFire }) {
+function AttackCard({ label, desc, hint, disabled, danger, highValue, onFire }) {
   return (
     <button onClick={onFire} disabled={disabled}
       style={{
@@ -371,6 +372,7 @@ function AttackCard({ label, desc, disabled, danger, highValue, onFire }) {
         }}>▶ fire</span>
       </div>
       <div className="muted" style={{ fontSize: 12, lineHeight: 1.45 }}>{desc}</div>
+      {hint && <div style={{ fontSize: 11, color: 'var(--primary)', marginTop: 6, lineHeight: 1.4 }}>ℹ {hint}</div>}
     </button>
   );
 }
