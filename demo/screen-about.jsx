@@ -181,6 +181,90 @@ function ScreenAbout({ goto }) {
         </div>
       </div>
 
+      {/* Bond architecture */}
+      <div className="card" style={{ border: '1px solid var(--warning)' }}>
+        <div className="ch" style={{ padding: '20px 24px', borderBottom: '1px solid var(--border)' }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>Bond Architecture — how the ID is stored and linked</h3>
+            <p className="muted" style={{ fontSize: 13 }}>A TSK bond = clientId + sharedSecret + positional map. The map is a server-only structural secret. The bond cannot be forged without all three parts matching.</p>
+          </div>
+          <Pill tone="warn">STRUCTURAL SECRECY</Pill>
+        </div>
+
+        <div className="cb">
+          <div className="g3" style={{ gap: 12, marginBottom: 16 }}>
+            {[
+              {
+                label: 'clientId',
+                color: 'var(--warning)',
+                body: 'Issued at provisioning. Stored by the client. Sent in every request as X-TSK-Client-ID. Server maps it to the full TumblerMap including positions.',
+                server: 'tsk-maps.json \u2192 TumblerMap',
+                client: 'provision payload \u2014 clientId field',
+              },
+              {
+                label: 'sharedSecret',
+                color: 'var(--warning)',
+                body: 'Hex string. Both server and client store it. Used as HMAC-SHA256 key for ALL segment derivation \u2014 static, TOTP, HOTP, checksum. Changing it invalidates the entire tumbler.',
+                server: 'TumblerMap.sharedSecret',
+                client: 'provision payload \u2014 sharedSecret field',
+              },
+              {
+                label: 'Segment positions (SERVER ONLY)',
+                color: 'var(--danger)',
+                body: 'The structural secret. Server stores [start, end) positions for every segment. Client receives segment IDs and types but NEVER positions. Client assembles full key; server extracts by position. Neither side can reconstruct what the other holds.',
+                server: 'TumblerMap.segments[].position \u2014 NEVER transmitted after provisioning',
+                client: 'clientSegments \u2014 types and windows only, NO positions',
+              },
+              {
+                label: 'HOTP counter (atomic CAS)',
+                color: 'var(--primary)',
+                body: 'Advances by compare-and-swap on every successful HOTP validation. A concurrent replay of the same key is detected when the server finds the counter has already advanced. Client must track its counter and stay synchronized.',
+                server: 'TumblerMap.segments[].counter \u2014 updated atomically',
+                client: 'local counter, reset on re-provisioning',
+              },
+            ].map(c => (
+              <div key={c.label} style={{ padding: 14, borderRadius: 8, background: 'var(--bg-2)', border: '1px solid var(--border)' }}>
+                <div className="row" style={{ gap: 8, marginBottom: 8, alignItems: 'center' }}>
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
+                  <span style={{ fontSize: 12, fontWeight: 700 }}>{c.label}</span>
+                </div>
+                <p style={{ fontSize: 12, lineHeight: 1.55, marginBottom: 8 }}>{c.body}</p>
+                <div className="mono" style={{ fontSize: 10, color: 'var(--dim)', lineHeight: 1.7 }}>
+                  <div>SERVER: {c.server}</div>
+                  <div>CLIENT: {c.client}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+            <div style={{ padding: 14, borderRadius: 8, background: 'color-mix(in oklab, var(--success) 8%, transparent)', border: '1px solid color-mix(in oklab, var(--success) 25%, transparent)' }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--success)', marginBottom: 8 }}>Does NOT break the bond</div>
+              <ul style={{ margin: 0, paddingLeft: 14, fontSize: 12, color: 'var(--muted)', lineHeight: 1.8 }}>
+                <li>Server restart (with file store — tsk-maps.json persists)</li>
+                <li>Changing what endpoint the key is used against</li>
+                <li>New TOTP windows — client auto-derives new values</li>
+                <li>Server-side counter advance (client stays in sync)</li>
+              </ul>
+            </div>
+            <div style={{ padding: 14, borderRadius: 8, background: 'color-mix(in oklab, var(--danger) 8%, transparent)', border: '1px solid color-mix(in oklab, var(--danger) 25%, transparent)' }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--danger)', marginBottom: 8 }}>Breaks the bond</div>
+              <ul style={{ margin: 0, paddingLeft: 14, fontSize: 12, color: 'var(--muted)', lineHeight: 1.8 }}>
+                <li>Server store deleted (tsk-maps.json lost, no backup)</li>
+                <li>sharedSecret lost on client side — re-provision required</li>
+                <li>Explicit revocation: <code>POST /tsk/revoke</code></li>
+                <li>HOTP counter desync beyond lookahead window</li>
+              </ul>
+            </div>
+          </div>
+
+          <div style={{ padding: 12, borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)', fontSize: 12, lineHeight: 1.6 }}>
+            <strong style={{ color: 'var(--text)' }}>Universal scope:</strong>{' '}
+            <code className="mono">verifyTSKRequest()</code> is middleware — it doesn't care what your endpoint does. After verification: <code className="mono">result.clientId</code> is a provable identity. Pair with BPC for the full 8-layer stack: ECDSA device binding + tumbler key structural secrecy + behavioral anomaly detection — all in one verification call.
+          </div>
+        </div>
+      </div>
+
       {/* Three-site architecture */}
       <div className="card">
         <h3 style={{ marginBottom: 4 }}>Three demo deployments</h3>
