@@ -15,7 +15,12 @@ import { fileURLToPath } from 'node:url';
 import {
   createTSKServer,
   verifyTSKRequest,
+  TSKProvisioner,
+  MemoryAnomalyEngine,
 } from '../packages/server/src/index.ts';
+// File store imported DIRECTLY — not re-exported via index.ts.
+// Enterprise ultra_server imports @tsk/server; this import bypasses that path.
+import { FileTumblerStore } from '../packages/server/src/file-store.ts';
 
 const PORT      = 3200;
 const DEMO_DIR  = dirname(fileURLToPath(import.meta.url));
@@ -27,7 +32,22 @@ interface AnalyticsEvent {
 }
 const analyticsEvents: AnalyticsEvent[] = [];
 
-const { store, provisioner, anomaly } = createTSKServer();
+// ── Persistent storage when TSK_DATA_DIR is set — demo data stays isolated ──
+// NEVER point TSK_DATA_DIR at enterprise directories (%APPDATA%\SelfConnect\).
+// Demo state and enterprise state (ultra_server) must never share a path.
+const DATA_DIR = process.env['TSK_DATA_DIR'];
+let store: FileTumblerStore | ReturnType<typeof createTSKServer>['store'];
+let provisioner: TSKProvisioner;
+let anomaly: MemoryAnomalyEngine;
+
+if (DATA_DIR) {
+  console.log(`[TSK] Persistent store: ${DATA_DIR}`);
+  store      = new FileTumblerStore(join(DATA_DIR, 'tsk-maps.json'));
+  provisioner = new TSKProvisioner(store);
+  anomaly    = new MemoryAnomalyEngine();
+} else {
+  ({ store, provisioner, anomaly } = createTSKServer());
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
