@@ -138,11 +138,20 @@ export class TSKProvisioner {
    *
    * @param options - Map generation options (all validated before use)
    * @param requestorId - Optional identifier of the requestor (for rate limiting and audit)
+   * @param lifecycle - Optional lifecycle metadata (label, expiry, usage cap)
    * @returns ProvisionResult with client payload and full map
    */
   async provision(
     options: TumblerMapOptions = {},
     requestorId?: string,
+    lifecycle?: {
+      /** Human-readable label for this key. */
+      label?: string;
+      /** Unix timestamp (ms) after which the key expires. */
+      expiresAt?: number;
+      /** Hard cap on successful validations. 0 or omitted = unlimited. */
+      maxRequests?: number;
+    },
   ): Promise<ProvisionResult> {
     // ── Rate limit check ────────────────────────────────────────────────────
     if (this.rateLimiter && requestorId) {
@@ -168,6 +177,19 @@ export class TSKProvisioner {
 
     try {
       const map = generateTumblerMap(options);
+      // Apply lifecycle metadata if provided
+      if (lifecycle) {
+        if (lifecycle.label !== undefined) map.label = lifecycle.label;
+        if (lifecycle.expiresAt !== undefined) map.expiresAt = lifecycle.expiresAt;
+        if (lifecycle.maxRequests !== undefined && lifecycle.maxRequests > 0) {
+          map.maxRequests = lifecycle.maxRequests;
+        }
+      }
+      // Initialize lifecycle tracking fields
+      map.status = 'active';
+      map.requestCount = 0;
+      map.lastUsedAt = null;
+
       await this.store.set(map.clientId, map);
       this.auditLogger?.logProvision(map.clientId, requestorId);
 
@@ -196,6 +218,106 @@ export class TSKProvisioner {
     await this.store.delete(clientId);
     this.auditLogger?.logRevocation(clientId, requestorId);
     return true;
+  }
+
+  /**
+   * Update lifecycle metadata on an existing key.
+   * Allows changing label, expiry, maxRequests, and status without re-provisioning.
+   *
+   * @returns true if the key was found and updated, false if not found.
+   */
+  async updateKey(
+    clientId: string,
+    updates: {
+      label?: string;
+      expiresAt?: number | null;
+      maxRequests?: number | null;
+      status?: 'active' | 'revoked' | 'expired';
+    },
+    requestorId?: string,
+  ): Promise<boolean> {
+    const existing = await this.store.get(clientId);
+    if (!existing) return false;
+
+    const updated = { ...existing };
+    if ('label' in updates) updated.label = updates.label;
+    if ('expiresAt' in updates) {
+      updated.expiresAt = updates.expiresAt ?? undefined;
+    }
+    if ('maxRequests' in updates) {
+      updated.maxRequests = updates.maxRequests ?? undefined;
+    }
+    if (updates.status !== undefined) updated.status = updates.status;
+
+    await this.store.set(clientId, updated);
+    this.auditLogger?.logProvision(clientId, requestorId); // reuse for audit trail
+    return true;
+  }
+
+  /**
+   * List all provisioned keys with their lifecycle metadata.
+   * Returns a safe view — sharedSecret is never included.
+   */
+  async listKeys(): Promise<Array<{
+    clientId: string;
+    label?: string;
+    status: string;
+    createdAt: number;
+    expiresAt?: number;
+    maxRequests?: number;
+    requestCount: number;
+    lastUsedAt: number | null;
+    keyLength: number;
+    segmentCount: number;
+  }>> {
+    const clientIds = await this.store.list();
+    const results = await Promise.all(clientIds.map(id => this.store.get(id)));
+    return results
+      .filter((m): m is NonNullable<typeof m> => m !== null && m !== undefined)
+      .map(m => ({
+        clientId: m.clientId,
+        label: m.label,
+        status: m.status ?? 'active',
+        createdAt: m.createdAt,
+        expiresAt: m.expiresAt,
+        maxRequests: m.maxRequests,
+        requestCount: m.requestCount ?? 0,
+        lastUsedAt: m.lastUsedAt ?? null,
+        keyLength: m.keyLength,
+        segmentCount: m.segments.length,
+      }));
+  }
+
+  /**
+   * Get a single key's lifecycle metadata.
+   * Returns null if not found. Never includes sharedSecret.
+   */
+  async getKey(clientId: string): Promise<{
+    clientId: string;
+    label?: string;
+    status: string;
+    createdAt: number;
+    expiresAt?: number;
+    maxRequests?: number;
+    requestCount: number;
+    lastUsedAt: number | null;
+    keyLength: number;
+    segmentCount: number;
+  } | null> {
+    const m = await this.store.get(clientId);
+    if (!m) return null;
+    return {
+      clientId: m.clientId,
+      label: m.label,
+      status: m.status ?? 'active',
+      createdAt: m.createdAt,
+      expiresAt: m.expiresAt,
+      maxRequests: m.maxRequests,
+      requestCount: m.requestCount ?? 0,
+      lastUsedAt: m.lastUsedAt ?? null,
+      keyLength: m.keyLength,
+      segmentCount: m.segments.length,
+    };
   }
 }
 

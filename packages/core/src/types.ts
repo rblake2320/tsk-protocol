@@ -38,6 +38,46 @@ export interface TumblerMap {
   createdAt: number;
   /** Protocol version */
   version: '1';
+
+  // ── Key Lifecycle Fields ─────────────────────────────────────────────────
+
+  /** Human-readable label for this key (e.g. 'production-agent-1', 'ci-runner'). */
+  label?: string;
+
+  /**
+   * Unix timestamp (ms) after which this key is considered expired and all
+   * validation attempts will be denied with 'key_expired'.
+   * Omit for a key that never expires.
+   */
+  expiresAt?: number;
+
+  /**
+   * Hard cap on the total number of successful validations this key may serve.
+   * Once requestCount reaches maxRequests, the key transitions to 'expired'
+   * and all further attempts are denied with 'key_usage_cap_exceeded'.
+   * Omit (or 0) for unlimited usage.
+   */
+  maxRequests?: number;
+
+  /**
+   * Total number of successful validations served by this key.
+   * Incremented by the server middleware after each successful verifyTSKRequest.
+   */
+  requestCount?: number;
+
+  /**
+   * Unix timestamp (ms) of the most recent successful validation.
+   * Null if the key has never been used.
+   */
+  lastUsedAt?: number | null;
+
+  /**
+   * Key lifecycle status.
+   * - 'active':   Key is valid and accepting requests.
+   * - 'revoked':  Key was explicitly revoked by an operator.
+   * - 'expired':  Key has passed its expiresAt timestamp or hit its maxRequests cap.
+   */
+  status?: 'active' | 'revoked' | 'expired';
 }
 
 export interface TSKProvisionPayload {

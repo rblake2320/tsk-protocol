@@ -75,10 +75,33 @@ export async function verifyTSKRequest(
     return { ok: false, error: 'TSK_CLIENT_NOT_FOUND' };
   }
 
-  // 5. Validate key
+  // 5. Lifecycle checks — before cryptographic validation to fail fast
+  if (map.status === 'revoked') {
+    return { ok: false, error: 'TSK_KEY_REVOKED', clientId: clientIdRaw };
+  }
+  if (map.status === 'expired') {
+    return { ok: false, error: 'TSK_KEY_EXPIRED', clientId: clientIdRaw };
+  }
+  if (map.expiresAt !== undefined && Date.now() > map.expiresAt) {
+    // Auto-transition to expired
+    const updated = { ...map, status: 'expired' as const };
+    await store.set(clientIdRaw, updated);
+    return { ok: false, error: 'TSK_KEY_EXPIRED', clientId: clientIdRaw };
+  }
+  if (map.maxRequests && map.maxRequests > 0) {
+    const count = map.requestCount ?? 0;
+    if (count >= map.maxRequests) {
+      // Auto-transition to expired
+      const updated = { ...map, status: 'expired' as const };
+      await store.set(clientIdRaw, updated);
+      return { ok: false, error: 'TSK_KEY_USAGE_CAP_EXCEEDED', clientId: clientIdRaw };
+    }
+  }
+
+  // 6. Validate key
   const result = validateTSKKey(keyRaw, { map, config });
 
-  // 6. Record anomaly if failed
+  // 7. Record anomaly if failed
   if (!result.ok && anomaly && result.segmentResults) {
     anomaly.record({
       clientId: clientIdRaw,
@@ -115,6 +138,14 @@ export async function verifyTSKRequest(
   if (!result.ok) {
     return { ok: false, error: result.error ?? 'TSK_VALIDATION_FAILED', clientId: clientIdRaw };
   }
+
+  // 11. Update lifecycle tracking fields after successful validation
+  const updatedMap = {
+    ...map,
+    requestCount: (map.requestCount ?? 0) + 1,
+    lastUsedAt: Date.now(),
+  };
+  await store.set(clientIdRaw, updatedMap);
 
   return { ok: true, clientId: result.clientId };
 }
