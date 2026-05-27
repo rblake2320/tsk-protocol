@@ -280,6 +280,57 @@ console.log('\n[10] ULTRA_SECURITY_LAYERS Contract');
     `Got: ${ULTRA_SECURITY_LAYERS[6].property}`);
 }
 
+
+// ── Group 11: HIGH-03 — BPC scope propagated to UltraVerifyResult ─────────────
+console.log('\n[11] BPC Scope Propagation (HIGH-03)');
+{
+  // Test 1: scope field set directly on BPCLikeResult
+  const bpcWithScope = async () => ({ ok: true, pairId, scope: 'read' });
+  const req11a: TSKRequestData = {
+    headers: {
+      'x-tsk-client-id': clientId,
+      'x-tsk-key': generateKeyFromMap(map, NOW),
+      'x-tsk-version': '1',
+    },
+  };
+  const r11a = await verifyUltraRequest(req11a, bpcWithScope, { tskStore: store, identityBinding });
+  assert('scope=read propagated from bpcResult.scope', r11a.scope === 'read', `Got: ${r11a.scope}`);
+
+  // Test 2: scope extracted from bpcResult.pair.scope
+  const bpcWithPair = async () => ({ ok: true, pairId, pair: { scope: 'read-write', id: pairId } });
+  const req11b: TSKRequestData = {
+    headers: {
+      'x-tsk-client-id': clientId,
+      'x-tsk-key': generateKeyFromMap(map, NOW),
+      'x-tsk-version': '1',
+    },
+  };
+  const r11b = await verifyUltraRequest(req11b, bpcWithPair, { tskStore: store, identityBinding });
+  assert('scope=read-write extracted from bpcResult.pair.scope', r11b.scope === 'read-write', `Got: ${r11b.scope}`);
+
+  // Test 3: no scope — result.scope is undefined (not a failure, just not set)
+  const req11c: TSKRequestData = {
+    headers: {
+      'x-tsk-client-id': clientId,
+      'x-tsk-key': generateKeyFromMap(map, NOW),
+      'x-tsk-version': '1',
+    },
+  };
+  const r11c = await verifyUltraRequest(req11c, bpcPass(), { tskStore: store, identityBinding });
+  assert('scope=undefined when BPC does not return scope', r11c.scope === undefined, `Got: ${r11c.scope}`);
+
+  // Test 4: scope field takes priority over pair.scope
+  const bpcBoth = async () => ({ ok: true, pairId, scope: 'admin', pair: { scope: 'read', id: pairId } });
+  const req11d: TSKRequestData = {
+    headers: {
+      'x-tsk-client-id': clientId,
+      'x-tsk-key': generateKeyFromMap(map, NOW),
+      'x-tsk-version': '1',
+    },
+  };
+  const r11d = await verifyUltraRequest(req11d, bpcBoth, { tskStore: store, identityBinding });
+  assert('scope field takes priority over pair.scope', r11d.scope === 'admin', `Got: ${r11d.scope}`);
+}
 // ─── Results ──────────────────────────────────────────────────────────────────
 
 const passed = results.filter(r => r.passed).length;

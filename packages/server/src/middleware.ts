@@ -59,8 +59,11 @@ export async function verifyTSKRequest(
     return { ok: false, error: 'TSK_HEADERS_MISSING' };
   }
 
-  // 2. Protocol version
-  if (versionRaw && versionRaw !== TSK_PROTOCOL_VERSION) {
+  // 2. Protocol version (MED-07 FIX: Enforce version negotiation in wire format)
+  if (!versionRaw) {
+    return { ok: false, error: 'TSK_VERSION_MISSING' };
+  }
+  if (versionRaw !== TSK_PROTOCOL_VERSION) {
     return { ok: false, error: 'TSK_VERSION_UNSUPPORTED' };
   }
 

@@ -29,11 +29,27 @@ import type { TumblerMapStore } from '@tsk/server';
  * BPC verification result shape (compatible with @bpc/server BPCVerifyResult).
  * Typed generically so this file doesn't require @bpc/server as a hard dep
  * (it's a peer dep — consumers bring their own BPC).
+ *
+ * HIGH-03 FIX: Added `scope` and `pair` fields so the Ultra Bridge can
+ * surface the BPC scope in UltraVerifyResult for cross-layer scope coherence.
+ * The BPC middleware returns `pair` (the full StoredPair) on success — callers
+ * can pass it through and the bridge will extract `pair.scope` automatically.
  */
 export interface BPCLikeResult {
   ok: boolean;
   pairId?: string;
   error?: string;
+  /**
+   * The BPC pair scope ('read' | 'read-write' | 'admin').
+   * Set this directly if you want to override scope extraction from `pair`.
+   */
+  scope?: string;
+  /**
+   * The full BPC StoredPair object returned by verifyBPCRequest on success.
+   * The bridge reads pair.scope from this if `scope` is not set directly.
+   * Typed loosely to avoid a hard dep on @bpc/server types.
+   */
+  pair?: { scope?: string; [key: string]: unknown };
 }
 
 export interface UltraVerifyResult {
@@ -42,6 +58,14 @@ export interface UltraVerifyResult {
   clientId?: string;
   layers: ('bpc' | 'tsk')[];
   error?: string;
+  /**
+   * HIGH-03 FIX: The BPC scope that was verified and is now propagated to
+   * the caller. Callers MUST use this scope to enforce access control on
+   * the downstream resource — the TSK layer alone does not enforce scope.
+   *
+   * Values: 'read' | 'read-write' | 'admin' | undefined (if BPC did not return scope)
+   */
+  scope?: string;
 }
 
 export interface UltraVerifyOptions {
@@ -65,6 +89,11 @@ export interface UltraVerifyOptions {
  *     (r) => verifyBPCRequest(r, registry, nonceStore, anomaly, bpcConfig),
  *     { tskStore, identityBinding }
  *   );
+ *
+ * HIGH-03: The returned `result.scope` is the BPC pair scope. Callers MUST
+ * enforce this scope on the downstream resource. The Ultra Bridge does NOT
+ * automatically block write operations for read-scoped pairs — that enforcement
+ * is the caller's responsibility using result.scope.
  */
 export async function verifyUltraRequest(
   req: TSKRequestData,
@@ -114,11 +143,18 @@ export async function verifyUltraRequest(
     };
   }
 
+  // HIGH-03 FIX: Extract BPC scope from the result and surface it to the caller.
+  // Priority: bpcResult.scope > bpcResult.pair?.scope > undefined
+  const resolvedScope: string | undefined =
+    bpcResult.scope ??
+    (bpcResult.pair as { scope?: string } | undefined)?.scope;
+
   return {
     ok: true,
     pairId: bpcResult.pairId,
     clientId: tskResult.clientId,
     layers: ['bpc', 'tsk'],
+    scope: resolvedScope,
   };
 }
 
