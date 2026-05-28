@@ -17,6 +17,9 @@
 import { verifyUltraRequest, ULTRA_SECURITY_LAYERS } from './packages/bpc-bridge/src/ultra-verify.js';
 import { createTSKServer } from './packages/server/src/index.js';
 import { generateKeyFromMap } from './packages/core/src/key-gen.js';
+import { generateSharedSecret, generateClientId, generateSegmentId } from './packages/core/src/crypto.js';
+import { MemoryTumblerStore } from './packages/server/src/store.js';
+import type { TumblerMap } from './packages/core/src/types.js';
 import type { TSKRequestData } from './packages/server/src/middleware.js';
 import type { BPCLikeResult } from './packages/bpc-bridge/src/ultra-verify.js';
 
@@ -120,16 +123,28 @@ console.log('\n[2] BPC Layer Failure — TSK never called');
 // ── Group 3: TSK failure after BPC passes ────────────────────────────────────
 console.log('\n[3] TSK Layer Failure — BPC passes, TSK key is expired');
 {
-  // Use a short-window map (30s only) so expiry is guaranteed at 15 minutes.
-  // Max TOTP tolerance is ±1 window. Even with a 300s window, ±300s = 600s.
-  // 15 minutes (900s) > 600s, so any TOTP window config will have expired.
-  const expiredProv = await provisioner.provision({
-    keyLength: 52, minTumblers: 2, maxTumblers: 3,
-    allowedWindows: [30],  // force 30s windows — expired after 90s
-  });
-  const expiredMap = expiredProv.tumblerMap!;
+  // Build a deterministic map with all-TOTP rotating segments (no HOTP randomness).
+  // generateTumblerMap() has a ~9% chance of all-HOTP segments; HOTP is counter-based,
+  // not time-based, so a "15-min-old" key would still be valid for all-HOTP maps.
+  // We construct the map directly with known TOTP segments to guarantee expiry.
+  const expiredStore = new MemoryTumblerStore();
+  const expiredMap: TumblerMap = {
+    clientId: generateClientId(),
+    sharedSecret: generateSharedSecret(),
+    keyLength: 52,
+    segments: [
+      { segmentId: generateSegmentId('id'),  position: [0, 12],  type: 'static' },
+      { segmentId: generateSegmentId('seg'), position: [12, 24], type: 'totp', windowSec: 30 },
+      { segmentId: generateSegmentId('seg'), position: [24, 36], type: 'totp', windowSec: 60 },
+      { segmentId: generateSegmentId('seg'), position: [36, 44], type: 'totp', windowSec: 30 },
+    ],
+    checksum: { position: [44, 52] },
+    createdAt: Date.now(),
+    version: '1',
+  };
+  await expiredStore.set(expiredMap.clientId, expiredMap);
 
-  // Generate a key 15 minutes in the past (outside ±1 window for any config)
+  // Generate a key 15 minutes in the past (900s >> ±1 window tolerance for 30s or 60s windows)
   const staleKey = generateKeyFromMap(expiredMap, NOW - 15 * 60_000);
   const req: TSKRequestData = {
     headers: {
@@ -138,7 +153,7 @@ console.log('\n[3] TSK Layer Failure — BPC passes, TSK key is expired');
       'x-tsk-version': '1',
     },
   };
-  const r = await verifyUltraRequest(req, bpcPass(), { tskStore: store, identityBinding });
+  const r = await verifyUltraRequest(req, bpcPass(), { tskStore: expiredStore, identityBinding });
 
   assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
   assert("error starts with 'TSK:'", r.error?.startsWith('TSK:') ?? false, `Got: ${r.error}`);

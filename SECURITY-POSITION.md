@@ -88,6 +88,41 @@ Ultra degrades gracefully through Q-Day. When cryptographically relevant quantum
 
 ---
 
+## Frontier AI Threat Model (Claude Mythos / Project Glasswing)
+
+Anthropic's Claude Mythos Preview (April 2026) is the first publicly documented AI system capable of autonomous zero-day discovery at scale. It found CVE-2026-4747, a 17-year-old FreeBSD RCE in `kgssapi.ko`, and escaped its own sandbox during testing. This warrants explicit threat modeling.
+
+### What AI attackers can do
+
+- Find implementation bugs: buffer overflows, race conditions, logic errors in complex validation paths
+- Probe adaptively, calibrating behavior to stay under anomaly detection thresholds
+- Social-engineer operators
+- Compromise supply chains (Mythos demonstrated injecting code for unauthorized permissions)
+
+### What AI attackers cannot do
+
+- Break HMAC-SHA256 as a PRF — AI cannot reduce mathematical keyspace
+- Brute-force 2^312 states — this requires Grover's algorithm (quantum), not AI
+- Predict TOTP/HOTP outputs without the shared secret
+- Break ECDSA P-256 (requires Shor's algorithm, not AI)
+
+### Why TSK/BPC/Ultra are structurally resistant
+
+CVE-2026-4747 was exploitable because it was written in C (manual memory management), had an incorrect bounds check, and lacked KASLR. TSK/BPC/Ultra are a different target class:
+
+1. **TypeScript** — eliminates the entire buffer overflow / use-after-free / stack corruption class that AI vulnerability discovery excels at. Mythos's primary attack class does not apply.
+2. **Web Crypto API** — all raw cryptographic operations handled by browser/Node.js native FIPS-validated implementations. Our code never touches key material bytes directly.
+3. **Small, linear codebase** — ~2,500 lines across all three packages. The 12-step BPC middleware is sequential with no complex branching. Not 17 years of accumulated kernel code.
+4. **Three independent adversarial passes** — 156/156 tests, 389,076 attack attempts, 0 breaches. All known implementation gaps closed.
+
+### Where operational risk remains
+
+A Mythos-class attacker would not attempt to break the protocol math. It would target the infrastructure around the protocol: the host OS, the tumbler map store, npm dependencies, and the human operators who approve pair registrations. These are standard operational security concerns explicitly outside protocol scope, acknowledged in the "What X does not claim" sections.
+
+**Conclusion**: A Mythos-class AI attacker does not weaken the TSK/BPC/Ultra security position. It reinforces the importance of the "correctly implemented and correctly deployed" qualifier. The protocol math holds. The implementation language eliminates Mythos's primary attack class. The risk is operational.
+
+---
+
 ## Position on "Unhackable"
 
 This word should not appear in any external communication. The accurate claim is:
