@@ -2,11 +2,11 @@
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "outDir": "./dist",
+    "rootDir": "./src",
     "baseUrl": ".",
     "paths": {
-      "@tsk/core": ["../core/src/index.ts"]
-    },
-    "rootDirs": ["./src", "../core/src"]
+      "@tsk/core": ["../core/dist/index.d.ts"]
+    }
   },
-  "include": ["src/**/*", "../core/src/**/*"]
+  "include": ["src/**/*"]
 }
