@@ -1,7 +1,12 @@
 // screen-vault.jsx — Live key visualizer with real HMAC-SHA256 via useGenerateKey
 
 function ScreenVault() {
-  const map = window.DEMO_MAP;
+  const [map, setMap] = useState(window.DEMO_MAP);
+  useEffect(() => {
+    const handler = e => setMap(e.detail);
+    window.addEventListener('demo-map-updated', handler);
+    return () => window.removeEventListener('demo-map-updated', handler);
+  }, []);
   const [counters, setCounters] = useState({});
   const [view, setView] = useState('server');
   const [paused, setPaused] = useState(false);
@@ -35,6 +40,23 @@ function ScreenVault() {
 
   const advanceHotp = segId => setCounters(c => ({ ...c, [segId]: (c[segId] ?? 0) + 1 }));
 
+  // Expiry countdown — must be declared before any conditional return (Rules of Hooks)
+  const [expiryLabel, setExpiryLabel] = useState('');
+  useEffect(() => {
+    if (!map?.expiresAt) { setExpiryLabel('Never'); return; }
+    const update = () => {
+      const remaining = map.expiresAt - Date.now();
+      if (remaining <= 0) { setExpiryLabel('Expired'); return; }
+      const days = Math.floor(remaining / 86400000);
+      const hours = Math.floor((remaining % 86400000) / 3600000);
+      const mins = Math.floor((remaining % 3600000) / 60000);
+      setExpiryLabel(days > 0 ? `${days}d ${hours}h remaining` : hours > 0 ? `${hours}h ${mins}m remaining` : `${mins}m remaining`);
+    };
+    update();
+    const iv = setInterval(update, 1000);
+    return () => clearInterval(iv);
+  }, [map?.expiresAt]);
+
   if (!map || !gen) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '40vh' }}>
@@ -60,6 +82,25 @@ function ScreenVault() {
           </div>
         }
       />
+
+      {/* Credential status */}
+      <div className="card">
+        <h3 style={{ marginBottom: 12 }}>Credential status</h3>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+          <Stat label="Status" value={map.status ?? 'active'}
+            sub={(map.status ?? 'active') === 'expired' ? 'not accepted' : 'accepted'}
+            accent={(map.status ?? 'active') === 'expired' ? 'var(--danger)' : 'var(--success)'} />
+          <Stat label="Expires" value={expiryLabel}
+            sub={map.expiresAt ? new Date(map.expiresAt).toLocaleString() : 'no expiry set'}
+            accent={map.expiresAt && Date.now() > map.expiresAt ? 'var(--danger)' : 'var(--success)'} />
+          <Stat label="Requests" value={map.maxRequests ? `${map.requestCount ?? 0} / ${map.maxRequests}` : `${map.requestCount ?? 0}`}
+            sub={map.maxRequests ? `${Math.round(100 - ((map.requestCount ?? 0) / map.maxRequests * 100))}% remaining` : 'unlimited'}
+            accent="var(--primary)" />
+          <Stat label="Label" value={map.label || '(none)'}
+            sub={map.lastUsedAt ? `last used ${new Date(map.lastUsedAt).toLocaleTimeString()}` : 'never used'}
+            accent="var(--muted)" />
+        </div>
+      </div>
 
       {/* View switcher */}
       <div className="card flush">

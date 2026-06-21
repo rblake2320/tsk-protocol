@@ -17,14 +17,16 @@ import {
   verifyTSKRequest,
   TSKProvisioner,
   MemoryAnomalyEngine,
-} from '../packages/server/src/index.ts';
+} from '../packages/server/src/index.js';
 // File store imported DIRECTLY — not re-exported via index.ts.
 // Enterprise ultra_server imports @tsk/server; this import bypasses that path.
-import { FileTumblerStore } from '../packages/server/src/file-store.ts';
+import { FileTumblerStore } from '../packages/server/src/file-store.js';
 
-const PORT      = 3200;
-const DEMO_DIR  = dirname(fileURLToPath(import.meta.url));
-const EVENT_LOG = join(DEMO_DIR, 'analytics.ndjson');
+const PORT         = 3200;
+const DEMO_DIR     = dirname(fileURLToPath(import.meta.url));
+const EVENT_LOG    = join(DEMO_DIR, 'analytics.ndjson');
+const SERVER_START = Date.now();
+const ADMIN_TOKEN  = process.env['TSK_ADMIN_TOKEN'] ?? 'demo-admin-token';
 
 // ── In-memory analytics store ────────────────────────────────────────────────
 interface AnalyticsEvent {
@@ -62,9 +64,15 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 
 function cors(res: ServerResponse): void {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers',
-    'Content-Type,X-TSK-Client-ID,X-TSK-Key,X-TSK-Version');
+    'Content-Type,Authorization,X-TSK-Client-ID,X-TSK-Key,X-TSK-Version');
+}
+
+function verifyAdmin(headers: Record<string, string | string[] | undefined>): boolean {
+  const auth = headers['authorization'];
+  const token = Array.isArray(auth) ? auth[0] : (auth ?? '');
+  return token === `Bearer ${ADMIN_TOKEN}`;
 }
 
 function json(res: ServerResponse, status: number, data: unknown): void {
@@ -93,7 +101,7 @@ function serveFile(res: ServerResponse, filePath: string): boolean {
   const ext  = extname(filePath);
   const mime = MIME[ext] ?? 'application/octet-stream';
   cors(res);
-  res.writeHead(200, { 'Content-Type': mime });
+  res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-store' });
   res.end(readFileSync(filePath));
   return true;
 }
@@ -141,16 +149,39 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 
     // ── Provision ────────────────────────────────────────────────────────────
     if (method === 'POST' && path === '/tsk/provision') {
-      const result = await provisioner.provision({}, ip);
+      const rawBody = await readBody(req);
+      let provisionOpts: { keyLength?: number; rotatingCount?: number; ttlMs?: number | null; maxRequests?: number | null; label?: string } = {};
+      try { provisionOpts = JSON.parse(rawBody.toString()); } catch { /* empty body is fine */ }
+
+      const expiresAt = (provisionOpts.ttlMs != null && provisionOpts.ttlMs > 0) ? Date.now() + provisionOpts.ttlMs : undefined;
+      const maxRequests = (provisionOpts.maxRequests != null && provisionOpts.maxRequests > 0) ? provisionOpts.maxRequests : undefined;
+      const label = provisionOpts.label ?? undefined;
+
+      const result = await provisioner.provision(
+        { keyLength: provisionOpts.keyLength, minTumblers: provisionOpts.rotatingCount, maxTumblers: provisionOpts.rotatingCount },
+        ip,
+      );
       if (!result.ok) {
         log(method, path, `PROVISION DENIED (${result.error})`);
         json(res, 400, { error: result.error });
         return;
       }
-      log(method, path, `PROVISIONED client=${result.clientId}`);
+
+      // Stamp lifecycle fields on the stored map
+      const fullMap = result.tumblerMap!;
+      if (expiresAt) fullMap.expiresAt = expiresAt;
+      if (maxRequests !== undefined) fullMap.maxRequests = maxRequests;
+      fullMap.requestCount = 0;
+      if (label) fullMap.label = label;
+      await store.set(fullMap.clientId, fullMap);
+
+      log(method, path, `PROVISIONED client=${result.clientId}${label ? ` label=${label}` : ''}`);
       json(res, 200, {
         ok: true,
         clientId: result.clientId,
+        expiresAt: expiresAt ?? null,
+        maxRequests: maxRequests ?? null,
+        label: label ?? null,
         provisionPayload: result.provisionPayload,
         sharedSecret: result.tumblerMap!.sharedSecret,
         serverMap: result.tumblerMap,
@@ -233,6 +264,19 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       return;
     }
 
+    // ── TSK-Protected: PUT /api/admin/config ─────────────────────────────────
+    if (method === 'PUT' && path === '/api/admin/config') {
+      const result = await verifyTSK(req, ip);
+      if (!result.ok) {
+        log(method, path, `DENIED (${result.error})`);
+        json(res, 401, { error: result.error });
+        return;
+      }
+      log(method, path, `PASS client=${result.clientId}`);
+      json(res, 200, { updated: true, clientId: result.clientId });
+      return;
+    }
+
     // ── Analytics: POST /analytics/event ────────────────────────────────────
     if (method === 'POST' && path === '/analytics/event') {
       const rawBody = await readBody(req);
@@ -275,6 +319,73 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       return;
     }
 
+    // ── Health ────────────────────────────────────────────────────────────────
+    if (method === 'GET' && path === '/health') {
+      const clients = await store.list();
+      const sessions = new Set(analyticsEvents.map(e => e.session));
+      // Count expired clients
+      let expiredCount = 0;
+      const now = Date.now();
+      for (const cid of clients) {
+        const m = await store.get(cid);
+        if (m?.expiresAt && now > m.expiresAt) expiredCount++;
+      }
+      json(res, 200, {
+        status: 'ok',
+        uptimeMs: Date.now() - SERVER_START,
+        port: PORT,
+        clientCount: clients.length,
+        expiredCount,
+        trackedClients: anomaly.trackedClients,
+        trackedIPs: anomaly.trackedIPs,
+        analyticsEvents: analyticsEvents.length,
+        uniqueSessions: sessions.size,
+        ts: Date.now(),
+      });
+      return;
+    }
+
+    // ── Admin: list clients ───────────────────────────────────────────────────
+    if (method === 'GET' && path === '/tsk/admin/clients') {
+      if (!verifyAdmin(req.headers as Record<string, string | string[] | undefined>)) {
+        json(res, 401, { error: 'unauthorized' });
+        return;
+      }
+      const url_obj = new URL(req.url ?? '/', `http://localhost:${PORT}`);
+      const fullExport = url_obj.searchParams.get('export') === 'true';
+      const clients = await store.list();
+      const result = await Promise.all(clients.map(async cid => {
+        const map = await store.get(cid);
+        if (!map) return null;
+        const score = anomaly.score(cid);
+        return {
+          clientId: cid,
+          createdAt: new Date(map.createdAt).toISOString(),
+          keyLength: map.keyLength,
+          sharedSecret: fullExport ? map.sharedSecret : '••••' + map.sharedSecret.slice(-4),
+          expiresAt: map.expiresAt ? new Date(map.expiresAt).toISOString() : null,
+          expiresIn: map.expiresAt ? Math.max(0, map.expiresAt - Date.now()) : null,
+          maxRequests: map.maxRequests ?? null,
+          requestCount: map.requestCount ?? 0,
+          status: map.status ?? 'active',
+          label: map.label ?? null,
+          lastUsedAt: map.lastUsedAt ? new Date(map.lastUsedAt).toISOString() : null,
+          segments: map.segments.map(s => ({
+            segmentId: s.segmentId,
+            type: s.type,
+            position: s.position,
+            length: s.position[1] - s.position[0],
+            ...(s.type === 'totp' ? { windowSec: s.windowSec } : {}),
+            ...(s.type === 'hotp' ? { counter: s.counter ?? 0 } : {}),
+          })),
+          anomaly: score,
+        };
+      }));
+      log(method, path, `ADMIN clients=${clients.length} export=${fullExport}`);
+      json(res, 200, { clientCount: clients.length, clients: result.filter(Boolean) });
+      return;
+    }
+
     json(res, 404, { error: 'not_found' });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -289,11 +400,17 @@ process.on('unhandledRejection', (reason) => console.error('[CRITICAL] Rejection
 server.listen(PORT, () => {
   console.log(`\nTSK Demo Server running on http://localhost:${PORT}`);
   console.log('');
-  console.log('  POST /tsk/provision         Provision a new client');
-  console.log('  POST /tsk/revoke            Revoke a client');
-  console.log('  GET  /tsk/anomaly           Anomaly scores');
-  console.log('  GET  /api/data    [TSK]     Protected endpoint');
-  console.log('  GET  /api/secret  [TSK]     Protected endpoint');
-  console.log('  POST /api/action  [TSK]     Protected endpoint');
+  console.log('  POST /tsk/provision               Provision a new client');
+  console.log('  POST /tsk/revoke                  Revoke a client');
+  console.log('  GET  /tsk/anomaly                 Anomaly scores (all clients)');
+  console.log('  GET  /tsk/admin/clients  [admin]  List clients + map info');
+  console.log('  GET  /tsk/admin/clients?export=true  Full export with secrets');
+  console.log('  GET  /health                      Server health + metrics');
+  console.log('  GET  /analytics                   Analytics event summary');
+  console.log('  GET  /api/data         [TSK]     Protected endpoint');
+  console.log('  GET  /api/secret       [TSK]     Protected endpoint');
+  console.log('  POST /api/action       [TSK]     Protected endpoint');
+  console.log('  PUT  /api/admin/config [TSK]     Protected endpoint');
+  console.log(`  Admin token: ${process.env['TSK_ADMIN_TOKEN'] ? 'custom token configured' : 'demo default active'}`);
   console.log('');
 });

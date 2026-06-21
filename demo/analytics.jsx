@@ -12,10 +12,19 @@ const SESSION_START = Date.now();
 const _queue = [];
 let _flushing = false;
 
-// Defer first flush until page is fully loaded — prevents boot-window
-// races where analytics POSTs arrive before the server finishes startup.
-let _pageReady = document.readyState === 'complete';
-if (!_pageReady) window.addEventListener('load', () => { _pageReady = true; _flush(); }, { once: true });
+// Defer first flush until the page is fully loaded AND one event-loop
+// tick has passed. This prevents boot-window races where Babel executes
+// analytics.jsx while data.jsx's provisionFromServer() is still in-flight —
+// the server is busy with provision crypto and not ready to handle analytics.
+// Using setTimeout(0) guarantees we're always deferred, even when
+// document.readyState is already 'complete' (common with type="text/babel").
+let _pageReady = false;
+const _activateQueue = () => setTimeout(() => { _pageReady = true; _flush(); }, 0);
+if (document.readyState === 'complete') {
+  _activateQueue();
+} else {
+  window.addEventListener('load', _activateQueue, { once: true });
+}
 
 async function _flush() {
   if (!_pageReady || _flushing || _queue.length === 0) return;

@@ -10,6 +10,7 @@
 import { generateTumblerMap, validateTSKKey } from './packages/core/src/index.js';
 import { createTSKServer } from './packages/server/src/index.js';
 import { verifyTSKRequest } from './packages/server/src/middleware.js';
+import type { TumblerMap } from './packages/core/src/types.js';
 
 type TestResult = { name: string; passed: boolean; detail: string };
 const results: TestResult[] = [];
@@ -24,6 +25,14 @@ function assert(name: string, condition: boolean, detail: string) {
 // ─── Setup ────────────────────────────────────────────────────────────────────
 const map = generateTumblerMap({ keyLength: 96, minTumblers: 2, maxTumblers: 4 });
 const NOW = Date.now();
+const replayMap: TumblerMap = {
+  ...map,
+  segments: map.segments.map((seg, index) => (
+    index === 0
+      ? { ...seg, type: 'static' as const, counter: undefined, windowSec: undefined }
+      : { ...seg, type: 'totp' as const, counter: undefined, windowSec: 30 }
+  )),
+};
 
 // Generate a valid key at time NOW
 async function validKey(nowMs = NOW): Promise<string> {
@@ -37,18 +46,18 @@ console.log('\n[Attack 1] Stolen Key Replay — TOTP window expired');
   const { generateKeyFromMap } = await import('./packages/core/src/key-gen.js');
   // Generate a key in a past window (5 minutes ago = well outside ±1 window tolerance)
   const pastWindow = NOW - 5 * 60 * 1000;
-  const stolenKey = generateKeyFromMap(map, pastWindow);
+  const stolenKey = generateKeyFromMap(replayMap, pastWindow);
 
   // Attempt to use the stolen key at current time
-  const result = validateTSKKey(stolenKey, { map, nowMs: NOW });
-  assert('Expired TOTP segment rejected', !result.ok, 'Expected VALIDATION_FAILED for expired key');
-  assert('Error is VALIDATION_FAILED or CHECKSUM_INVALID',
-    result.error === 'INVALID_KEY' || result.error === 'VALIDATION_FAILED' || result.error === 'CHECKSUM_INVALID',
-    `Got: ${result.error}`);
+  const result = validateTSKKey(stolenKey, { map: replayMap, nowMs: NOW });
+  assert('Expired TOTP segment rejected', !result.ok, 'Expected INVALID_KEY for expired key');
+  assert('Error is generic externally with internal diagnostic',
+    result.error === 'INVALID_KEY' && ['VALIDATION_FAILED', 'CHECKSUM_INVALID'].includes(result.internalError ?? ''),
+    `Got: ${result.error} / ${result.internalError}`);
 
   // Current key still works
-  const currentKey = generateKeyFromMap(map, NOW);
-  const validResult = validateTSKKey(currentKey, { map, nowMs: NOW });
+  const currentKey = generateKeyFromMap(replayMap, NOW);
+  const validResult = validateTSKKey(currentKey, { map: replayMap, nowMs: NOW });
   assert('Current key still valid after replay attempt', validResult.ok, `Error: ${validResult.error}`);
 }
 
@@ -114,8 +123,8 @@ console.log('\n[Attack 5] Stolen Key Structural Analysis — attacker tries to i
 {
   const { generateKeyFromMap } = await import('./packages/core/src/key-gen.js');
   // Generate two keys 30 seconds apart — attacker XORs to find which chars changed
-  const key1 = generateKeyFromMap(map, NOW);
-  const key2 = generateKeyFromMap(map, NOW + 5 * 60_000); // 5 minutes later
+  const key1 = generateKeyFromMap(replayMap, NOW);
+  const key2 = generateKeyFromMap(replayMap, NOW + 5 * 60_000); // 5 minutes later
 
   // Which positions changed?
   const changedPositions: number[] = [];
@@ -129,7 +138,7 @@ console.log('\n[Attack 5] Stolen Key Structural Analysis — attacker tries to i
   ).join('');
 
   // At NOW+60000, key1's segments are expired — hybrid key with old rotating values should fail
-  const result = validateTSKKey(hybridKey, { map, nowMs: NOW + 5 * 60_000 });
+  const result = validateTSKKey(hybridKey, { map: replayMap, nowMs: NOW + 5 * 60_000 });
   assert('Hybrid key with expired rotating segments rejected', !result.ok,
     'Structural analysis + replay attempt correctly blocked');
 }

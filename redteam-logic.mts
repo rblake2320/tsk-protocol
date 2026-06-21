@@ -160,7 +160,7 @@ await test('Validation order: checksum checked AFTER segments', () => {
   // Since checksum is validated AFTER segments, what error do we get?
   console.log(`    Expired key error: ${r.error}`);
   
-  if (r.error === 'VALIDATION_FAILED') {
+  if (r.error === 'INVALID_KEY' && r.internalError === 'VALIDATION_FAILED') {
     warn('Checksum validated after segments — inefficient rejection path',
       `validate.ts iterates ALL segments before checking the checksum. ` +
       `For a completely random key, this wastes CPU on segment comparison before the fast checksum check. ` +

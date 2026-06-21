@@ -125,6 +125,58 @@ function ScreenAttack() {
         eventKind = 'fail-all';
       }
 
+      if (kind === 'expired-cred') {
+        // Provision a short-lived client (100ms TTL), wait for it to expire, then fire
+        try {
+          const tmpMap = await provisionFromServer({ ttlMs: 100 });
+          await new Promise(r => setTimeout(r, 300));
+          const tmpGen = await generateKey(tmpMap, Date.now());
+          const srv = await verifyWithServer(tmpMap.clientId, tmpGen.key);
+          label = 'Expired credential (100ms TTL, fired after 300ms)';
+          result = {
+            verdict: srv.ok ? 'accept' : 'reject',
+            serverError: srv.data?.error,
+            status: srv.status,
+            results: {},
+          };
+        } catch (e) {
+          label = 'Expired credential';
+          result = { verdict: 'error', serverError: e.message, results: {} };
+        }
+        trackEvent('attack_fired', { kind, verdict: result.verdict });
+        setAttempts(a => [{ t, kind, label, result }, ...a].slice(0, 12));
+        await refreshAnomaly();
+        setFiring(false);
+        return;
+      }
+
+      if (kind === 'cap-exceeded') {
+        // Provision a maxRequests=1 client, use it once (succeed), then use it again (fail)
+        try {
+          const tmpMap = await provisionFromServer({ maxRequests: 1 });
+          const tmpGen1 = await generateKey(tmpMap, Date.now());
+          const srv1 = await verifyWithServer(tmpMap.clientId, tmpGen1.key);
+          // Second attempt — should fail
+          const tmpGen2 = await generateKey(tmpMap, Date.now());
+          const srv2 = await verifyWithServer(tmpMap.clientId, tmpGen2.key);
+          label = `Cap exceeded (maxRequests=1): 1st=${srv1.ok ? 'PASS' : 'FAIL'}, 2nd=${srv2.ok ? 'PASS' : 'FAIL'}`;
+          result = {
+            verdict: srv2.ok ? 'accept' : 'reject',
+            serverError: srv2.data?.error,
+            status: srv2.status,
+            results: {},
+          };
+        } catch (e) {
+          label = 'Cap exceeded';
+          result = { verdict: 'error', serverError: e.message, results: {} };
+        }
+        trackEvent('attack_fired', { kind, verdict: result.verdict });
+        setAttempts(a => [{ t, kind, label, result }, ...a].slice(0, 12));
+        await refreshAnomaly();
+        setFiring(false);
+        return;
+      }
+
       if (kind === 'brute-burst') {
         // 6 random forgeries — all sent to real server
         const localEvents = [];
@@ -221,7 +273,7 @@ function ScreenAttack() {
       {/* Attack triggers + anomaly */}
       <div style={{ display: 'grid', gridTemplateColumns: '1.3fr 1fr', gap: 16 }}>
         <div className="card flush">
-          <div className="ch"><h3>Attack vectors</h3><Pill>5 live · real server</Pill></div>
+          <div className="ch"><h3>Attack vectors</h3><Pill>7 live · real server</Pill></div>
           <div className="cb" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <AttackCard
               kind="replay-now" label="Replay immediately"
@@ -240,6 +292,14 @@ function ScreenAttack() {
               kind="forge-checksum" label="Corrupt checksum"
               desc="Mutate the checksum tail. Server rejects before any segment validation runs."
               disabled={firing} onFire={() => fire('forge-checksum')} />
+            <AttackCard
+              kind="expired-cred" label="Expired credential"
+              desc="Provisions a 100ms-TTL client, waits 300ms, then fires the key. Server rejects with TSK_KEY_EXPIRED."
+              highValue disabled={firing} onFire={() => fire('expired-cred')} />
+            <AttackCard
+              kind="cap-exceeded" label="Usage cap exceeded"
+              desc="Provisions a maxRequests=1 client. First request passes. Second request rejected: TSK_KEY_USAGE_CAP_EXCEEDED."
+              highValue disabled={firing} onFire={() => fire('cap-exceeded')} />
             <AttackCard
               kind="brute-burst" label="Brute burst ×6"
               desc="Six random forgeries sent to real server. Watch threat score spike in the anomaly engine."
@@ -271,7 +331,11 @@ function ScreenAttack() {
           </div>
           <div className="col" style={{ gap: 6 }}>
             {localAnomaly.reasons.length === 0
-              ? <span className="muted" style={{ fontSize: 12 }}>No failures observed yet. Fire something.</span>
+              ? <span className="muted" style={{ fontSize: 12 }}>
+                  {localAnomaly.windowSize === 0
+                    ? 'No failures observed yet. Fire something.'
+                    : `${localAnomaly.windowSize} event${localAnomaly.windowSize > 1 ? 's' : ''} logged — below scoring threshold. Keep firing.`}
+                </span>
               : localAnomaly.reasons.map((r, i) => (
                   <div key={i} className="mono" style={{ fontSize: 11.5, color: 'var(--muted)' }}>
                     <span style={{ color: 'var(--danger)' }}>›</span> {r}
@@ -335,7 +399,9 @@ function ScreenAttack() {
                     </Pill>
                   </td>
                   <td className="muted" style={{ fontSize: 12 }}>
-                    {a.result?.checksumFail ? 'Checksum rejected — segments skipped'
+                    {a.result?.serverError === 'TSK_KEY_EXPIRED' ? 'Credential expired — key TTL exceeded'
+                      : a.result?.serverError === 'TSK_KEY_USAGE_CAP_EXCEEDED' ? 'Usage cap reached — max requests exhausted'
+                      : a.result?.checksumFail ? 'Checksum rejected — segments skipped'
                       : a.result?.staticPass && a.result?.rotFail ? 'Static passes, rotating fails — stolen key fingerprint'
                       : a.result?.allFail ? 'All segments fail — forgery'
                       : a.result?.verdict === 'observed' ? 'Sniffer only — no validation request'

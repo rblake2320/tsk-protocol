@@ -86,6 +86,13 @@ function buildLocalMap(clientId, sharedSecret, serverMap, provisionPayload) {
     order: segments.map(s => s.id),
     createdAt: serverMap.createdAt,
     version: '1.0',
+    // Lifecycle fields
+    expiresAt: serverMap.expiresAt ?? null,
+    maxRequests: serverMap.maxRequests ?? null,
+    requestCount: serverMap.requestCount ?? 0,
+    status: serverMap.status ?? 'active',
+    label: serverMap.label ?? null,
+    lastUsedAt: serverMap.lastUsedAt ?? null,
     // Keep provision payload for client-SDK key generation context
     clientSegments: provisionPayload.clientSegments,
     checksumLength: provisionPayload.checksumLength,

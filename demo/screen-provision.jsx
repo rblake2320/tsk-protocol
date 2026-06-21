@@ -3,6 +3,9 @@
 function ScreenProvision() {
   const [keyLength, setKeyLength] = useState(52);
   const [rotatingCount, setRotatingCount] = useState(3);
+  const [ttlMs, setTtlMs] = useState(null);
+  const [maxRequests, setMaxRequests] = useState(null);
+  const [label, setLabel] = useState('');
   const [map, setMap] = useState(window.DEMO_MAP);
   const [stage, setStage] = useState('ready');  // ready | rolling | done | error
   const [step, setStep] = useState(0);
@@ -41,10 +44,12 @@ function ScreenProvision() {
     }, 180);
 
     try {
-      const newMap = await provisionFromServer({ keyLength, rotatingCount });
+      const newMap = await provisionFromServer({ keyLength, rotatingCount, ttlMs, maxRequests, label: label || undefined });
       clearInterval(interval);
       setStep(steps.length);
       setMap(newMap);
+      window.DEMO_MAP = newMap;
+      window.dispatchEvent(new CustomEvent('demo-map-updated', { detail: newMap }));
       trackEvent('provision_complete', { keyLength, rotatingCount, clientId: newMap.clientId });
       setStage('done');
       setTimeout(() => setStage('ready'), 1500);
@@ -79,6 +84,31 @@ function ScreenProvision() {
             <Param label="Rotating segments" value={rotatingCount} min={2} max={5} step={1}
               onChange={setRotatingCount}
               hint="2–5 rotating segments + 1 static + 1 checksum. Each gets a random type and timing." />
+            <div>
+              <div className="upper" style={{ marginBottom: 6 }}>Expires</div>
+              <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                {[['Never', null], ['1h', 3600000], ['8h', 28800000], ['24h', 86400000], ['7d', 604800000]].map(([lbl, ms]) => (
+                  <button key={lbl} className={`btn sm ${ttlMs === ms ? 'primary' : ''}`}
+                    onClick={() => setTtlMs(ms)}>{lbl}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="upper" style={{ marginBottom: 6 }}>Max requests</div>
+              <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                {[['Unlimited', null], ['10', 10], ['100', 100], ['1000', 1000]].map(([lbl, n]) => (
+                  <button key={lbl} className={`btn sm ${maxRequests === n ? 'primary' : ''}`}
+                    onClick={() => setMaxRequests(n)}>{lbl}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="upper" style={{ marginBottom: 6 }}>Label (optional)</div>
+              <input type="text" value={label} onChange={e => setLabel(e.target.value)}
+                placeholder="e.g. mobile-client-1"
+                style={{ width: '100%', background: 'var(--surface-2)', border: '1px solid var(--border)',
+                  borderRadius: 6, padding: '6px 10px', fontSize: 12, color: 'var(--text)' }} />
+            </div>
             <div>
               <div className="upper" style={{ marginBottom: 6 }}>Auth · Provisioner endpoint</div>
               <div className="mono" style={{ fontSize: 12, color: 'var(--muted)' }}>
@@ -158,6 +188,14 @@ function ScreenProvision() {
               </div>
               <Pill tone="primary">≤ what client needs</Pill>
             </div>
+            <div className="cb">
+              <div className="row" style={{ gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
+                <Pill tone={map.status === 'expired' ? 'warn' : 'primary'}>{map.status ?? 'active'}</Pill>
+                {map.expiresAt && <Pill tone="warn">expires {new Date(map.expiresAt).toLocaleDateString()}</Pill>}
+                {map.maxRequests && <Pill tone="warn">max {map.maxRequests} requests</Pill>}
+                {map.label && <Pill>{map.label}</Pill>}
+              </div>
+            </div>
             <pre className="mono" style={{
               margin: 0, padding: 18, fontSize: 12, lineHeight: 1.55,
               color: 'var(--muted)', background: 'var(--bg-2)',
@@ -194,6 +232,11 @@ function ScreenProvision() {
                 clientId: map.clientId,
                 sharedSecret: map.sharedSecret.slice(0, 8) + '…' + map.sharedSecret.slice(-4),
                 keyLength: map.keyLength,
+                status: map.status ?? 'active',
+                ...(map.expiresAt ? { expiresAt: new Date(map.expiresAt).toISOString() } : {}),
+                ...(map.maxRequests ? { maxRequests: map.maxRequests } : {}),
+                ...(map.label ? { label: map.label } : {}),
+                requestCount: map.requestCount ?? 0,
                 segments: map.segments.map(s => ({
                   id: s.id,
                   type: s.type,

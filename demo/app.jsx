@@ -83,7 +83,7 @@ function App() {
   }, []);
 
   const goto = id => {
-    location.hash = id;
+    history.pushState(null, '', `#${id}`);
     setRoute(id);
     window.scrollTo({ top: 0, behavior: 'instant' });
   };
