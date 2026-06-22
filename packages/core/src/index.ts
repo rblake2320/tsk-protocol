@@ -4,3 +4,4 @@ export * from './segment.js';
 export * from './tumbler-map.js';
 export * from './key-gen.js';
 export * from './validate.js';
+export * from './runtime-capture.js';

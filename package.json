@@ -8,7 +8,7 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "test": "npx tsx test-suite.mts && npx tsx lifecycle-suite.mts && npx tsx attack-suite.mts && npx tsx adversarial-proof.mts && npx tsx ultra-bridge-test.mts",
+    "test": "npx tsx test-suite.mts && npx tsx lifecycle-suite.mts && npx tsx attack-suite.mts && npx tsx adversarial-proof.mts && npx tsx ultra-bridge-test.mts && npx tsx runtime-capture-suite.mts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {

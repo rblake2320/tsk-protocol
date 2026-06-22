@@ -25,6 +25,7 @@ import {
   MIN_WINDOW_SEC,
   MAX_WINDOW_SEC,
 } from '@tsk/core';
+import { emitKeyGenerationCapture } from '@tsk/core';
 import type { TumblerMapStore } from './store.js';
 
 // ─── Rate Limiter Interface ───────────────────────────────────────────────────
@@ -192,6 +193,19 @@ export class TSKProvisioner {
 
       await this.store.set(map.clientId, map);
       this.auditLogger?.logProvision(map.clientId, requestorId);
+      emitKeyGenerationCapture({
+        protocol: 'tsk',
+        packageName: '@tsk/server',
+        event: 'tsk.client.provisioned',
+        clientId: map.clientId,
+        algorithm: 'HMAC-SHA-256',
+        details: {
+          keyLength: map.keyLength,
+          segmentCount: map.segments.length,
+          requestorId,
+          label: lifecycle?.label,
+        },
+      });
 
       return {
         ok: true,

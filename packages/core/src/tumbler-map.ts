@@ -21,6 +21,8 @@ import {
   generateSegmentId,
   secureRandomInt,
 } from './crypto.js';
+import { emitKeyGenerationCapture } from './runtime-capture.js';
+import type { KeyGenerationCaptureOptions } from './runtime-capture.js';
 import type {
   TumblerMap,
   SegmentConfig,
@@ -127,7 +129,10 @@ function validateOptions(options: TumblerMapOptions): Required<TumblerMapOptions
  * The positions of segments are randomized and shuffled — this is the
  * structural secrecy layer. The client NEVER receives position information.
  */
-export function generateTumblerMap(options: TumblerMapOptions = {}): TumblerMap {
+export function generateTumblerMap(
+  options: TumblerMapOptions = {},
+  captureOptions: KeyGenerationCaptureOptions = {},
+): TumblerMap {
   const { keyLength, minTumblers, maxTumblers, allowedWindows } = validateOptions(options);
 
   const clientId = generateClientId();
@@ -168,7 +173,7 @@ export function generateTumblerMap(options: TumblerMapOptions = {}): TumblerMap 
     };
   });
 
-  return {
+  const map: TumblerMap = {
     clientId,
     sharedSecret,
     keyLength,
@@ -177,6 +182,21 @@ export function generateTumblerMap(options: TumblerMapOptions = {}): TumblerMap 
     createdAt: Date.now(),
     version: '1',
   };
+  emitKeyGenerationCapture({
+    protocol: 'tsk',
+    packageName: '@tsk/core',
+    event: 'tsk.tumbler_map.generated',
+    clientId,
+    algorithm: 'HMAC-SHA-256',
+    runtime: captureOptions.runtimeMetadata,
+    details: {
+      keyLength,
+      segmentCount: segments.length,
+      checksumLength: CHECKSUM_LENGTH,
+      ...captureOptions.captureDetails,
+    },
+  });
+  return map;
 }
 
 // ─── Provision Payload ────────────────────────────────────────────────────────
