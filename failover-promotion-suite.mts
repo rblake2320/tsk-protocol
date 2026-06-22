@@ -122,4 +122,5 @@ if (failed > 0) {
   process.exit(1);
 } else {
   console.log('ALL TESTS PASSED — TSK promotion gate + failover transport verified');
+  process.exit(0);   // explicit: a pending backoff setTimeout would otherwise keep node alive
 }

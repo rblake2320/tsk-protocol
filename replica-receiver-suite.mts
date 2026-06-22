@@ -132,4 +132,5 @@ if (failed > 0) {
   process.exit(1);
 } else {
   console.log('ALL TESTS PASSED — TSK replica receiver verified');
+  process.exit(0);   // explicit: a pending backoff setTimeout would otherwise keep node alive
 }
