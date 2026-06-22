@@ -4,6 +4,9 @@ export * from './anomaly.js';
 export * from './middleware.js';
 export * from './principal-session.js';
 export * from './agent-cache.js';
+export * from './replicating-tumbler-store.js';
+export * from './replica-receiver.js';
+export * from './promotion.js';
 
 import { MemoryTumblerStore } from './store.js';
 import { TSKProvisioner } from './provisioner.js';
