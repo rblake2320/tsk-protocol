@@ -12,3 +12,6 @@ debug-prov.mts
 patch_*.py
 redteam-concurrency-diag.mts
 debug-e2e.mts
+
+# FileTumblerStore persistent data — lives in ~/.tsk, never in repo
+demo/tsk-maps.json
