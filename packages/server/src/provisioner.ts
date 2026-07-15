@@ -25,6 +25,7 @@ import {
   MAX_TUMBLERS,
   MIN_WINDOW_SEC,
   MAX_WINDOW_SEC,
+  TSK_MAX_HOTP_COUNTER,
 } from '@tsk/core';
 import { emitKeyGenerationCapture } from '@tsk/core';
 import type { TumblerMapStore } from './store.js';
@@ -186,6 +187,8 @@ export class TSKProvisioner {
       maxRequests?: number;
       /** Explicit number of remaining requests at which rotation is required. */
       rotationWarningRequests?: number;
+      /** HOTP derivations remaining at which replacement is required. */
+      hotpRotationWarningCounters?: number;
     },
   ): Promise<ProvisionResult> {
     // ── Rate limit check ─────────────────────────────────────────────────────────
@@ -227,6 +230,12 @@ export class TSKProvisioner {
             return { ok: false, error: 'INVALID_ROTATION_WARNING_REQUESTS' };
           }
           map.rotationWarningRequests = lifecycle.rotationWarningRequests;
+        }
+        if (lifecycle.hotpRotationWarningCounters !== undefined) {
+          if (!isValidHOTPWarning(lifecycle.hotpRotationWarningCounters)) {
+            return { ok: false, error: 'INVALID_HOTP_ROTATION_WARNING_COUNTERS' };
+          }
+          map.hotpRotationWarningCounters = lifecycle.hotpRotationWarningCounters;
         }
       }
       // Initialize lifecycle tracking fields
@@ -291,6 +300,7 @@ export class TSKProvisioner {
       expiresAt?: number;
       maxRequests?: number;
       rotationWarningRequests?: number;
+      hotpRotationWarningCounters?: number;
     },
     requestorId: string,
     reason: string,
@@ -325,6 +335,12 @@ export class TSKProvisioner {
         }
         replacement.rotationWarningRequests = lifecycle.rotationWarningRequests;
       }
+      if (lifecycle.hotpRotationWarningCounters !== undefined) {
+        if (!isValidHOTPWarning(lifecycle.hotpRotationWarningCounters)) {
+          return { ok: false, error: 'INVALID_HOTP_ROTATION_WARNING_COUNTERS' };
+        }
+        replacement.hotpRotationWarningCounters = lifecycle.hotpRotationWarningCounters;
+      }
 
       const committed = await this.store.replaceCredential(oldClientId, replacement);
       if (!committed) return { ok: false, error: 'REPLACEMENT_COMMIT_FAILED' };
@@ -353,6 +369,7 @@ export class TSKProvisioner {
       expiresAt?: number | null;
       maxRequests?: number | null;
       rotationWarningRequests?: number | null;
+      hotpRotationWarningCounters?: number | null;
       status?: 'active' | 'expiring' | 'revoked' | 'expired';
     },
     requestorId: string,
@@ -385,6 +402,11 @@ export class TSKProvisioner {
       }
       updated.rotationWarningRequests = warning ?? undefined;
     }
+    if ('hotpRotationWarningCounters' in updates) {
+      const warning = updates.hotpRotationWarningCounters;
+      if (warning !== null && warning !== undefined && !isValidHOTPWarning(warning)) return false;
+      updated.hotpRotationWarningCounters = warning ?? undefined;
+    }
     if (updates.status === 'revoked' || updates.status === 'expired') {
       updated.status = updates.status;
     } else if (updates.status !== undefined && updates.status !== existing.status) {
@@ -411,6 +433,7 @@ export class TSKProvisioner {
     expiresAt?: number;
     maxRequests?: number;
     rotationWarningRequests?: number;
+    hotpRotationWarningCounters?: number;
     requestCount: number;
     lastUsedAt: number | null;
     keyLength: number;
@@ -428,6 +451,7 @@ export class TSKProvisioner {
         expiresAt: m.expiresAt,
         maxRequests: m.maxRequests,
         rotationWarningRequests: m.rotationWarningRequests,
+        hotpRotationWarningCounters: m.hotpRotationWarningCounters,
         requestCount: m.requestCount ?? 0,
         lastUsedAt: m.lastUsedAt ?? null,
         keyLength: m.keyLength,
@@ -447,6 +471,7 @@ export class TSKProvisioner {
     expiresAt?: number;
     maxRequests?: number;
     rotationWarningRequests?: number;
+    hotpRotationWarningCounters?: number;
     requestCount: number;
     lastUsedAt: number | null;
     keyLength: number;
@@ -462,6 +487,7 @@ export class TSKProvisioner {
       expiresAt: m.expiresAt,
       maxRequests: m.maxRequests,
       rotationWarningRequests: m.rotationWarningRequests,
+      hotpRotationWarningCounters: m.hotpRotationWarningCounters,
       requestCount: m.requestCount ?? 0,
       lastUsedAt: m.lastUsedAt ?? null,
       keyLength: m.keyLength,
@@ -510,4 +536,8 @@ function validateProvisionOptions(options: TumblerMapOptions): string | undefine
     }
   }
   return undefined;
+}
+
+function isValidHOTPWarning(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 1 && value <= TSK_MAX_HOTP_COUNTER;
 }

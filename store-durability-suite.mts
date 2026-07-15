@@ -35,7 +35,12 @@ try {
   const serverFile = join(directory, 'server.json');
   const fileStore = new FileTumblerStore(serverFile);
   await fileStore.set(first.clientId, first);
-  await fileStore.commitValidation(first.clientId, { counterMatches: [], usedAt: Date.now() });
+  await fileStore.commitValidation(first.clientId, {
+    counterMatches: first.segments
+      .filter(segment => segment.type === 'hotp')
+      .map(segment => ({ segmentId: segment.segmentId, matchedCounter: segment.counter ?? 0 })),
+    usedAt: Date.now(),
+  });
   const restarted = new FileTumblerStore(serverFile);
   assert('server file store survives restart with lifecycle state', (await restarted.get(first.clientId))?.requestCount === 1);
 

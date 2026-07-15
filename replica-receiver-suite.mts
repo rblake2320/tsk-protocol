@@ -1,4 +1,8 @@
-import { generateTumblerMap, type TumblerMap } from './packages/core/src/index.ts';
+import {
+  TSK_MAX_HOTP_COUNTER,
+  generateTumblerMap,
+  type TumblerMap,
+} from './packages/core/src/index.ts';
 import { MemoryTumblerStore } from './packages/server/src/store.ts';
 import {
   REPLICATION_GENESIS_HASH,
@@ -116,6 +120,51 @@ await test('newer signed set cannot roll counters, usage, or terminal lifecycle 
   const result = await receiver.ingest(second);
   assert(result.status === 409 && result.result.error === 'lifecycle_rollback', JSON.stringify(result));
   assert(receiver.promotionCheckpoint() === null, 'rollback attempt must disqualify receiver');
+});
+
+await test('exhausted MAX sentinel replicates as terminal and cannot roll back', async () => {
+  const store = new MemoryTumblerStore();
+  const receiver = new TumblerReplicaReceiver(store, TOKEN, {
+    streamId: STREAM,
+    epoch: EPOCH,
+    now: () => NOW,
+    secretUnsealer: (_clientId, sealed) => sealed.startsWith('sealed:') ? sealed.slice(7) : 'invalid',
+    promotionDurability: () => true,
+  });
+  const source = generateTumblerMap();
+  const exhausted: TumblerMap = {
+    ...source,
+    sharedSecret: `sealed:${source.sharedSecret}`,
+    status: 'expired',
+    segments: source.segments.map(segment => segment.type === 'hotp'
+      ? { ...segment, counter: TSK_MAX_HOTP_COUNTER }
+      : segment),
+  };
+  const first = envelope(
+    { op: 'set', clientId: source.clientId, map: exhausted, secretSealed: true },
+    1,
+    REPLICATION_GENESIS_HASH,
+  );
+  const applied = await receiver.ingest(first);
+  assert(applied.status === 200, JSON.stringify(applied));
+  const stored = await store.get(source.clientId);
+  assert(stored?.status === 'expired', JSON.stringify(stored));
+  assert(stored?.segments.filter(segment => segment.type === 'hotp')
+    .every(segment => segment.counter === TSK_MAX_HOTP_COUNTER), JSON.stringify(stored));
+
+  const hotp = exhausted.segments.find(segment => segment.type === 'hotp')!;
+  const rollback = envelope(
+    {
+      op: 'updateCounters',
+      clientId: source.clientId,
+      updates: [[hotp.segmentId, TSK_MAX_HOTP_COUNTER - 1]],
+    },
+    2,
+    first.headHash,
+  );
+  const rejected = await receiver.ingest(rollback);
+  assert(rejected.status === 409 && rejected.result.error === 'counter_rollback', JSON.stringify(rejected));
+  assert(receiver.promotionCheckpoint() === null, 'rollback did not disqualify promotion');
 });
 
 await test('sealed state qualifies only after successful secret unsealing', async () => {

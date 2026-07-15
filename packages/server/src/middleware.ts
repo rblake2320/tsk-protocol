@@ -26,6 +26,7 @@ export const TSK_RESPONSE_HEADERS = {
   AUTHENTICATED: 'x-tsk-authenticated',
   ROTATION_REQUIRED: 'x-tsk-rotation-required',
   REQUESTS_REMAINING: 'x-tsk-requests-remaining',
+  HOTP_COUNTERS_REMAINING: 'x-tsk-hotp-counters-remaining',
 } as const;
 
 export interface TSKRequestData {
@@ -42,10 +43,12 @@ export interface TSKVerifyResult {
   ok: boolean;
   clientId?: string;
   error?: string;
-  /** True when the credential is inside its configured pre-cap rotation window. */
+  /** True inside either the usage-cap or numeric-counter rotation window. */
   rotationRequired?: boolean;
   /** Successful validations remaining before the hard usage cap. */
   requestsRemaining?: number;
+  /** Legal HOTP uses remaining for the segment closest to exhaustion. */
+  hotpCountersRemaining?: number;
 }
 
 /** Response headers an HTTP adapter must add after successful verification. */
@@ -59,6 +62,9 @@ export function buildTSKResponseHeaders(result: TSKVerifyResult): Record<string,
   }
   if (result.requestsRemaining !== undefined) {
     headers[TSK_RESPONSE_HEADERS.REQUESTS_REMAINING] = String(result.requestsRemaining);
+  }
+  if (result.hotpCountersRemaining !== undefined) {
+    headers[TSK_RESPONSE_HEADERS.HOTP_COUNTERS_REMAINING] = String(result.hotpCountersRemaining);
   }
   return headers;
 }
@@ -162,6 +168,7 @@ export async function verifyTSKRequest(
     clientId: result.clientId,
     rotationRequired: committed.rotationRequired,
     requestsRemaining: committed.requestsRemaining,
+    hotpCountersRemaining: committed.hotpCountersRemaining,
   };
 }
 

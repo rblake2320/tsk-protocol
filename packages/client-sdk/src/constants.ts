@@ -8,6 +8,7 @@ export const TSK_RESPONSE_HEADERS = {
   AUTHENTICATED: 'x-tsk-authenticated',
   ROTATION_REQUIRED: 'x-tsk-rotation-required',
   REQUESTS_REMAINING: 'x-tsk-requests-remaining',
+  HOTP_COUNTERS_REMAINING: 'x-tsk-hotp-counters-remaining',
 } as const;
 
 export const TSK_PROTOCOL_VERSION = '1';

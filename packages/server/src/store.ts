@@ -11,7 +11,14 @@
  *    database or script-level atomicity.
  * 4. MONITORING: trackedClients getter for observability.
  */
-import type { TumblerMap } from '@tsk/core';
+import {
+  DEFAULT_HOTP_ROTATION_WARNING_COUNTERS,
+  TSK_MAX_HOTP_COUNTER,
+  assertValidHOTPStoredCounter,
+  isUsableHOTPDerivationCounter,
+  minimumHOTPUsesRemaining,
+  type TumblerMap,
+} from '@tsk/core';
 
 export interface ValidationCommitInput {
   counterMatches: Array<{ segmentId: string; matchedCounter: number }>;
@@ -20,10 +27,55 @@ export interface ValidationCommitInput {
 
 export interface ValidationCommitResult {
   ok: boolean;
-  error?: 'TSK_KEY_REVOKED' | 'TSK_KEY_EXPIRED' | 'TSK_KEY_USAGE_CAP_EXCEEDED' | 'TSK_HOTP_REPLAY_DETECTED';
+  error?:
+    | 'TSK_KEY_REVOKED'
+    | 'TSK_KEY_EXPIRED'
+    | 'TSK_KEY_USAGE_CAP_EXCEEDED'
+    | 'TSK_HOTP_REPLAY_DETECTED'
+    | 'TSK_HOTP_COUNTER_INVALID'
+    | 'TSK_HOTP_COUNTER_EXHAUSTED';
   requestCount?: number;
   requestsRemaining?: number;
+  /** Legal HOTP derivations remaining for the segment closest to exhaustion. */
+  hotpCountersRemaining?: number;
   rotationRequired?: boolean;
+}
+
+export function assertTumblerMapCounterState(map: TumblerMap): void {
+  let hotpCount = 0;
+  for (const segment of map.segments) {
+    if (segment.type === 'hotp') {
+      hotpCount++;
+      assertValidHOTPStoredCounter(segment.counter ?? 0, `HOTP counter for ${segment.segmentId}`);
+    }
+  }
+  if (hotpCount === 0) throw new Error('TSK_MAP_INVALID_NO_HOTP');
+  if (map.hotpRotationWarningCounters !== undefined &&
+      (!Number.isSafeInteger(map.hotpRotationWarningCounters) ||
+       map.hotpRotationWarningCounters < 1 ||
+       map.hotpRotationWarningCounters > TSK_MAX_HOTP_COUNTER)) {
+    throw new Error('TSK_HOTP_ROTATION_WARNING_INVALID');
+  }
+  const remaining = minimumHOTPUsesRemaining(map.segments);
+  if (remaining === 0 && map.status !== 'expired' && map.status !== 'revoked') {
+    throw new Error('TSK_HOTP_COUNTER_STATUS_INVALID');
+  }
+}
+
+function hotpWarningWindow(map: TumblerMap): number {
+  return map.hotpRotationWarningCounters ?? DEFAULT_HOTP_ROTATION_WARNING_COUNTERS;
+}
+
+export function reconcileTumblerMapCounterStatus(
+  map: TumblerMap,
+  hotpCountersRemaining: number,
+): boolean {
+  const rotationRequired = hotpCountersRemaining <= hotpWarningWindow(map);
+  if (map.status !== 'revoked' && map.status !== 'expired') {
+    if (hotpCountersRemaining === 0) map.status = 'expired';
+    else if (rotationRequired) map.status = 'expiring';
+  }
+  return rotationRequired;
 }
 
 // ─── Abstract Interface ───────────────────────────────────────────────────────
@@ -74,6 +126,11 @@ export function commitValidationToMap(
   map: TumblerMap,
   input: ValidationCommitInput,
 ): ValidationCommitResult {
+  try {
+    assertTumblerMapCounterState(map);
+  } catch {
+    return { ok: false, error: 'TSK_HOTP_COUNTER_INVALID' };
+  }
   if (map.status === 'revoked') return { ok: false, error: 'TSK_KEY_REVOKED' };
   if (map.status === 'expired') return { ok: false, error: 'TSK_KEY_EXPIRED' };
   if (map.expiresAt !== undefined && input.usedAt > map.expiresAt) {
@@ -88,9 +145,26 @@ export function commitValidationToMap(
   }
 
   const segments = new Map(map.segments.map(segment => [segment.segmentId, segment]));
+  const hotpSegmentCount = map.segments.filter(segment => segment.type === 'hotp').length;
+  if (input.counterMatches.length !== hotpSegmentCount) {
+    return { ok: false, error: 'TSK_HOTP_COUNTER_INVALID' };
+  }
+  const seen = new Set<string>();
   for (const update of input.counterMatches) {
     const segment = segments.get(update.segmentId);
-    if (!segment || segment.type !== 'hotp' || (segment.counter ?? 0) > update.matchedCounter) {
+    if (!segment || segment.type !== 'hotp' || seen.has(update.segmentId)) {
+      return { ok: false, error: 'TSK_HOTP_REPLAY_DETECTED' };
+    }
+    seen.add(update.segmentId);
+    const storedCounter = segment.counter ?? 0;
+    if (storedCounter >= TSK_MAX_HOTP_COUNTER) {
+      map.status = 'expired';
+      return { ok: false, error: 'TSK_HOTP_COUNTER_EXHAUSTED' };
+    }
+    if (!isUsableHOTPDerivationCounter(update.matchedCounter)) {
+      return { ok: false, error: 'TSK_HOTP_COUNTER_INVALID' };
+    }
+    if (storedCounter > update.matchedCounter) {
       return { ok: false, error: 'TSK_HOTP_REPLAY_DETECTED' };
     }
   }
@@ -103,18 +177,30 @@ export function commitValidationToMap(
   map.requestCount = requestCount;
   map.lastUsedAt = input.usedAt;
 
-  if (map.maxRequests === undefined || map.maxRequests <= 0) {
-    return { ok: true, requestCount, rotationRequired: false };
+  const hotpCountersRemaining = minimumHOTPUsesRemaining(map.segments);
+  if (hotpCountersRemaining === undefined) {
+    return { ok: false, error: 'TSK_HOTP_COUNTER_INVALID' };
+  }
+  const hotpRotationRequired = reconcileTumblerMapCounterStatus(map, hotpCountersRemaining);
+
+  let requestsRemaining: number | undefined;
+  let usageRotationRequired = false;
+  if (map.maxRequests !== undefined && map.maxRequests > 0) {
+    requestsRemaining = Math.max(0, map.maxRequests - requestCount);
+    const configuredWindow = map.rotationWarningRequests
+      ?? Math.max(1, Math.ceil(map.maxRequests * 0.1));
+    const warningWindow = Math.min(map.maxRequests, Math.max(1, configuredWindow));
+    usageRotationRequired = requestsRemaining <= warningWindow;
+    if (usageRotationRequired && hotpCountersRemaining > 0) map.status = 'expiring';
   }
 
-  const requestsRemaining = Math.max(0, map.maxRequests - requestCount);
-  const configuredWindow = map.rotationWarningRequests
-    ?? Math.max(1, Math.ceil(map.maxRequests * 0.1));
-  const warningWindow = Math.min(map.maxRequests, Math.max(1, configuredWindow));
-  const rotationRequired = requestsRemaining <= warningWindow;
-  if (rotationRequired) map.status = 'expiring';
-
-  return { ok: true, requestCount, requestsRemaining, rotationRequired };
+  return {
+    ok: true,
+    requestCount,
+    requestsRemaining,
+    hotpCountersRemaining,
+    rotationRequired: usageRotationRequired || hotpRotationRequired,
+  };
 }
 
 // ─── Memory Store Config ──────────────────────────────────────────────────────
@@ -160,6 +246,7 @@ export class MemoryTumblerStore implements TumblerMapStore {
       throw new Error('TSK_STORE_CAPACITY_REACHED');
     }
 
+    assertTumblerMapCounterState(map);
     this.maps.set(clientId, structuredClone(map));
     this.touchLRU(clientId);
   }
@@ -191,12 +278,20 @@ export class MemoryTumblerStore implements TumblerMapStore {
   async updateCounters(clientId: string, updates: Map<string, number>): Promise<void> {
     const map = this.maps.get(clientId);
     if (!map) return;
+    for (const [segmentId, newCounter] of updates) {
+      const segment = map.segments.find(candidate => candidate.segmentId === segmentId);
+      if (!segment || segment.type !== 'hotp') throw new Error('TSK_HOTP_COUNTER_INVALID');
+      assertValidHOTPStoredCounter(newCounter, `HOTP counter for ${segmentId}`);
+      if (newCounter < (segment.counter ?? 0)) throw new Error('TSK_HOTP_COUNTER_ROLLBACK');
+    }
     for (const seg of map.segments) {
       const newCounter = updates.get(seg.segmentId);
       if (newCounter !== undefined && seg.type === 'hotp') {
         seg.counter = newCounter;
       }
     }
+    const remaining = minimumHOTPUsesRemaining(map.segments);
+    if (remaining !== undefined) reconcileTumblerMapCounterStatus(map, remaining);
   }
 
   /**
@@ -215,6 +310,11 @@ export class MemoryTumblerStore implements TumblerMapStore {
     if (!seg || seg.type !== 'hotp') return Promise.resolve(false);
 
     const storedCounter = seg.counter ?? 0;
+    if (!isUsableHOTPDerivationCounter(storedCounter) ||
+        !isUsableHOTPDerivationCounter(matchedCounter)) {
+      if (storedCounter === TSK_MAX_HOTP_COUNTER) map.status = 'expired';
+      return Promise.resolve(false);
+    }
     // Atomic CAS for HOTP with lookahead:
     // matchedCounter is the counter value that was matched during validation
     // (may be storedCounter + lookahead, e.g., stored=0, matched=3).
@@ -227,6 +327,8 @@ export class MemoryTumblerStore implements TumblerMapStore {
     }
     // Advance stored counter to matchedCounter + 1
     seg.counter = matchedCounter + 1;
+    const remaining = minimumHOTPUsesRemaining(map.segments);
+    if (remaining !== undefined) reconcileTumblerMapCounterStatus(map, remaining);
     return Promise.resolve(true);
   }
 
@@ -237,6 +339,7 @@ export class MemoryTumblerStore implements TumblerMapStore {
   }
 
   async replaceCredential(oldClientId: string, replacement: TumblerMap): Promise<boolean> {
+    assertTumblerMapCounterState(replacement);
     const current = this.maps.get(oldClientId);
     if (!current || (current.status !== undefined && current.status !== 'active' && current.status !== 'expiring')) {
       return false;

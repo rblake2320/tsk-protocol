@@ -91,3 +91,16 @@ security claims.
 - **Location:** `parked/legacy-simulations/rotation-gap-suite.mts`.
 - **Current evidence:** lifecycle, adversarial, and HA suites call production
   package code directly.
+
+## P-011: Silent 64-bit counter widening in wire v1
+
+- **Parked:** replacing the v1 numeric counter with BigInt or an 8-byte value
+  without changing the protocol version.
+- **Reason:** JavaScript numbers cannot exactly represent the full unsigned
+  64-bit range. Encoding, persistence, replication, client storage, and
+  cross-language behavior would change.
+- **Current design:** v1 uses a bounded project counter, warns before exhaustion,
+  commits MAX as an exhausted sentinel, and requires authorized replacement.
+- **Restore only with:** a wire-v2 specification, canonical byte encoding,
+  compatibility negotiation, storage migration, rollback plan, and
+  cross-language boundary vectors.

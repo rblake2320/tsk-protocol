@@ -21,9 +21,10 @@ import { DEFAULT_TSK_CONFIG } from './types.js';
 import type { TumblerMap, TSKValidationResult, TSKConfig, SegmentType } from './types.js';
 import { deriveSegmentForWindow, deriveSegmentForCounter, deriveSegmentValue } from './segment.js';
 import { computeChecksum, CHECKSUM_LENGTH } from './tumbler-map.js';
-
-/** Maximum safe HOTP counter value (2^31 - 1). Counters beyond this are exhausted. */
-const MAX_HOTP_COUNTER = 2_147_483_647;
+import {
+  TSK_MAX_HOTP_COUNTER,
+  isValidHOTPStoredCounter,
+} from './hotp-counter.js';
 
 export interface ValidationContext {
   /** Full tumbler map (server-side only) */
@@ -69,6 +70,15 @@ export function validateTSKKey(
 ): ValidationResultWithCounterUpdates {
   const { map, nowMs = Date.now(), config = {} } = ctx;
   const cfg = { ...DEFAULT_TSK_CONFIG, ...config };
+
+  if (!Number.isSafeInteger(cfg.hotpLookahead) || cfg.hotpLookahead < 0) {
+    return {
+      ok: false,
+      error: 'INVALID_KEY',
+      internalError: 'INTERNAL_ERROR',
+      clientId: map.clientId,
+    };
+  }
 
   // Time is an authentication input. Reject non-finite values before window
   // arithmetic can turn them into non-finite derivation strings.
@@ -154,8 +164,17 @@ export function validateTSKKey(
     } else {
       // hotp
       const storedCounter = seg.counter ?? 0;
-      // Check for counter exhaustion before lookahead
-      if (storedCounter > MAX_HOTP_COUNTER) {
+      if (!isValidHOTPStoredCounter(storedCounter)) {
+        return {
+          ok: false,
+          error: 'INVALID_KEY',
+          internalError: 'HOTP_COUNTER_INVALID',
+          clientId: map.clientId,
+          segmentResults,
+        };
+      }
+      // MAX is the persisted exhausted sentinel; it is never a derivation input.
+      if (storedCounter >= TSK_MAX_HOTP_COUNTER) {
         // TSK-06 FIX: Generic external error; internal code for anomaly engine.
         return {
           ok: false,
@@ -165,7 +184,11 @@ export function validateTSKKey(
           segmentResults,
         };
       }
-      for (let lookahead = 0; lookahead <= cfg.hotpLookahead; lookahead++) {
+      const maximumLookahead = Math.min(
+        cfg.hotpLookahead,
+        TSK_MAX_HOTP_COUNTER - 1 - storedCounter,
+      );
+      for (let lookahead = 0; lookahead <= maximumLookahead; lookahead++) {
         const matchedCounter = storedCounter + lookahead;
         const expected = deriveSegmentForCounter(map.sharedSecret, seg, matchedCounter);
         if (constantTimeEqual(providedSegValue, expected)) {

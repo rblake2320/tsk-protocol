@@ -66,6 +66,12 @@ export interface TumblerMap {
   rotationWarningRequests?: number;
 
   /**
+   * Number of usable HOTP counters remaining at which rotation is required.
+   * Independent of maxRequests. Defaults to 1,000 for wire v1.
+   */
+  hotpRotationWarningCounters?: number;
+
+  /**
    * Total number of successful validations served by this key.
    * Incremented by the server middleware after each successful verifyTSKRequest.
    */
@@ -175,6 +181,7 @@ export type TSKError =
 export type TSKInternalError =
   | 'CHECKSUM_INVALID'
   | 'VALIDATION_FAILED'
+  | 'HOTP_COUNTER_INVALID'
   | 'HOTP_COUNTER_EXHAUSTED'
   | 'INTERNAL_ERROR';
 

@@ -15,6 +15,8 @@
  * 5. INITIALIZATION GUARD: all methods throw if called before init().
  */
 import {
+  assertUsableHOTPDerivationCounter,
+  assertValidHOTPStoredCounter,
   generateKeyFromClientPayload,
   type TSKProvisionPayload,
 } from '@tsk/core';
@@ -60,10 +62,9 @@ export class TSKClient {
           this.config.clientId,
           seg.segmentId
         );
-        this.counters.set(
-          seg.segmentId,
-          persisted ?? seg.initialCounter ?? 0
-        );
+        const counter = persisted ?? seg.initialCounter ?? 0;
+        assertValidHOTPStoredCounter(counter, `HOTP counter for ${seg.segmentId}`);
+        this.counters.set(seg.segmentId, counter);
       }
     }
 
@@ -87,7 +88,7 @@ export class TSKClient {
    */
   generateHeaders(nowMs: number = Date.now()): {
     headers: Record<string, string>;
-    /** Call this after receiving a successful (2xx) response to advance HOTP counters */
+    /** Call only after the server explicitly confirms TSK authentication. */
     commitHOTPCounters: () => Promise<void>;
   } {
     this.assertInitialized();
@@ -97,6 +98,13 @@ export class TSKClient {
 
     // Snapshot current counters (do NOT advance yet — commit-after-success pattern)
     const snapshotCounters = new Map(this.counters);
+    for (const seg of payload.clientSegments) {
+      if (seg.type !== 'hotp') continue;
+      assertUsableHOTPDerivationCounter(
+        snapshotCounters.get(seg.segmentId) ?? seg.initialCounter ?? 0,
+        `HOTP counter for ${seg.segmentId}`,
+      );
+    }
 
     // Generate the full key using the client payload (with segmentLength per segment)
     const key = generateKeyFromClientPayload(
@@ -118,7 +126,10 @@ export class TSKClient {
       for (const seg of payload.clientSegments) {
         if (seg.type === 'hotp') {
           const current = snapshotCounters.get(seg.segmentId) ?? 0;
-          nextCounters.set(seg.segmentId, current + 1);
+          assertUsableHOTPDerivationCounter(current, `HOTP counter for ${seg.segmentId}`);
+          const next = current + 1;
+          assertValidHOTPStoredCounter(next, `next HOTP counter for ${seg.segmentId}`);
+          nextCounters.set(seg.segmentId, next);
         }
       }
       await this.config.storage.saveCounters(this.config.clientId, nextCounters);

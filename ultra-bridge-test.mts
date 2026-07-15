@@ -135,22 +135,21 @@ console.log('\n[2] BPC Layer Failure — TSK never called');
 // ── Group 3: TSK failure after BPC passes ────────────────────────────────────
 console.log('\n[3] TSK Layer Failure — BPC passes, TSK key is expired');
 {
-  // Build a deterministic map with all-TOTP rotating segments (no HOTP randomness).
-  // generateTumblerMap() has a ~9% chance of all-HOTP segments; HOTP is counter-based,
-  // not time-based, so a "15-min-old" key would still be valid for all-HOTP maps.
-  // We construct the map directly with known TOTP segments to guarantee expiry.
+  // Build a deterministic, structurally valid map with known TOTP segments and
+  // one required HOTP segment. The stale key fails on time state, not randomness.
   const expiredStore = new MemoryTumblerStore();
   const expiredMap: TumblerMap = {
     clientId: generateClientId(),
     sharedSecret: generateSharedSecret(),
-    keyLength: 52,
+    keyLength: 64,
     segments: [
       { segmentId: generateSegmentId('id'),  position: [0, 12],  type: 'static' },
       { segmentId: generateSegmentId('seg'), position: [12, 24], type: 'totp', windowSec: 30 },
       { segmentId: generateSegmentId('seg'), position: [24, 36], type: 'totp', windowSec: 60 },
-      { segmentId: generateSegmentId('seg'), position: [36, 44], type: 'totp', windowSec: 30 },
+      { segmentId: generateSegmentId('seg'), position: [36, 44], type: 'hotp', counter: 0 },
+      { segmentId: generateSegmentId('seg'), position: [44, 52], type: 'totp', windowSec: 30 },
     ],
-    checksum: { position: [44, 52] },
+    checksum: { position: [52, 64] },
     createdAt: Date.now(),
     version: '1',
   };

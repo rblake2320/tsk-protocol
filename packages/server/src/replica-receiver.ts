@@ -1,6 +1,6 @@
 /** Authenticated, ordered receiver for a TSK replication stream. */
 import { timingSafeEqual } from 'node:crypto';
-import type { TumblerMap } from '@tsk/core';
+import { TSK_MAX_HOTP_COUNTER, type TumblerMap } from '@tsk/core';
 import type { TumblerMapStore } from './store.js';
 import {
   MIN_REPLICATION_TOKEN_BYTES,
@@ -61,6 +61,10 @@ function isSafeNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
+function isValidHOTPStoredCounter(value: unknown): value is number {
+  return isSafeNonNegativeInteger(value) && value <= TSK_MAX_HOTP_COUNTER;
+}
+
 function validateMap(map: unknown, clientId: string, secretSealed: boolean): map is TumblerMap {
   if (!map || typeof map !== 'object') return false;
   const candidate = map as TumblerMap;
@@ -80,6 +84,7 @@ function validateMap(map: unknown, clientId: string, secretSealed: boolean): map
   const ids = new Set<string>();
   let cursor = 0;
   let hasHotp = false;
+  let hasExhaustedHotp = false;
   for (const segment of candidate.segments) {
     if (!segment || !isValidId(segment.segmentId, MAX_SEGMENT_ID_LEN) || ids.has(segment.segmentId)) return false;
     ids.add(segment.segmentId);
@@ -88,7 +93,8 @@ function validateMap(map: unknown, clientId: string, secretSealed: boolean): map
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start !== cursor || end <= start || end > candidate.keyLength) return false;
     if (segment.type !== 'static' && segment.type !== 'totp' && segment.type !== 'hotp') return false;
     if (segment.type === 'hotp') {
-      if (!isSafeNonNegativeInteger(segment.counter ?? 0)) return false;
+      if (!isValidHOTPStoredCounter(segment.counter ?? 0)) return false;
+      if ((segment.counter ?? 0) === TSK_MAX_HOTP_COUNTER) hasExhaustedHotp = true;
       hasHotp = true;
     }
     if (segment.type === 'totp' && (!Number.isSafeInteger(segment.windowSec) || (segment.windowSec ?? 0) < 1)) return false;
@@ -99,8 +105,13 @@ function validateMap(map: unknown, clientId: string, secretSealed: boolean): map
   if (!hasHotp) return false;
   if (candidate.requestCount !== undefined && !isSafeNonNegativeInteger(candidate.requestCount)) return false;
   if (candidate.maxRequests !== undefined && (!Number.isSafeInteger(candidate.maxRequests) || candidate.maxRequests < 1)) return false;
+  if (candidate.hotpRotationWarningCounters !== undefined &&
+      (!Number.isSafeInteger(candidate.hotpRotationWarningCounters) ||
+       candidate.hotpRotationWarningCounters < 1 ||
+       candidate.hotpRotationWarningCounters > TSK_MAX_HOTP_COUNTER)) return false;
   if (candidate.expiresAt !== undefined && (!Number.isSafeInteger(candidate.expiresAt) || candidate.expiresAt < 0)) return false;
   if (candidate.status !== undefined && !['active', 'expiring', 'revoked', 'expired'].includes(candidate.status)) return false;
+  if (hasExhaustedHotp && candidate.status !== 'expired' && candidate.status !== 'revoked') return false;
   return true;
 }
 
@@ -125,14 +136,15 @@ function validateMutation(value: unknown): { ok: true; mutation: TumblerReplicaM
       const { clientId, updates } = value as { clientId?: unknown; updates?: unknown };
       if (!isValidId(clientId)) return { ok: false, error: 'invalid_update_clientId' };
       if (!Array.isArray(updates) || updates.length > MAX_SEGMENTS || !updates.every(entry =>
-        Array.isArray(entry) && entry.length === 2 && isValidId(entry[0], MAX_SEGMENT_ID_LEN) && isSafeNonNegativeInteger(entry[1]))) {
+        Array.isArray(entry) && entry.length === 2 && isValidId(entry[0], MAX_SEGMENT_ID_LEN) && isValidHOTPStoredCounter(entry[1]))) {
         return { ok: false, error: 'invalid_update_entries' };
       }
       return { ok: true, mutation: { op: 'updateCounters', clientId, updates: updates as Array<[string, number]> } };
     }
     case 'consumeCounter': {
       const { clientId, segmentId, matchedCounter } = value as Record<string, unknown>;
-      if (!isValidId(clientId) || !isValidId(segmentId, MAX_SEGMENT_ID_LEN) || !isSafeNonNegativeInteger(matchedCounter)) {
+      if (!isValidId(clientId) || !isValidId(segmentId, MAX_SEGMENT_ID_LEN) ||
+          !isValidHOTPStoredCounter(matchedCounter) || matchedCounter >= TSK_MAX_HOTP_COUNTER) {
         return { ok: false, error: 'invalid_consume' };
       }
       return { ok: true, mutation: { op: 'consumeCounter', clientId, segmentId, matchedCounter } };

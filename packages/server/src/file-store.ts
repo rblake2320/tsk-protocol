@@ -9,9 +9,17 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { TumblerMap } from '@tsk/core';
 import {
+  TSK_MAX_HOTP_COUNTER,
+  assertValidHOTPStoredCounter,
+  isUsableHOTPDerivationCounter,
+  minimumHOTPUsesRemaining,
+  type TumblerMap,
+} from '@tsk/core';
+import {
+  assertTumblerMapCounterState,
   commitValidationToMap,
+  reconcileTumblerMapCounterStatus,
   type TumblerMapStore,
   type ValidationCommitInput,
   type ValidationCommitResult,
@@ -44,6 +52,9 @@ export class FileTumblerStore implements TumblerMapStore {
         this.data = JSON.parse(raw) as FileTumblerData;
         this.data.maps       ??= {};
         this.data.lastAccess ??= {};
+        for (const map of Object.values(this.data.maps)) {
+          assertTumblerMapCounterState(map);
+        }
         // Prune TTL-expired entries immediately
         if (this.maxAgeMs > 0) {
           const now = Date.now();
@@ -83,6 +94,7 @@ export class FileTumblerStore implements TumblerMapStore {
     if (!this.data.maps[clientId] && Object.keys(this.data.maps).length >= this.maxEntries) {
       throw new Error('TSK_STORE_CAPACITY_REACHED');
     }
+    assertTumblerMapCounterState(map);
     this.data.maps[clientId] = structuredClone(map);
     this.data.lastAccess[clientId] = Date.now();
     this.flush();
@@ -114,12 +126,20 @@ export class FileTumblerStore implements TumblerMapStore {
   async updateCounters(clientId: string, updates: Map<string, number>): Promise<void> {
     const map = this.data.maps[clientId];
     if (!map) return;
+    for (const [segmentId, newCounter] of updates) {
+      const segment = map.segments.find(candidate => candidate.segmentId === segmentId);
+      if (!segment || segment.type !== 'hotp') throw new Error('TSK_HOTP_COUNTER_INVALID');
+      assertValidHOTPStoredCounter(newCounter, `HOTP counter for ${segmentId}`);
+      if (newCounter < (segment.counter ?? 0)) throw new Error('TSK_HOTP_COUNTER_ROLLBACK');
+    }
     for (const seg of map.segments) {
       const newCounter = updates.get(seg.segmentId);
       if (newCounter !== undefined && seg.type === 'hotp') {
         seg.counter = newCounter;
       }
     }
+    const remaining = minimumHOTPUsesRemaining(map.segments);
+    if (remaining !== undefined) reconcileTumblerMapCounterStatus(map, remaining);
     this.flush();
   }
 
@@ -133,8 +153,16 @@ export class FileTumblerStore implements TumblerMapStore {
     const seg = map.segments.find(s => s.segmentId === segmentId);
     if (!seg || seg.type !== 'hotp') return Promise.resolve(false);
     const stored = seg.counter ?? 0;
+    if (!isUsableHOTPDerivationCounter(stored) ||
+        !isUsableHOTPDerivationCounter(matchedCounter)) {
+      if (stored === TSK_MAX_HOTP_COUNTER) map.status = 'expired';
+      this.flush();
+      return Promise.resolve(false);
+    }
     if (stored > matchedCounter) return Promise.resolve(false); // already consumed
     seg.counter = matchedCounter + 1;
+    const remaining = minimumHOTPUsesRemaining(map.segments);
+    if (remaining !== undefined) reconcileTumblerMapCounterStatus(map, remaining);
     this.flush();
     return Promise.resolve(true);
   }
@@ -148,6 +176,7 @@ export class FileTumblerStore implements TumblerMapStore {
   }
 
   replaceCredential(oldClientId: string, replacement: TumblerMap): Promise<boolean> {
+    assertTumblerMapCounterState(replacement);
     const current = this.data.maps[oldClientId];
     if (!current || (current.status !== undefined && current.status !== 'active' && current.status !== 'expiring')) {
       return Promise.resolve(false);
