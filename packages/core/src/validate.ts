@@ -70,6 +70,17 @@ export function validateTSKKey(
   const { map, nowMs = Date.now(), config = {} } = ctx;
   const cfg = { ...DEFAULT_TSK_CONFIG, ...config };
 
+  // Time is an authentication input. Reject non-finite values before window
+  // arithmetic can turn them into non-finite derivation strings.
+  if (!Number.isFinite(nowMs)) {
+    return {
+      ok: false,
+      error: 'INVALID_KEY',
+      internalError: 'INTERNAL_ERROR',
+      clientId: map.clientId,
+    };
+  }
+
   // ── Step 0: Map structural integrity guards ─────────────────────────────────
   // Reject degenerate maps that would allow trivial bypass:
   // - Empty segment array: any key with correct checksum would pass with no segment checks

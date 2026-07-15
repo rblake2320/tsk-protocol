@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Beta shared-secret API authentication with server-authoritative segmented credential state",
   "private": true,
+  "engines": {
+    "node": ">=24 <25"
+  },
   "workspaces": [
     "packages/*"
   ],
@@ -11,10 +14,11 @@
     "test": "npx tsx test-suite.mts && npx tsx lifecycle-suite.mts && npx tsx client-lifecycle-suite.mts && npx tsx store-durability-suite.mts && npx tsx anomaly-integration-suite.mts && npx tsx attack-suite.mts && npx tsx adversarial-proof.mts && npx tsx ultra-bridge-test.mts && npx tsx runtime-capture-suite.mts",
     "test:ha": "npx tsx replicating-tumbler-suite.mts && npx tsx replica-receiver-suite.mts && npx tsx failover-promotion-suite.mts",
     "test:redis": "npx tsx redis-fencing-integration.mts",
+    "test:pack": "npm run build && npx tsx package-boundary-suite.mts && npm pack --dry-run --workspaces",
     "typecheck": "tsc --noEmit --allowImportingTsExtensions -p tsconfig.json"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^24.13.3",
     "tsx": "^4.23.1",
     "typescript": "^5.4.0"
   }

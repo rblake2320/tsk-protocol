@@ -50,3 +50,25 @@ supplies the explicit durability check.
 Major-version action tags and mutable container tags can change without a
 repository commit. The protocol workflow pins GitHub Actions by commit and the
 Redis service by digest so a repeated run resolves the same reviewed inputs.
+
+## 2026-07-15: Keep only maintained production-code tests in the release gate
+
+Historical red-team scripts remain useful for understanding how earlier flaws
+were discovered, but several duplicated protocol logic or expected behavior
+that was deliberately removed. They are parked rather than deleted. Active
+security evidence must call current packages, have deterministic pass
+conditions, and run in CI.
+
+## 2026-07-15: Test on a supported LTS runtime
+
+Node 20 no longer receives upstream security fixes. TSK now uses Node 24 LTS as
+its explicit build, type, test, and CI baseline so a green release gate does not
+depend on an end-of-life runtime.
+
+## 2026-07-15: Package entry points are executable release boundaries
+
+A successful source-tree build does not prove an installable package. Each
+workspace now rebuilds before packing, publishes only `dist`, and has its
+declared runtime and type entry points checked for existence and runtime import.
+This prevents a tarball from passing a dry run while omitting or misplacing the
+files that consumers load.

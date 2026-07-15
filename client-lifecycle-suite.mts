@@ -41,21 +41,23 @@ try {
   });
   const applicationFailure = await client.fetch('https://example.test/work');
   assert('authenticated application failure is returned to caller', applicationFailure.status === 500);
-  for (const segment of hotpSegments) {
-    assert(
-      `authenticated response persists ${segment.segmentId} counter`,
-      await storage.loadCounter(map.clientId, segment.segmentId) === 1,
-    );
-  }
+  const persistedCounters = await Promise.all(
+    hotpSegments.map(segment => storage.loadCounter(map.clientId, segment.segmentId)),
+  );
+  assert(
+    'authenticated response persists every counter-based segment',
+    persistedCounters.every(counter => counter === 1),
+  );
 
   globalThis.fetch = async () => new Response('ok', { status: 200 });
   await client.fetch('https://example.test/missing-auth-confirmation');
-  for (const segment of hotpSegments) {
-    assert(
-      `2xx without authentication confirmation does not advance ${segment.segmentId}`,
-      await storage.loadCounter(map.clientId, segment.segmentId) === 1,
-    );
-  }
+  const unconfirmedCounters = await Promise.all(
+    hotpSegments.map(segment => storage.loadCounter(map.clientId, segment.segmentId)),
+  );
+  assert(
+    '2xx without authentication confirmation advances no counter-based segment',
+    unconfirmedCounters.every(counter => counter === 1),
+  );
 
   globalThis.fetch = async () => { throw new Error('network unavailable'); };
   let networkRejected = false;

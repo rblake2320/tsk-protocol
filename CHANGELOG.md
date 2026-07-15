@@ -2,6 +2,21 @@
 
 ## Unreleased - 2026-07-15
 
+- CI and package type baselines now use Node 24 LTS instead of EOL Node 20.
+- Validation now rejects NaN and infinite authentication times, with maintained
+  production-code adversarial coverage for time and secret inputs.
+- Superseded red-team runners and a reimplemented rotation simulation moved to
+  `parked/`; they remain historical material but are not release evidence.
+- Package publishing now rebuilds from source, includes only declared `dist`
+  artifacts, and verifies every advertised JavaScript and type entry point.
+- Corrected the client SDK build boundary so its published `dist/index.js` and
+  `dist/index.d.ts` are emitted at the paths declared by its manifest.
+- Replaced wildcard internal package dependencies with the tested `0.1.x`
+  range, aligned the BPC bridge peer with BPC `0.2.x`, and declared Node 24 on
+  every publishable workspace.
+- Made client lifecycle evidence counts deterministic while still asserting
+  every generated counter-based segment.
+
 ### Security
 
 - Enforced writer fencing at every `TumblerMapStore` mutation through

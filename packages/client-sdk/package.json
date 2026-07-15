@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "TSK Protocol client SDK — key generation, provisioning storage, fetch wrapper",
   "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -11,14 +14,18 @@
       "types": "./dist/index.d.ts"
     }
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build --prefix ../.."
   },
   "dependencies": {
-    "@tsk/core": "*"
+    "@tsk/core": "^0.1.0"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^24.13.3"
   }
 }
