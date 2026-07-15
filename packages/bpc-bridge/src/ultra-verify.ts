@@ -18,33 +18,46 @@
  * both factors and remains outside the bridge's protection boundary.
  *
  * NO BPC CODE CHANGES REQUIRED. This file is the entire bridge.
+ *
+ * Issue #4 fix: All BPC result validation and identity binding is performed
+ * BEFORE verifyTSKRequest is called. TSK counter and lifecycle state are
+ * never consumed on a malformed, mismatched, or missing BPC result.
  */
 
 import { verifyTSKRequest, type TSKRequestData, type TSKServerConfig, type TSKVerifyResult } from '@tsk/server';
 import type { TumblerMapStore } from '@tsk/server';
 
+/** Closed set of valid BPC scope values. */
+const VALID_BPC_SCOPES = new Set(['read', 'read-write', 'admin']);
+
 /**
  * BPC verification result shape (compatible with @bpc/server BPCVerifyResult).
- * Typed generically so this file doesn't require @bpc/server as a hard dep
- * (it's a peer dep — consumers bring their own BPC).
+ * Typed generically so this file doesn't require @bpc/server as a hard dep.
  *
- * HIGH-03 FIX: Added `scope` and `pair` fields so the Ultra Bridge can
- * surface the BPC scope in UltraVerifyResult for cross-layer scope coherence.
- * The BPC middleware returns `pair` (the full StoredPair) on success — callers
- * can pass it through and the bridge will extract `pair.scope` automatically.
+ * Supports both the legacy `pair?.scope` shape and the new immutable
+ * `snapshot?.scope` shape from BPC fix/immutable-auth-snapshot.
  */
 export interface BPCLikeResult {
+  /**
+   * MUST be the boolean true for BPC verification to be accepted.
+   * Truthy-but-not-true values (e.g. 'false', 1, {}) are treated as failure.
+   */
   ok: boolean;
   pairId?: string;
   error?: string;
   /**
+   * Immutable authorization snapshot (new shape from BPC fix/immutable-auth-snapshot).
+   * Preferred source for scope. If present and ok===true, scope is read from here.
+   */
+  snapshot?: { scope?: string; [key: string]: unknown };
+  /**
    * The BPC pair scope ('read' | 'read-write' | 'admin').
-   * Set this directly if you want to override scope extraction from `pair`.
+   * Set this directly if you want to override scope extraction from pair/snapshot.
    */
   scope?: string;
   /**
-   * The full BPC StoredPair object returned by verifyBPCRequest on success.
-   * The bridge reads pair.scope from this if `scope` is not set directly.
+   * The full BPC StoredPair object (legacy shape).
+   * The bridge reads pair.scope from this if scope and snapshot are not set.
    * Typed loosely to avoid a hard dep on @bpc/server types.
    */
   pair?: { scope?: string; [key: string]: unknown };
@@ -57,11 +70,10 @@ export interface UltraVerifyResult {
   layers: ('bpc' | 'tsk')[];
   error?: string;
   /**
-   * HIGH-03 FIX: The BPC scope that was verified and is now propagated to
-   * the caller. Callers MUST use this scope to enforce access control on
-   * the downstream resource — the TSK layer alone does not enforce scope.
-   *
-   * Values: 'read' | 'read-write' | 'admin' | undefined (if BPC did not return scope)
+   * The BPC scope verified at authorization time.
+   * Read from result.snapshot.scope (immutable) or result.scope or result.pair.scope.
+   * Callers MUST use this scope to enforce access control on the downstream resource.
+   * Values: 'read' | 'read-write' | 'admin' | undefined
    */
   scope?: string;
 }
@@ -78,37 +90,104 @@ export interface UltraVerifyOptions {
 /**
  * Verify a request through both BPC and TSK layers.
  *
+ * BPC preflight (identity binding, scope validation) is performed BEFORE TSK
+ * verification so that TSK counter and lifecycle state are never consumed on
+ * a malformed, mismatched, or missing BPC result.
+ *
  * @param req - The request data (must have both BPC and TSK headers)
- * @param bpcVerify - A function that calls BPC's verifyBPCRequest (caller brings BPC dep)
- * @param options - TSK store and config
- *
- * Example:
- *   const result = await verifyUltraRequest(req,
- *     (r) => verifyBPCRequest(r, registry, nonceStore, anomaly, bpcConfig),
- *     { tskStore, identityBinding }
- *   );
- *
- * HIGH-03: The returned `result.scope` is the BPC pair scope. Callers MUST
- * enforce this scope on the downstream resource. The Ultra Bridge does NOT
- * automatically block write operations for read-scoped pairs — that enforcement
- * is the caller's responsibility using result.scope.
+ * @param bpcVerify - A function that calls BPC's verifyBPCRequest
+ * @param options - TSK store, config, and identity binding resolver
  */
 export async function verifyUltraRequest(
   req: TSKRequestData,
   bpcVerify: (req: TSKRequestData) => Promise<BPCLikeResult>,
   options: UltraVerifyOptions,
 ): Promise<UltraVerifyResult> {
-  // --- Layers 1-5: BPC ---
-  const bpcResult = await bpcVerify(req);
-  if (!bpcResult.ok) {
+
+  // ── Layers 1–5: BPC ─────────────────────────────────────────────────────────
+
+  let bpcResult: BPCLikeResult;
+  try {
+    bpcResult = await bpcVerify(req);
+  } catch (err) {
+    // Resolver exceptions must not reach TSK. Deny immediately.
     return {
       ok: false,
-      error: `BPC: ${bpcResult.error ?? 'VERIFICATION_FAILED'}`,
+      error: 'BPC_CALLBACK_EXCEPTION',
       layers: [],
     };
   }
 
-  // --- Layers 6-7: TSK ---
+  // Strict structural validation of the BPC result before trusting ANY field.
+  // ok must be exactly the boolean true — truthy-but-not-true values are denied.
+  if (
+    bpcResult === null ||
+    typeof bpcResult !== 'object' ||
+    bpcResult.ok !== true
+  ) {
+    return {
+      ok: false,
+      error: `BPC: ${(bpcResult as BPCLikeResult)?.error ?? 'VERIFICATION_FAILED'}`,
+      layers: [],
+    };
+  }
+
+  // pairId must be a non-empty string.
+  if (typeof bpcResult.pairId !== 'string' || bpcResult.pairId.length === 0) {
+    return {
+      ok: false,
+      error: 'BPC_MISSING_PAIR_ID',
+      layers: [],
+    };
+  }
+
+  // Extract scope: prefer snapshot (immutable) > direct scope > pair.scope (legacy).
+  const resolvedScope: string | undefined =
+    (bpcResult.snapshot as { scope?: string } | undefined)?.scope ??
+    bpcResult.scope ??
+    (bpcResult.pair as { scope?: string } | undefined)?.scope;
+
+  // Scope must be one of the three closed BPC values.
+  if (!resolvedScope || !VALID_BPC_SCOPES.has(resolvedScope)) {
+    return {
+      ok: false,
+      error: 'BPC_INVALID_SCOPE',
+      layers: [],
+    };
+  }
+
+  // ── Identity preflight — BEFORE TSK state consumption ──────────────────────────
+  //
+  // Resolve the expected TSK clientId for this BPC pairId before invoking
+  // verifyTSKRequest. If binding resolution fails or mismatches, we deny
+  // without consuming any TSK counter or lifecycle state.
+
+  let expectedClientId: string | null;
+  try {
+    expectedClientId = await options.identityBinding.resolve(bpcResult.pairId);
+  } catch {
+    return {
+      ok: false,
+      pairId: bpcResult.pairId,
+      error: 'IDENTITY_BINDING_RESOLVER_EXCEPTION',
+      layers: [],
+    };
+  }
+
+  if (!expectedClientId) {
+    return {
+      ok: false,
+      pairId: bpcResult.pairId,
+      error: 'IDENTITY_BINDING_NOT_FOUND',
+      layers: [],
+    };
+  }
+
+  // ── Layers 6–7: TSK ─────────────────────────────────────────────────────────
+  //
+  // TSK verification (and counter/lifecycle state consumption) only runs
+  // after BPC preflight and identity binding have fully passed.
+
   const tskResult: TSKVerifyResult = await verifyTSKRequest(req, options.tskStore, options.tskConfig);
   if (!tskResult.ok) {
     return {
@@ -119,18 +198,18 @@ export async function verifyUltraRequest(
     };
   }
 
-  // Identity binding: BPC and TSK must resolve to the same principal.
-  if (!bpcResult.pairId || !tskResult.clientId) {
+  // Post-TSK identity agreement check.
+  // The expected clientId was resolved before TSK ran; we now confirm the
+  // TSK-verified clientId matches exactly.
+  if (!tskResult.clientId) {
     return {
       ok: false,
       pairId: bpcResult.pairId,
-      clientId: tskResult.clientId,
-      error: 'IDENTITY_BINDING_UNAVAILABLE',
+      error: 'TSK_MISSING_CLIENT_ID',
       layers: ['bpc', 'tsk'],
     };
   }
 
-  const expectedClientId = await options.identityBinding.resolve(bpcResult.pairId);
   if (expectedClientId !== tskResult.clientId) {
     return {
       ok: false,
@@ -141,12 +220,7 @@ export async function verifyUltraRequest(
     };
   }
 
-  // HIGH-03 FIX: Extract BPC scope from the result and surface it to the caller.
-  // Priority: bpcResult.scope > bpcResult.pair?.scope > undefined
-  const resolvedScope: string | undefined =
-    bpcResult.scope ??
-    (bpcResult.pair as { scope?: string } | undefined)?.scope;
-
+  // All seven layers passed. Return verified identity and immutable scope.
   return {
     ok: true,
     pairId: bpcResult.pairId,
