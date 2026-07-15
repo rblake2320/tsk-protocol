@@ -13,7 +13,7 @@ const SCREENS = [
   { id: 'vault',     label: 'Live Vault',    group: 'Protocol',    comp: 'ScreenVault',     hint: 'Tumbling key' },
   { id: 'attack',    label: 'Attack Lab',    group: 'Protocol',    comp: 'ScreenAttack',    hint: 'Replay · forge · anomaly' },
   { id: 'provision', label: 'Provisioning',  group: 'Protocol',    comp: 'ScreenProvision', hint: 'Mint clients' },
-  { id: 'stack',     label: '8-Layer Stack', group: 'Architecture',comp: 'ScreenStack',     hint: 'BPC + TSK + Active Defense' },
+  { id: 'stack',     label: 'Composed Verifier', group: 'Architecture',comp: 'ScreenStack', hint: 'BPC + TSK identity binding' },
   { id: 'about',     label: 'About',         group: 'Info',        comp: 'ScreenAbout',     hint: 'Protocol · inventor · access' },
 ];
 
@@ -175,7 +175,7 @@ function App() {
           <div className="row" style={{ gap: 4 }}>
             <button className="btn sm ghost"
               onClick={() => window.open('http://localhost:3100', '_blank')}>Full stack ↗</button>
-            <button className="btn sm ghost">Spec v1.1</button>
+            <button className="btn sm ghost">Wire spec 1</button>
           </div>
         </div>
       </header>

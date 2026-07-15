@@ -22,6 +22,11 @@ export const TSK_HEADERS = {
 
 export const TSK_PROTOCOL_VERSION = '1';
 export const TSK_MAX_KEY_HEADER_BYTES = 1024;
+export const TSK_RESPONSE_HEADERS = {
+  AUTHENTICATED: 'x-tsk-authenticated',
+  ROTATION_REQUIRED: 'x-tsk-rotation-required',
+  REQUESTS_REMAINING: 'x-tsk-requests-remaining',
+} as const;
 
 export interface TSKRequestData {
   headers: Record<string, string | string[] | undefined>;
@@ -37,11 +42,30 @@ export interface TSKVerifyResult {
   ok: boolean;
   clientId?: string;
   error?: string;
+  /** True when the credential is inside its configured pre-cap rotation window. */
+  rotationRequired?: boolean;
+  /** Successful validations remaining before the hard usage cap. */
+  requestsRemaining?: number;
+}
+
+/** Response headers an HTTP adapter must add after successful verification. */
+export function buildTSKResponseHeaders(result: TSKVerifyResult): Record<string, string> {
+  if (!result.ok) return {};
+  const headers: Record<string, string> = {
+    [TSK_RESPONSE_HEADERS.AUTHENTICATED]: '1',
+  };
+  if (result.rotationRequired === true) {
+    headers[TSK_RESPONSE_HEADERS.ROTATION_REQUIRED] = '1';
+  }
+  if (result.requestsRemaining !== undefined) {
+    headers[TSK_RESPONSE_HEADERS.REQUESTS_REMAINING] = String(result.requestsRemaining);
+  }
+  return headers;
 }
 
 /**
  * Verify a TSK request.
- * Pure function — no side effects except anomaly recording and HOTP counter updates.
+ * The store atomically commits HOTP counters and lifecycle usage after validation.
  */
 export async function verifyTSKRequest(
   req: TSKRequestData,
@@ -105,52 +129,40 @@ export async function verifyTSKRequest(
   const result = validateTSKKey(keyRaw, { map, config });
 
   // 7. Record anomaly if failed
-  if (!result.ok && anomaly && result.segmentResults) {
+  if (!result.ok && anomaly) {
     anomaly.record({
       clientId: clientIdRaw,
       timestamp: Date.now(),
-      segmentResults: result.segmentResults,
+      segmentResults: result.segmentResults ?? [],
+      failureKind: result.internalError === 'CHECKSUM_INVALID'
+        ? 'checksum_invalid'
+        : 'segment_validation_failed',
       ipAddress,
     });
-  }
-
-  // 7. Advance HOTP counters on success — use CAS (consumeCounter) when available
-  // to prevent replay under concurrent requests. Fall back to updateCounters.
-  if (result.ok && result.counterUpdates && result.counterUpdates.size > 0) {
-    if (store.consumeCounter) {
-      for (const [segmentId, update] of result.counterUpdates) {
-        // CAS: use matchedCounter as expectedCounter (the exact value that was matched
-        // during validation). This correctly handles lookahead scenarios where the
-        // matched counter may be > storedCounter (e.g., counter+3 matched with stored=0).
-        const cas = await store.consumeCounter(clientIdRaw, segmentId, update.matchedCounter);
-        if (!cas) {
-          // Counter was already consumed by a concurrent request — treat as replay
-          return { ok: false, error: 'TSK_HOTP_REPLAY_DETECTED', clientId: clientIdRaw };
-        }
-      }
-    } else {
-      // Fallback: build a plain Map<string, number> for updateCounters
-      const plainUpdates = new Map<string, number>();
-      for (const [segmentId, update] of result.counterUpdates) {
-        plainUpdates.set(segmentId, update.newCounter);
-      }
-      await store.updateCounters(clientIdRaw, plainUpdates);
-    }
   }
 
   if (!result.ok) {
     return { ok: false, error: result.error ?? 'TSK_VALIDATION_FAILED', clientId: clientIdRaw };
   }
 
-  // 11. Update lifecycle tracking fields after successful validation
-  const updatedMap = {
-    ...map,
-    requestCount: (map.requestCount ?? 0) + 1,
-    lastUsedAt: Date.now(),
-  };
-  await store.set(clientIdRaw, updatedMap);
+  // 8. Atomically commit all counters and lifecycle usage. The commit repeats
+  // lifecycle checks so concurrent requests cannot cross the hard cap.
+  const committed = await store.commitValidation(clientIdRaw, {
+    counterMatches: [...(result.counterUpdates ?? new Map())].map(
+      ([segmentId, update]) => ({ segmentId, matchedCounter: update.matchedCounter }),
+    ),
+    usedAt: Date.now(),
+  });
+  if (!committed.ok) {
+    return { ok: false, error: committed.error, clientId: clientIdRaw };
+  }
 
-  return { ok: true, clientId: result.clientId };
+  return {
+    ok: true,
+    clientId: result.clientId,
+    rotationRequired: committed.rotationRequired,
+    requestsRemaining: committed.requestsRemaining,
+  };
 }
 
 function getHeader(req: TSKRequestData, name: string): string | undefined {

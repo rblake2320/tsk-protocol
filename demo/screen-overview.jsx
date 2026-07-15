@@ -33,7 +33,7 @@ function ScreenOverview({ goto }) {
         <div>
           <Pill tone="primary">
             <span className="live-dot" style={{ background: 'var(--primary)', boxShadow: '0 0 10px var(--primary)' }} />
-            Patent-pending · v1.1
+            Beta reference · wire v1
           </Pill>
           <h1 style={{ marginTop: 18 }}>
             API keys that <span style={{
@@ -44,15 +44,15 @@ function ScreenOverview({ goto }) {
           <p style={{ marginTop: 16, fontSize: 17, maxWidth: 560, color: 'var(--muted)', lineHeight: 1.5 }}>
             TSK is a tumbler-style authentication protocol. Each key is a string whose
             <span style={{ color: 'var(--text)' }}> internal segments rotate independently</span>,
-            and whose <span style={{ color: 'var(--text)' }}>positional map is a per-client server secret</span>.
-            Captured keys are structurally useless after the shortest rotation window.
+            with <span style={{ color: 'var(--text)' }}>server-authoritative counter and lifecycle state</span>.
+            Generated maps include a counter-based segment consumed atomically on acceptance.
           </p>
           <div className="row" style={{ marginTop: 24, gap: 10 }}>
             <button className="btn primary" onClick={() => goto('vault')}>
               See it tumble →
             </button>
             <button className="btn" onClick={() => goto('stack')}>
-              The 8-layer stack
+              Composed verifier
             </button>
             <span className="muted" style={{ fontSize: 12, marginLeft: 10 }}>
               <span className="kbd">G</span> <span className="kbd">V</span> · jump to vault
@@ -60,18 +60,18 @@ function ScreenOverview({ goto }) {
           </div>
           <div className="row" style={{ marginTop: 32, gap: 22 }}>
             <div>
-              <div className="upper">Replay window</div>
-              <div className="tnum mono" style={{ fontSize: 22, fontWeight: 600 }}>≤ 30s</div>
+              <div className="upper">Counter commit</div>
+              <div className="tnum mono" style={{ fontSize: 22, fontWeight: 600 }}>atomic</div>
             </div>
             <div style={{ width: 1, height: 36, background: 'var(--border)' }} />
             <div>
-              <div className="upper">Position entropy</div>
-              <div className="tnum mono" style={{ fontSize: 22, fontWeight: 600 }}>2<sup style={{ fontSize: 13 }}>122</sup></div>
+              <div className="upper">Hard cap</div>
+              <div className="tnum mono" style={{ fontSize: 22, fontWeight: 600 }}>fail closed</div>
             </div>
             <div style={{ width: 1, height: 36, background: 'var(--border)' }} />
             <div>
-              <div className="upper">Stack layers</div>
-              <div className="tnum mono" style={{ fontSize: 22, fontWeight: 600 }}>8</div>
+              <div className="upper">Verifiers</div>
+              <div className="tnum mono" style={{ fontSize: 22, fontWeight: 600 }}>2</div>
             </div>
           </div>
         </div>
@@ -130,7 +130,7 @@ function ScreenOverview({ goto }) {
         {[
           { eyebrow: '01', title: 'Static keys leak. Forever.', body: 'A key in a logfile, env var, or build artifact is a live credential until manually revoked. Industry mean-time-to-rotation: weeks.' },
           { eyebrow: '02', title: 'Rotation alone is not enough.', body: 'AWS Secrets Manager and Vault swap the whole string on a schedule. Within the window, the key is still static — and replayable.' },
-          { eyebrow: '03', title: 'TSK makes the shape secret.', body: 'Not just the value — the structure. Attackers cannot tell which characters rotate, at what rate, or where they live in the string.' },
+          { eyebrow: '03', title: 'TSK binds validation to state.', body: 'The server atomically consumes counter and lifecycle state, so an accepted generated credential cannot be accepted again with the same counter.' },
         ].map(b => (
           <div className="card" key={b.eyebrow}>
             <div className="upper" style={{ color: 'var(--primary)' }}>{b.eyebrow}</div>
@@ -149,14 +149,14 @@ function ScreenOverview({ goto }) {
         />
         <div className="g4">
           {[
-            ['Structural secrecy', 'Segment positions, lengths, and ordering are stored server-side only. The provision payload omits all of them.'],
-            ['Independent rotation', 'TOTP segments expire at 30–120s. HOTP segments are one-shot. Static segment anchors identity.'],
-            ['Atomic CAS replay block', 'HOTP counter advances via compare-and-swap. Concurrent replay of the same key is blocked by the store.'],
-            ['Checksum-first validation', '72-bit HMAC checksum rejects 1 − 2⁻⁷² of forgeries before any segment is touched. DoS-resistant by construction.'],
-            ['Per-segment anomaly intel', 'Static-passes-rotating-fails is the stolen-key fingerprint. The engine reads it directly.'],
-            ['BPC composability', 'Stack TSK behind device-bound ECDSA. Two orthogonal factors, one bridge.'],
-            ['Brute-force margin', 'C(L − Σℓ + N, N) positional arrangements × segment HMAC entropy. Astronomical even for short keys.'],
-            ['Wire compatible', 'Three headers. No new handshake. Drop into any HTTPS stack.'],
+            ['Honest layout model', 'Ordered segment lengths reveal cumulative boundaries. Layout is not used as a secret factor.'],
+            ['Independent schedules', 'Time-window and counter-based values derive independently from the provisioned shared secret.'],
+            ['Atomic replay boundary', 'Every matched counter and usage count commits in one store transaction.'],
+            ['Integrity-first validation', 'A truncated HMAC tag is checked before individual segment values.'],
+            ['Per-segment telemetry', 'Segment results can inform anomaly scoring; the score is not an authorization decision by itself.'],
+            ['BPC composability', 'Require both BPC pair-key and TSK shared-secret verification with principal matching.'],
+            ['Authorized replacement', 'A deployment authorizer must approve atomic new-key creation and old-key revocation.'],
+            ['Adapter contract', 'Three request headers plus explicit response confirmation for counter synchronization.'],
           ].map(([h, b]) => (
             <div className="card" key={h} style={{ padding: 18 }}>
               <h3 style={{ fontSize: 14, letterSpacing: '-0.01em', marginBottom: 8 }}>{h}</h3>
@@ -173,7 +173,7 @@ function ScreenOverview({ goto }) {
       }}>
         <div>
           <h2 style={{ fontSize: 22 }}>Inspect every screen of the protocol.</h2>
-          <p style={{ marginTop: 6 }}>Live vault · attack lab · provisioning console · 8-layer stack.</p>
+          <p style={{ marginTop: 6 }}>Live vault · attack lab · provisioning console · composed verifier.</p>
         </div>
         <div className="row" style={{ gap: 10 }}>
           <button className="btn primary" onClick={() => goto('vault')}>Live Vault</button>

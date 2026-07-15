@@ -14,16 +14,20 @@
  *   4. Appends a checksumLength-char HMAC checksum of the concatenated body
  *
  * The resulting key is byte-for-byte identical to the server's expected positional layout.
- * The client knows segment lengths but NOT start offsets — it cannot reconstruct positions.
+ * Ordered segment lengths reveal the cumulative start/end offsets. Layout is
+ * therefore metadata, not a secret or an authentication factor.
  */
 
 import type { TumblerMap, ClientSegmentConfig, TSKProvisionPayload } from './types.js';
 import { deriveSegmentValue } from './segment.js';
-import { hmac, hmacRaw, validateHexSecret } from './crypto.js';
+import { hmac, hmacRaw, sha256, validateHexSecret } from './crypto.js';
+import { emitKeyGenerationCapture } from './runtime-capture.js';
+import type { KeyGenerationCaptureOptions } from './runtime-capture.js';
 
 /**
  * Generate a TSK key using the FULL tumbler map (server-side / test path).
- * Uses absolute positions from the map — not available to clients in production.
+ * Uses the server map's absolute positions. A provisioned client receives
+ * equivalent cumulative layout information as ordered segment lengths.
  */
 export function generateKeyFromMap(map: TumblerMap, nowMs: number = Date.now()): string {
   const keyBuffer = new Array<string>(map.keyLength).fill('\x00');
@@ -44,7 +48,20 @@ export function generateKeyFromMap(map: TumblerMap, nowMs: number = Date.now()):
     keyBuffer[map.checksum.position[0] + i] = checksum[i];
   }
 
-  return keyBuffer.join('');
+  const key = keyBuffer.join('');
+  emitKeyGenerationCapture({
+    protocol: 'tsk',
+    packageName: '@tsk/core',
+    event: 'tsk.key.generated.from_map',
+    clientId: map.clientId,
+    keyDigest: sha256(key),
+    algorithm: 'HMAC-SHA-256',
+    details: {
+      keyLength: map.keyLength,
+      segmentCount: map.segments.length,
+    },
+  });
+  return key;
 }
 
 /**
@@ -66,6 +83,7 @@ export function generateKeyFromClientPayload(
   payload: TSKProvisionPayload,
   counters: Map<string, number>,
   nowMs: number = Date.now(),
+  captureOptions: KeyGenerationCaptureOptions = {},
 ): string {
   validateHexSecret(sharedSecret);
   const secretBuf = Buffer.from(sharedSecret, 'hex');
@@ -98,7 +116,22 @@ export function generateKeyFromClientPayload(
 
   // Append checksum
   const checksum = computeChecksumChars(sharedSecret, body, payload.checksumLength);
-  return body + checksum;
+  const key = body + checksum;
+  emitKeyGenerationCapture({
+    protocol: 'tsk',
+    packageName: '@tsk/core',
+    event: 'tsk.key.generated.from_client_payload',
+    clientId: payload.clientId,
+    keyDigest: sha256(key),
+    algorithm: 'HMAC-SHA-256',
+    runtime: captureOptions.runtimeMetadata,
+    details: {
+      keyLength: payload.keyLength,
+      segmentCount: payload.clientSegments.length,
+      ...captureOptions.captureDetails,
+    },
+  });
+  return key;
 }
 
 /**

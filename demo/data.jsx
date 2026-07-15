@@ -52,7 +52,7 @@ async function padOrTruncate(secretHex, value, len) {
 // ── Server provisioning ───────────────────────────────────────────────────────
 
 // Convert server provision response into the local map format that all screens expect.
-// serverMap has positions (server-only secret); provisionPayload has clientSegments.
+// serverMap has absolute positions; provisionPayload has ordered segment lengths.
 function buildLocalMap(clientId, sharedSecret, serverMap, provisionPayload) {
   // Build segment list from serverMap (which has absolute positions)
   const segments = serverMap.segments.map(seg => ({

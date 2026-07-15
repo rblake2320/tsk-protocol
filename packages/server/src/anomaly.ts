@@ -1,6 +1,5 @@
 /**
  * TSK Protocol — Anomaly Detection Engine
- * IL4/5/6/7-hardened.
  *
  * Key security fixes in this version:
  * 1. BOUNDED MEMORY: LRU eviction with configurable max entries prevents
@@ -12,7 +11,7 @@
  * 4. TTL CLEANUP: automatic expiry of stale entries prevents unbounded growth
  *    even without LRU pressure.
  * 5. CONFIGURABLE THRESHOLDS: all scoring thresholds are configurable for
- *    environment-specific tuning (IL4 vs IL7 deployments).
+ *    deployment-specific tuning.
  */
 
 export interface SegmentFailureEvent {
@@ -20,6 +19,8 @@ export interface SegmentFailureEvent {
   timestamp: number;
   /** Per-segment results — MUST include type field for type-safe detection */
   segmentResults: { segmentId: string; type: 'static' | 'totp' | 'hotp'; valid: boolean }[];
+  /** Failure stage when rejection occurs before or during segment comparison. */
+  failureKind?: 'checksum_invalid' | 'segment_validation_failed';
   ipAddress?: string;
 }
 
@@ -188,11 +189,12 @@ export class MemoryAnomalyEngine implements AnomalyEngine {
 
     // ── All segments failing (brute force or wrong client) ───────────────────
     const totalFailures = events.filter(e =>
-      e.segmentResults.every(sr => !sr.valid)
+      e.failureKind === 'checksum_invalid' ||
+      (e.segmentResults.length > 0 && e.segmentResults.every(sr => !sr.valid))
     );
     if (totalFailures.length >= 3) {
       score += this.totalFailureScore;
-      reasons.push(`Repeated total failures (${totalFailures.length}) — brute force or wrong client`);
+      reasons.push(`Repeated integrity/segment failures (${totalFailures.length})`);
     }
 
     // ── Cross-client IP correlation ──────────────────────────────────────────

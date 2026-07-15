@@ -1,18 +1,30 @@
 /**
  * TSK Protocol — Abstract Store Interfaces
- * IL4/5/6/7-hardened.
  *
  * Key security fixes in this version:
- * 1. BOUNDED MEMORY: MemoryTumblerStore enforces a max entry count with LRU
- *    eviction to prevent memory exhaustion via provisioner spam.
+ * 1. BOUNDED MEMORY: MemoryTumblerStore rejects new entries at its configured
+ *    cap instead of silently evicting an active credential.
  * 2. TTL EVICTION: entries older than maxAgeSec are automatically expired on
  *    access, preventing unbounded growth of stale maps.
- * 3. ATOMIC CAS: consumeCounter() is properly atomic within the single-process
- *    in-memory store. Production note: PgTumblerStore must use SELECT FOR UPDATE,
- *    RedisTumblerStore must use a Lua CAS script.
+ * 3. ATOMIC COMMIT: bundled stores commit all counters and lifecycle usage in
+ *    one single-process transaction. Distributed stores must provide equivalent
+ *    database or script-level atomicity.
  * 4. MONITORING: trackedClients getter for observability.
  */
 import type { TumblerMap } from '@tsk/core';
+
+export interface ValidationCommitInput {
+  counterMatches: Array<{ segmentId: string; matchedCounter: number }>;
+  usedAt: number;
+}
+
+export interface ValidationCommitResult {
+  ok: boolean;
+  error?: 'TSK_KEY_REVOKED' | 'TSK_KEY_EXPIRED' | 'TSK_KEY_USAGE_CAP_EXCEEDED' | 'TSK_HOTP_REPLAY_DETECTED';
+  requestCount?: number;
+  requestsRemaining?: number;
+  rotationRequired?: boolean;
+}
 
 // ─── Abstract Interface ───────────────────────────────────────────────────────
 
@@ -47,14 +59,70 @@ export interface TumblerMapStore {
    * - RedisTumblerStore: use a Lua script: if GET == expected then SET expected+1
    */
   consumeCounter?(clientId: string, segmentId: string, expectedCounter: number): Promise<boolean>;
+  /**
+   * Atomically commit every replay-sensitive counter and the lifecycle usage
+   * count for one successful validation. Implementations must perform all
+   * checks before mutating any field.
+   */
+  commitValidation(clientId: string, input: ValidationCommitInput): Promise<ValidationCommitResult>;
+  /** Atomically add the replacement and mark the prior credential revoked. */
+  replaceCredential(oldClientId: string, replacement: TumblerMap): Promise<boolean>;
+}
+
+/** Mutate one already-exclusive map only after every commit precondition passes. */
+export function commitValidationToMap(
+  map: TumblerMap,
+  input: ValidationCommitInput,
+): ValidationCommitResult {
+  if (map.status === 'revoked') return { ok: false, error: 'TSK_KEY_REVOKED' };
+  if (map.status === 'expired') return { ok: false, error: 'TSK_KEY_EXPIRED' };
+  if (map.expiresAt !== undefined && input.usedAt > map.expiresAt) {
+    map.status = 'expired';
+    return { ok: false, error: 'TSK_KEY_EXPIRED' };
+  }
+
+  const currentCount = map.requestCount ?? 0;
+  if (map.maxRequests !== undefined && map.maxRequests > 0 && currentCount >= map.maxRequests) {
+    map.status = 'expired';
+    return { ok: false, error: 'TSK_KEY_USAGE_CAP_EXCEEDED' };
+  }
+
+  const segments = new Map(map.segments.map(segment => [segment.segmentId, segment]));
+  for (const update of input.counterMatches) {
+    const segment = segments.get(update.segmentId);
+    if (!segment || segment.type !== 'hotp' || (segment.counter ?? 0) > update.matchedCounter) {
+      return { ok: false, error: 'TSK_HOTP_REPLAY_DETECTED' };
+    }
+  }
+
+  for (const update of input.counterMatches) {
+    segments.get(update.segmentId)!.counter = update.matchedCounter + 1;
+  }
+
+  const requestCount = currentCount + 1;
+  map.requestCount = requestCount;
+  map.lastUsedAt = input.usedAt;
+
+  if (map.maxRequests === undefined || map.maxRequests <= 0) {
+    return { ok: true, requestCount, rotationRequired: false };
+  }
+
+  const requestsRemaining = Math.max(0, map.maxRequests - requestCount);
+  const configuredWindow = map.rotationWarningRequests
+    ?? Math.max(1, Math.ceil(map.maxRequests * 0.1));
+  const warningWindow = Math.min(map.maxRequests, Math.max(1, configuredWindow));
+  const rotationRequired = requestsRemaining <= warningWindow;
+  if (rotationRequired) map.status = 'expiring';
+
+  return { ok: true, requestCount, requestsRemaining, rotationRequired };
 }
 
 // ─── Memory Store Config ──────────────────────────────────────────────────────
 
 export interface MemoryStoreConfig {
   /**
-   * Maximum number of tumbler maps to store.
-   * LRU eviction when limit is reached. Default: 100,000.
+   * Maximum number of tumbler maps to store. New clients fail at the limit;
+   * active credentials are never silently evicted. Default: 100,000.
    */
   maxEntries?: number;
   /**
@@ -70,7 +138,7 @@ export interface MemoryStoreConfig {
 /**
  * In-memory tumbler map store.
  *
- * SECURITY: Bounded with LRU eviction and TTL to prevent memory exhaustion.
+ * SECURITY: Bounded with fail-on-capacity behavior and TTL for stale maps.
  * For production multi-server deployments, replace with PgTumblerStore or
  * RedisTumblerStore to share state across instances.
  */
@@ -87,13 +155,12 @@ export class MemoryTumblerStore implements TumblerMapStore {
   }
 
   async set(clientId: string, map: TumblerMap): Promise<void> {
-    // LRU eviction if at capacity
+    // Never silently evict an active credential. Capacity is a hard failure.
     if (!this.maps.has(clientId) && this.maps.size >= this.maxEntries) {
-      const lruKey = this.accessOrder.shift();
-      if (lruKey) this.maps.delete(lruKey);
+      throw new Error('TSK_STORE_CAPACITY_REACHED');
     }
 
-    this.maps.set(clientId, { ...map });
+    this.maps.set(clientId, structuredClone(map));
     this.touchLRU(clientId);
   }
 
@@ -109,7 +176,7 @@ export class MemoryTumblerStore implements TumblerMapStore {
     }
 
     this.touchLRU(clientId);
-    return map;
+    return structuredClone(map);
   }
 
   async delete(clientId: string): Promise<void> {
@@ -161,6 +228,29 @@ export class MemoryTumblerStore implements TumblerMapStore {
     // Advance stored counter to matchedCounter + 1
     seg.counter = matchedCounter + 1;
     return Promise.resolve(true);
+  }
+
+  commitValidation(clientId: string, input: ValidationCommitInput): Promise<ValidationCommitResult> {
+    const map = this.maps.get(clientId);
+    if (!map) return Promise.resolve({ ok: false, error: 'TSK_KEY_EXPIRED' });
+    return Promise.resolve(commitValidationToMap(map, input));
+  }
+
+  async replaceCredential(oldClientId: string, replacement: TumblerMap): Promise<boolean> {
+    const current = this.maps.get(oldClientId);
+    if (!current || (current.status !== undefined && current.status !== 'active' && current.status !== 'expiring')) {
+      return false;
+    }
+    if (this.maps.has(replacement.clientId)) return false;
+    current.status = 'revoked';
+    if (this.maps.size >= this.maxEntries) {
+      // Preserve the hard capacity bound. Removing the old credential still
+      // makes every old-key request fail closed.
+      this.maps.delete(oldClientId);
+      this.removeLRU(oldClientId);
+    }
+    await this.set(replacement.clientId, replacement);
+    return true;
   }
 
   /** Return current number of tracked clients (for monitoring). */

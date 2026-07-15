@@ -114,7 +114,7 @@ const map: TMap = {
   csPos: [44, 52],
 };
 
-console.log('\n┌─── TUMBLER MAP (server-side secret — attacker never sees this) ───┐');
+console.log('\n┌─── SERVER TUMBLER MAP (authoritative validation state) ───┐');
 console.log(`│ Key Length: ${map.keyLen} chars                                         │`);
 for (const seg of map.segs) {
   const len = seg.pos[1] - seg.pos[0];
@@ -173,7 +173,7 @@ console.log(`Match:      ${key1 === wrongKey ? 'IDENTICAL (bad!)' : 'DIFFERENT (
 const r5 = validate(wrongKey, map, NOW);
 console.log(`Validate: ${r5.ok ? '✓ PASS' : '✗ FAIL'} — ${r5.detail}`);
 
-// ── Demo 6: Position shift (structural secrecy) ──
+// ── Demo 6: Per-client layout diversification ──
 console.log('\n═══ DEMO 6: Shift key by 1 position (attacker guesses wrong structure) ═══');
 const shifted = key1.slice(1) + key1[0];
 console.log(`Original: ${key1}`);
@@ -197,14 +197,14 @@ console.log(`HOTP segment [28-36] across counters: ${hotpDiff.join(' → ')}`);
 console.log(`All different: ${hotpDiff[0] !== hotpDiff[1] && hotpDiff[1] !== hotpDiff[2] ? '✓ YES' : '✗ NO'}`);
 
 // ── Demo 8: Multiple clients, same time — completely different keys ──
-console.log('\n═══ DEMO 8: Two clients, same time — structural secrecy ═══');
+console.log('\n═══ DEMO 8: Two clients, same time — distinct derived credentials ═══');
 const secret2 = randomBytes(32).toString('hex');
 const map2: TMap = {
   clientId: 'tsk_client_B',
   secret: secret2,
   keyLen: 52,
   segs: [
-    // Different positions! This is the per-client secret structure
+    // Different per-client layouts and secrets yield distinct credentials.
     { id: 'ID',    pos: [0,  10], type: 'static' },
     { id: 'T120',  pos: [10, 22], type: 'totp', windowSec: 120 },
     { id: 'HOTP',  pos: [22, 34], type: 'hotp', counter: 0 },

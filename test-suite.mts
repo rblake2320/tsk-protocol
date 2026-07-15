@@ -237,15 +237,15 @@ test('HMAC differs with different secrets', () => {
   assert(a !== b, 'Expected different secrets → different HMAC');
 });
 
-test('Constant-time compare: equal strings pass', () => {
+test('timingSafeEqual wrapper: equal strings pass', () => {
   assert(constantTimeEqual('hello', 'hello'), 'Equal strings should match');
 });
 
-test('Constant-time compare: unequal strings fail', () => {
+test('timingSafeEqual wrapper: unequal strings fail', () => {
   assert(!constantTimeEqual('hello', 'world'), 'Unequal strings should not match');
 });
 
-test('Constant-time compare: different lengths fail', () => {
+test('timingSafeEqual wrapper: different lengths fail', () => {
   assert(!constantTimeEqual('hello', 'hi'), 'Different lengths should not match');
 });
 
@@ -419,7 +419,7 @@ test('Random key rejected', () => {
   assert(!result.ok, 'Random key should fail');
 });
 
-console.log('\n[6] Structural Secrecy — Stolen Key Analysis Attack');
+console.log('\n[6] Stale And Hybrid Credential Cases');
 
 test('Hybrid key (old rotating + current static) rejected', () => {
   const key1 = generateKey(testMap, NOW);
@@ -521,5 +521,5 @@ if (failed > 0) {
   for (const f of failures) console.log(`  ✗ ${f}`);
   process.exit(1);
 } else {
-  console.log('ALL TESTS PASSED — TSK Protocol fully verified');
+  console.log('Named TSK protocol cases passed');
 }

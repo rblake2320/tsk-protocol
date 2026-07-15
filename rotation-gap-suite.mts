@@ -272,7 +272,8 @@ console.log('\n== GAP 6: structural inference — position leakage from change p
   // Structural inference: changed positions reveal rotating segment boundaries.
   // This is a KNOWN LIMITATION of TSK (documented in spec §8.3):
   // "An attacker who intercepts multiple keys can infer which positions rotate."
-  // The spec claims the POSITIONAL MAP (which segment is which) is secret,
+  // Historical materials claimed the positional map was secret. Current
+  // protocol documents explicitly do not rely on layout secrecy.
   // not that change patterns are invisible.
   result(
     `${changed.length} chars changed across 30s boundary (rotating segments expose change pattern)`,
