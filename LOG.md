@@ -21,6 +21,8 @@
 - Added checksum-failure anomaly telemetry and verified the real browser attack
   path reaches server scoring.
 - Removed unused Jest dependencies and their deprecated transitive packages.
+- Pinned the CI actions and Redis service image to immutable upstream commits
+  and a tested container digest.
 - Corrected active documentation/demo claims; parked superseded wording and
   restoration evidence.
 - Verification: build and typecheck passed; 170/170 core/lifecycle/client/store/

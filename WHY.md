@@ -44,3 +44,9 @@ list beside a separate primary database would introduce an unfixable dual-write
 window. Promotion therefore returns no checkpoint unless the deployment binds
 the mutation/outbox and apply/checkpoint pairs into durable transactions and
 supplies the explicit durability check.
+
+## 2026-07-15: Release evidence must not depend on floating CI inputs
+
+Major-version action tags and mutable container tags can change without a
+repository commit. The protocol workflow pins GitHub Actions by commit and the
+Redis service by digest so a repeated run resolves the same reviewed inputs.
