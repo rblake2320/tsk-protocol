@@ -10,6 +10,8 @@
  * 4. REVOCATION: revoke() now returns a boolean indicating whether the
  *    client existed (useful for audit logging).
  * 5. AUDIT LOGGING: structured audit callback interface for deployment evidence.
+ * 6. PROV-01 FIX: logUpdate() added to ProvisionAuditLogger so updateKey()
+ *    emits a semantically correct update event instead of reusing logProvision.
  */
 import {
   generateTumblerMap,
@@ -27,7 +29,7 @@ import {
 import { emitKeyGenerationCapture } from '@tsk/core';
 import type { TumblerMapStore } from './store.js';
 
-// ─── Rate Limiter Interface ───────────────────────────────────────────────────
+// ─── Rate Limiter Interface ──────────────────────────────────────────────────────
 
 /**
  * Rate limiter interface for provisioning endpoint protection.
@@ -82,16 +84,25 @@ export class MemoryProvisionRateLimiter implements ProvisionRateLimiter {
   }
 }
 
-// ─── Audit Logger Interface ───────────────────────────────────────────────────
+// ─── Audit Logger Interface ─────────────────────────────────────────────────────
 
 /**
  * Audit logger interface for deployment evidence.
- * All provisioning and revocation events must be logged.
+ * All provisioning, update, and revocation events must be logged.
+ *
+ * All methods except logProvision, logRevocation, and logRateLimitExceeded
+ * are optional so existing implementations compile without change.
  */
 export interface ProvisionAuditLogger {
   logProvision(clientId: string, requestorId?: string): void;
   logRevocation(clientId: string, requestorId?: string): void;
   logRateLimitExceeded(requestorId?: string): void;
+  /**
+   * PROV-01 FIX: Emitted by updateKey() for lifecycle metadata changes.
+   * Separate from logProvision so audit consumers can distinguish provisioning
+   * events from update events when reconstructing credential lifecycle.
+   */
+  logUpdate?(clientId: string, requestorId?: string, reason?: string): void;
   logReplacement?(oldClientId: string, newClientId: string, requestorId: string, reason: string): void;
 }
 
@@ -108,7 +119,7 @@ export interface LifecycleAuthorizationRequest {
   action: 'revoke' | 'update';
 }
 
-// ─── Provision Result ─────────────────────────────────────────────────────────
+// ─── Provision Result ────────────────────────────────────────────────────────────
 
 export interface ProvisionResult {
   ok: boolean;
@@ -135,7 +146,7 @@ export interface ProvisionerOptions {
   lifecycleAuthorizer?: (request: LifecycleAuthorizationRequest) => Promise<boolean>;
 }
 
-// ─── Provisioner ──────────────────────────────────────────────────────────────
+// ─── Provisioner ────────────────────────────────────────────────────────────────
 
 export class TSKProvisioner {
   private readonly rateLimiter?: ProvisionRateLimiter;
@@ -177,7 +188,7 @@ export class TSKProvisioner {
       rotationWarningRequests?: number;
     },
   ): Promise<ProvisionResult> {
-    // ── Rate limit check ────────────────────────────────────────────────────
+    // ── Rate limit check ─────────────────────────────────────────────────────────
     if (this.rateLimiter && requestorId) {
       if (!this.rateLimiter.allow(requestorId)) {
         this.auditLogger?.logRateLimitExceeded(requestorId);
@@ -185,7 +196,7 @@ export class TSKProvisioner {
       }
     }
 
-    // ── Max client guard ────────────────────────────────────────────────────
+    // ── Max client guard ───────────────────────────────────────────────────────
     if (this.maxClients !== undefined) {
       const existing = await this.store.list();
       if (existing.length >= this.maxClients) {
@@ -381,7 +392,10 @@ export class TSKProvisioner {
     }
 
     await this.store.set(clientId, updated);
-    this.auditLogger?.logProvision(clientId, requestorId); // reuse for audit trail
+    // PROV-01 FIX: emit a semantically correct update event, not logProvision.
+    // logUpdate is optional so implementations that predate this fix continue
+    // to work unchanged.
+    this.auditLogger?.logUpdate?.(clientId, requestorId, reason);
     return true;
   }
 
@@ -456,7 +470,7 @@ export class TSKProvisioner {
   }
 }
 
-// ─── Option Validation ────────────────────────────────────────────────────────
+// ─── Option Validation ──────────────────────────────────────────────────────────
 
 /**
  * Validate provision options before passing to generateTumblerMap.
