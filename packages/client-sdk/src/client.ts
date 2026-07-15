@@ -1,18 +1,15 @@
 /**
  * TSK Protocol — Client SDK
- * IL4/5/6/7-hardened.
  *
  * Key security properties in this version:
  * 1. CORRECT KEY ASSEMBLY: generateHeaders() uses generateKeyFromClientPayload()
  *    which truncates/pads each segment value to its provisioned segmentLength before
  *    concatenation. This produces a key byte-for-byte identical to the server's
  *    positional layout.
- * 2. STRUCTURAL SECRECY COMPLIANCE: The client knows segment lengths but NOT
- *    start positions. It cannot reconstruct the structural map from the provision
- *    payload alone.
- * 3. HOTP COUNTER COMMIT-AFTER-SUCCESS: counters are only advanced after a
- *    successful HTTP response (2xx). Network failures no longer desynchronize
- *    the client counter from the server counter.
+ * 2. HONEST LAYOUT MODEL: ordered lengths reveal cumulative boundaries;
+ *    security does not depend on hiding them from the provisioned client.
+ * 3. HOTP COUNTER COMMIT-AFTER-AUTH: counters advance only when the server
+ *    returns X-TSK-Authenticated: 1, independent of application status.
  * 4. COUNTER PERSISTENCE: counters are persisted to storage after each
  *    successful use, preventing desync after process restarts.
  * 5. INITIALIZATION GUARD: all methods throw if called before init().
@@ -22,7 +19,7 @@ import {
   type TSKProvisionPayload,
 } from '@tsk/core';
 import type { TSKClientStorage } from './storage.js';
-import { TSK_HEADERS, TSK_PROTOCOL_VERSION } from './constants.js';
+import { TSK_HEADERS, TSK_PROTOCOL_VERSION, TSK_RESPONSE_HEADERS } from './constants.js';
 
 export interface TSKClientConfig {
   clientId: string;
@@ -59,7 +56,7 @@ export class TSKClient {
     for (const seg of this.payload.clientSegments) {
       if (seg.type === 'hotp') {
         // Try to load persisted counter first (survives process restarts)
-        const persisted = await this.config.storage.loadCounter?.(
+        const persisted = await this.config.storage.loadCounter(
           this.config.clientId,
           seg.segmentId
         );
@@ -82,12 +79,8 @@ export class TSKClient {
    *   3. Concatenates in positional order (matching server layout)
    *   4. Appends checksumLength-char HMAC checksum
    *
-   * STRUCTURAL SECRECY: The client knows segment lengths but NOT start positions.
-   * The server validates the key using its stored positional map.
-   *
    * HOTP SAFETY: Counters are NOT advanced here. They are advanced only after
-   * a successful HTTP response via commitHOTPCounters(). This prevents
-   * desynchronization on network failures.
+   * an authenticated response via commitHOTPCounters().
    *
    * @param nowMs - Current time in ms (injectable for testing)
    * @returns Headers object and a commit function to call on success
@@ -121,19 +114,15 @@ export class TSKClient {
 
     // Commit function: advance HOTP counters only after confirmed success
     const commitHOTPCounters = async (): Promise<void> => {
+      const nextCounters = new Map<string, number>();
       for (const seg of payload.clientSegments) {
         if (seg.type === 'hotp') {
           const current = snapshotCounters.get(seg.segmentId) ?? 0;
-          const next = current + 1;
-          this.counters.set(seg.segmentId, next);
-          // Persist counter to storage to survive process restarts
-          await this.config.storage.saveCounter?.(
-            this.config.clientId,
-            seg.segmentId,
-            next
-          );
+          nextCounters.set(seg.segmentId, current + 1);
         }
       }
+      await this.config.storage.saveCounters(this.config.clientId, nextCounters);
+      for (const [segmentId, counter] of nextCounters) this.counters.set(segmentId, counter);
     };
 
     return { headers, commitHOTPCounters };
@@ -141,7 +130,9 @@ export class TSKClient {
 
   /**
    * Fetch wrapper that automatically adds TSK headers.
-   * Advances HOTP counters only on successful (2xx) responses.
+   * Advances HOTP counters only when the server explicitly confirms that TSK
+   * authentication was accepted. HTTP adapters must add the headers returned
+   * by buildTSKResponseHeaders() even when downstream application work fails.
    *
    * This is the preferred way to make authenticated requests.
    */
@@ -156,8 +147,7 @@ export class TSKClient {
 
     const response = await fetch(url, { ...init, headers });
 
-    // Only commit HOTP counter advancement on success (2xx)
-    if (response.ok) {
+    if (response.headers.get(TSK_RESPONSE_HEADERS.AUTHENTICATED) === '1') {
       await commitHOTPCounters();
     }
 

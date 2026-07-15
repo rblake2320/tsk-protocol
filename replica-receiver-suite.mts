@@ -1,136 +1,178 @@
-/**
- * TSK HA — replica receiver test suite
- * Run with: npx tsx replica-receiver-suite.mts
- *
- * Tests the receiver against the REAL decorator end-to-end: decorator push is
- * routed in-process into the receiver, and the replica store must converge to
- * the primary — while the raw shared secret never reaches the replica.
- */
-import {
-  authorizeReplica, validateTumblerOp, applyTumblerOp, handleTumblerIngest,
-} from './packages/server/src/replica-receiver.ts';
-import { ReplicatingTumblerStore } from './packages/server/src/replicating-tumbler-store.ts';
+import { generateTumblerMap, type TumblerMap } from './packages/core/src/index.ts';
 import { MemoryTumblerStore } from './packages/server/src/store.ts';
-import type { TumblerMap } from './packages/core/src/types.ts';
+import {
+  REPLICATION_GENESIS_HASH,
+  ReplicatingTumblerStore,
+  computeReplicationHash,
+  signReplicaEnvelope,
+  type TumblerReplicaMutation,
+  type TumblerReplicaOp,
+} from './packages/server/src/replicating-tumbler-store.ts';
+import {
+  TumblerReplicaReceiver,
+  validateTumblerOp,
+} from './packages/server/src/replica-receiver.ts';
 
-let passed = 0, failed = 0;
-const failures: string[] = [];
-async function test(name: string, fn: () => Promise<void> | void) {
+const TOKEN = 'replica-test-secret-32-bytes-minimum-value';
+const NOW = 1_750_000_000_000;
+const STREAM = 'receiver-stream';
+const EPOCH = 3;
+let passed = 0;
+let failed = 0;
+
+async function test(name: string, fn: () => void | Promise<void>) {
   try { await fn(); passed++; console.log(`  ✓ ${name}`); }
-  catch (e: any) { failed++; failures.push(`${name}: ${e?.message ?? e}`); console.log(`  ✗ ${name}\n    ${e?.message ?? e}`); }
+  catch (error) { failed++; console.error(`  ✗ ${name}:`, error); }
 }
-function assert(c: boolean, m: string) { if (!c) throw new Error(m); }
+function assert(condition: unknown, message: string) { if (!condition) throw new Error(message); }
+function stripped(map: TumblerMap): TumblerMap { return { ...map, sharedSecret: '' }; }
 
-const SECRET = 'a'.repeat(64);
-const TOKEN = 'replica-shared-token';
-
-function tumbler(clientId: string, counter = 0): TumblerMap {
-  return {
-    clientId, sharedSecret: SECRET, keyLength: 32,
-    segments: [
-      { segmentId: 'seg-static', position: [0, 8], type: 'static' },
-      { segmentId: 'seg-hotp', position: [8, 16], type: 'hotp', counter },
-    ],
-    checksum: { position: [28, 32] }, createdAt: Date.now(), version: '1',
+function envelope(
+  mutation: TumblerReplicaMutation,
+  sequence: number,
+  previousHash: string,
+  overrides: Partial<Omit<TumblerReplicaOp, 'mutation' | 'signature'>> = {},
+): TumblerReplicaOp {
+  const base = {
+    streamId: overrides.streamId ?? STREAM,
+    epoch: overrides.epoch ?? EPOCH,
+    sequence,
+    previousHash,
+    mutation,
   };
+  const headHash = overrides.headHash ?? computeReplicationHash(base);
+  return signReplicaEnvelope({ ...base, headHash, sentAt: overrides.sentAt ?? NOW }, TOKEN);
 }
 
-console.log('\nTSK Replica Receiver Suite\n' + '─'.repeat(60));
+console.log('\nTSK replica receiver security suite');
 
-// ── Auth ──
-await test('RX-01: accepts correct token, rejects wrong/missing', () => {
-  assert(authorizeReplica({ 'x-replica-token': TOKEN }, TOKEN), 'correct token must pass');
-  assert(!authorizeReplica({ 'x-replica-token': 'nope' }, TOKEN), 'wrong token must fail');
-  assert(!authorizeReplica({}, TOKEN), 'missing token must fail');
+await test('accepts one valid signed envelope but metadata-only state cannot qualify for promotion', async () => {
+  const store = new MemoryTumblerStore();
+  const receiver = new TumblerReplicaReceiver(store, TOKEN, { streamId: STREAM, epoch: EPOCH, now: () => NOW });
+  const map = generateTumblerMap();
+  const op = envelope({ op: 'set', clientId: map.clientId, map: stripped(map), secretSealed: false }, 1, REPLICATION_GENESIS_HASH);
+  const result = await receiver.ingest(op);
+  assert(result.status === 200, JSON.stringify(result));
+  assert(receiver.getCheckpoint().headHash === op.headHash, 'checkpoint mismatch');
+  assert(receiver.promotionCheckpoint() === null, 'metadata-only replica must not qualify');
 });
 
-// ── Validation ──
-await test('RX-04: rejects unknown op and malformed set', () => {
-  assert(!validateTumblerOp({ op: 'nope' }).ok, 'unknown op rejected');
-  assert(!validateTumblerOp({ op: 'set', clientId: 'c1' }).ok, 'set without map rejected');
-  assert(!validateTumblerOp({ op: 'set', clientId: 'c1', map: { clientId: 'MISMATCH' } }).ok, 'clientId/map mismatch rejected');
-  assert(validateTumblerOp({ op: 'set', clientId: 'c1', map: tumbler('c1'), secretSealed: false }).ok, 'good set accepted');
+await test('rejects forged signatures before mutation', async () => {
+  const store = new MemoryTumblerStore();
+  const receiver = new TumblerReplicaReceiver(store, TOKEN, { streamId: STREAM, epoch: EPOCH, now: () => NOW });
+  const map = generateTumblerMap();
+  const op = envelope({ op: 'set', clientId: map.clientId, map: stripped(map), secretSealed: false }, 1, REPLICATION_GENESIS_HASH);
+  op.signature = `${op.signature.slice(0, -1)}${op.signature.endsWith('A') ? 'B' : 'A'}`;
+  const result = await receiver.ingest(op);
+  assert(result.status === 401, JSON.stringify(result));
+  assert(await store.get(map.clientId) === null, 'forgery mutated store');
 });
 
-await test('RX-04: updateCounters entries validated, bad shapes rejected', () => {
-  assert(validateTumblerOp({ op: 'updateCounters', clientId: 'c1', updates: [['seg', 3]] }).ok, 'valid entries accepted');
-  assert(!validateTumblerOp({ op: 'updateCounters', clientId: 'c1', updates: { seg: 3 } }).ok, 'object (not entries) rejected');
-  assert(!validateTumblerOp({ op: 'updateCounters', clientId: 'c1', updates: [['seg', 'x']] }).ok, 'non-number counter rejected');
+await test('rejects stale envelopes', async () => {
+  const receiver = new TumblerReplicaReceiver(new MemoryTumblerStore(), TOKEN, { streamId: STREAM, epoch: EPOCH, now: () => NOW });
+  const map = generateTumblerMap();
+  const op = envelope({ op: 'set', clientId: map.clientId, map: stripped(map), secretSealed: false }, 1, REPLICATION_GENESIS_HASH, { sentAt: NOW - 60_001 });
+  const result = await receiver.ingest(op);
+  assert(result.status === 401 && result.result.error === 'envelope_stale', JSON.stringify(result));
 });
 
-// ── Apply / idempotency ──
-await test('RX-02: updateCounters reconstructs Map and applies', async () => {
+await test('rejects replay and sequence gaps; a gap permanently blocks promotion', async () => {
+  const receiver = new TumblerReplicaReceiver(new MemoryTumblerStore(), TOKEN, { streamId: STREAM, epoch: EPOCH, now: () => NOW });
+  const map = generateTumblerMap();
+  const first = envelope({ op: 'set', clientId: map.clientId, map: stripped(map), secretSealed: false }, 1, REPLICATION_GENESIS_HASH);
+  assert((await receiver.ingest(first)).status === 200, 'first op failed');
+  const replay = await receiver.ingest(first);
+  assert(replay.status === 409 && replay.result.error === 'envelope_replay', JSON.stringify(replay));
+  const gap = envelope({ op: 'delete', clientId: map.clientId }, 3, first.headHash);
+  const gapResult = await receiver.ingest(gap);
+  assert(gapResult.status === 409 && gapResult.result.error === 'sequence_gap', JSON.stringify(gapResult));
+  assert(receiver.promotionCheckpoint() === null, 'gap must permanently disqualify receiver');
+});
+
+await test('strict map validation rejects malformed and raw-secret maps', () => {
+  const map = generateTumblerMap();
+  const rawSecret = envelope({ op: 'set', clientId: map.clientId, map, secretSealed: false }, 1, REPLICATION_GENESIS_HASH);
+  assert(!validateTumblerOp(rawSecret).ok, 'raw secret accepted under unsealed marker');
+  const malformed = envelope({
+    op: 'set', clientId: map.clientId,
+    map: { ...stripped(map), keyLength: -1 }, secretSealed: false,
+  }, 1, REPLICATION_GENESIS_HASH);
+  assert(!validateTumblerOp(malformed).ok, 'malformed map accepted');
+});
+
+await test('newer signed set cannot roll counters, usage, or terminal lifecycle backward', async () => {
+  const store = new MemoryTumblerStore();
+  const receiver = new TumblerReplicaReceiver(store, TOKEN, { streamId: STREAM, epoch: EPOCH, now: () => NOW });
+  const map = generateTumblerMap();
+  const hotp = map.segments.find(segment => segment.type === 'hotp')!;
+  const current: TumblerMap = {
+    ...stripped(map), status: 'revoked', requestCount: 5,
+    segments: map.segments.map(segment => segment.segmentId === hotp.segmentId ? { ...segment, counter: 5 } : segment),
+  };
+  const first = envelope({ op: 'set', clientId: map.clientId, map: current, secretSealed: false }, 1, REPLICATION_GENESIS_HASH);
+  assert((await receiver.ingest(first)).status === 200, 'initial state failed');
+  const rollbackMap: TumblerMap = { ...stripped(map), status: 'active', requestCount: 1 };
+  const second = envelope({ op: 'set', clientId: map.clientId, map: rollbackMap, secretSealed: false }, 2, first.headHash);
+  const result = await receiver.ingest(second);
+  assert(result.status === 409 && result.result.error === 'lifecycle_rollback', JSON.stringify(result));
+  assert(receiver.promotionCheckpoint() === null, 'rollback attempt must disqualify receiver');
+});
+
+await test('sealed state qualifies only after successful secret unsealing', async () => {
+  const store = new MemoryTumblerStore();
+  const receiver = new TumblerReplicaReceiver(store, TOKEN, {
+    streamId: STREAM, epoch: EPOCH, now: () => NOW,
+    secretUnsealer: (_clientId, sealed) => sealed.startsWith('sealed:') ? sealed.slice(7) : 'invalid',
+    promotionDurability: () => true,
+  });
+  const map = generateTumblerMap();
+  const sealedMap = { ...map, sharedSecret: `sealed:${map.sharedSecret}` };
+  const op = envelope({ op: 'set', clientId: map.clientId, map: sealedMap, secretSealed: true }, 1, REPLICATION_GENESIS_HASH);
+  const result = await receiver.ingest(op);
+  assert(result.status === 200, JSON.stringify(result));
+  assert(receiver.promotionCheckpoint()?.headHash === op.headHash, 'unsealed replica should qualify');
+  assert((await store.get(map.clientId))?.sharedSecret === map.sharedSecret, 'replica did not store usable unsealed secret');
+});
+
+await test('unsealed state still cannot qualify without durable checkpoint evidence', async () => {
+  const store = new MemoryTumblerStore();
+  const receiver = new TumblerReplicaReceiver(store, TOKEN, {
+    streamId: STREAM,
+    epoch: EPOCH,
+    now: () => NOW,
+    secretUnsealer: (_clientId, sealed) => sealed.startsWith('sealed:') ? sealed.slice(7) : 'invalid',
+  });
+  const map = generateTumblerMap();
+  const sealedMap = { ...map, sharedSecret: `sealed:${map.sharedSecret}` };
+  const op = envelope(
+    { op: 'set', clientId: map.clientId, map: sealedMap, secretSealed: true },
+    1,
+    REPLICATION_GENESIS_HASH,
+  );
+  assert((await receiver.ingest(op)).status === 200, 'valid sealed operation failed');
+  assert(receiver.promotionCheckpoint() === null, 'volatile receiver checkpoint qualified for promotion');
+});
+
+await test('end-to-end sender and receiver converge on the same signed head', async () => {
   const replica = new MemoryTumblerStore();
-  await replica.set('c1', tumbler('c1', 0));
-  await applyTumblerOp(replica, { op: 'updateCounters', clientId: 'c1', updates: [['seg-hotp', 7]] });
-  const map = await replica.get('c1');
-  const seg = map!.segments.find(s => s.segmentId === 'seg-hotp');
-  assert(seg?.counter === 7, `counter should be 7, got ${seg?.counter}`);
+  const receiver = new TumblerReplicaReceiver(replica, TOKEN, { streamId: STREAM, epoch: EPOCH, now: () => NOW });
+  const fetchImpl = async (_url: string | URL | Request, init?: RequestInit) => {
+    const result = await receiver.ingest(JSON.parse(String(init?.body)));
+    return new Response('', { status: result.status });
+  };
+  const sender = new ReplicatingTumblerStore(new MemoryTumblerStore(), { url: 'https://replica.test', token: TOKEN }, {
+    fetchImpl: fetchImpl as typeof fetch, streamId: STREAM, epoch: EPOCH, now: () => NOW,
+    promotionDurability: () => true,
+  });
+  const map = generateTumblerMap();
+  await sender.set(map.clientId, map);
+  assert(await sender.flush(), 'sender did not flush');
+  const source = sender.promotionCheckpoint();
+  const applied = receiver.getCheckpoint();
+  assert(Boolean(source && source.headHash === applied.headHash && source.sequence === applied.sequence), 'heads did not converge');
+  assert((await replica.get(map.clientId))?.sharedSecret === '', 'raw secret reached replica');
+  assert(receiver.promotionCheckpoint() === null, 'stripped replica must not qualify for authentication failover');
 });
 
-await test('RX-02: consumeCounter re-delivery is monotonic (no double-advance)', async () => {
-  const replica = new MemoryTumblerStore();
-  await replica.set('c1', tumbler('c1', 0));
-  await applyTumblerOp(replica, { op: 'consumeCounter', clientId: 'c1', segmentId: 'seg-hotp', matchedCounter: 0 }); // → 1
-  await applyTumblerOp(replica, { op: 'consumeCounter', clientId: 'c1', segmentId: 'seg-hotp', matchedCounter: 0 }); // replay, rejected by CAS
-  const seg = (await replica.get('c1'))!.segments.find(s => s.segmentId === 'seg-hotp');
-  assert(seg?.counter === 1, `replay must not double-advance; counter should be 1, got ${seg?.counter}`);
-});
-
-// ── Status mapping ──
-await test('handleTumblerIngest: 401 bad token (no mutation), 400 malformed, 200 good', async () => {
-  const replica = new MemoryTumblerStore();
-  const bad = await handleTumblerIngest(replica, { 'x-replica-token': 'x' }, { op: 'set', clientId: 'c1', map: tumbler('c1') }, TOKEN);
-  assert(bad.status === 401, `bad token → 401, got ${bad.status}`);
-  assert((await replica.list()).length === 0, 'no mutation on 401');
-  const malformed = await handleTumblerIngest(replica, { 'x-replica-token': TOKEN }, { op: 'set', clientId: 'c1' }, TOKEN);
-  assert(malformed.status === 400, `malformed → 400, got ${malformed.status}`);
-  const good = await handleTumblerIngest(replica, { 'x-replica-token': TOKEN }, { op: 'set', clientId: 'c1', map: tumbler('c1') }, TOKEN);
-  assert(good.status === 200, `good → 200, got ${good.status}`);
-});
-
-// ── END-TO-END convergence + secret safety ──
-await test('END-TO-END: replica converges to primary AND never receives the raw secret', async () => {
-  const primary = new MemoryTumblerStore();
-  const replica = new MemoryTumblerStore();
-  let sawRawSecret = false;
-
-  const fetchImpl = (async (_url: any, init: any) => {
-    if (String(init.body).includes(SECRET)) sawRawSecret = true;   // wire-level secret scan
-    const body = JSON.parse(init.body);
-    const headers = Object.fromEntries(Object.entries(init.headers));
-    const { status } = await handleTumblerIngest(replica, headers, body, TOKEN);
-    return new Response('{}', { status });
-  }) as unknown as typeof fetch;
-
-  const store = new ReplicatingTumblerStore(primary, { url: 'https://vps/replica', token: TOKEN }, { fetchImpl });
-
-  await store.set('c1', tumbler('c1', 0));
-  await store.set('c2', tumbler('c2', 0));
-  await store.updateCounters('c1', new Map([['seg-hotp', 4]]));
-  await store.consumeCounter('c2', 'seg-hotp', 0);   // success → mirrored
-  await store.delete('c2');
-  const drained = await store.flush(3000);
-  assert(drained, 'queue should drain');
-
-  assert(!sawRawSecret, 'raw shared secret must NEVER cross the wire (Tier-3 strip default)');
-
-  // Replica converges: only c1 remains, with the propagated counter update.
-  const ids = (await replica.list()).sort();
-  assert(ids.length === 1 && ids[0] === 'c1', `replica should hold only c1, got ${JSON.stringify(ids)}`);
-  const c1 = await replica.get('c1');
-  assert(c1!.sharedSecret === '', 'replica copy must be metadata-only (sharedSecret stripped)');
-  const seg = c1!.segments.find(s => s.segmentId === 'seg-hotp');
-  assert(seg?.counter === 4, `counter update should propagate; got ${seg?.counter}`);
-});
-
-console.log('\n' + '─'.repeat(60));
-console.log(`TSK Replica Receiver Suite: ${passed}/${passed + failed} passed`);
-if (failed > 0) {
-  console.log(`\nFAILURES (${failed}):`);
-  for (const f of failures) console.log(`  ✗ ${f}`);
-  process.exit(1);
-} else {
-  console.log('ALL TESTS PASSED — TSK replica receiver verified');
-  process.exit(0);   // explicit: a pending backoff setTimeout would otherwise keep node alive
-}
+console.log(`\nTSK replica receiver suite: ${passed}/${passed + failed} passed`);
+if (failed) process.exit(1);

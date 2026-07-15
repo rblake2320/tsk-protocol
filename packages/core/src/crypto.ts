@@ -1,11 +1,11 @@
 /**
  * TSK Protocol — Cryptographic Primitives
- * IL4/5/6/7-hardened. Uses Node.js built-in crypto (no external dependencies).
+ * Uses Node.js built-in cryptographic providers (no external dependencies).
  *
  * Security properties:
  * - HMAC-SHA256 with validated 256-bit hex key
- * - Constant-time comparison safe against both length and content timing leaks
- * - All randomness from crypto.randomBytes (CSPRNG, FIPS 140-2 compliant)
+ * - Node timingSafeEqual for equal-length value comparison
+ * - All randomness from crypto.randomBytes
  * - Hex secret validation prevents silent key collapse to empty buffer
  */
 import { createHmac, createHash, timingSafeEqual, randomBytes } from 'node:crypto';
@@ -82,13 +82,13 @@ export function sha256(input: string): string {
 // ─── Constant-Time Comparison ─────────────────────────────────────────────────
 
 /**
- * Constant-time string comparison.
+ * Compare equal-length string content with Node's timingSafeEqual.
  *
  * SECURITY HARDENING vs original:
  * - Original returned false immediately on length mismatch, leaking whether
  *   lengths matched via timing side-channel.
- * - Fixed: always runs timingSafeEqual on same-length buffers so execution
- *   time is independent of both length and content.
+ * - A dummy timingSafeEqual call is made on length mismatch, but callers must
+ *   not treat JavaScript/runtime timing as proof that input length is hidden.
  *
  * Returns true only if both strings are identical.
  */
@@ -97,7 +97,8 @@ export function constantTimeEqual(a: string, b: string): boolean {
   const bufB = Buffer.from(b, 'utf8');
 
   if (bufA.length !== bufB.length) {
-    // Run a dummy comparison to consume constant time and prevent length oracle.
+    // Avoid skipping the primitive entirely. This is not a guarantee that the
+    // surrounding JavaScript path hides input length.
     const dummy = Buffer.alloc(bufA.length);
     timingSafeEqual(bufA, dummy);
     return false;
@@ -110,7 +111,7 @@ export function constantTimeEqual(a: string, b: string): boolean {
 
 /**
  * Generate a random 256-bit hex-encoded shared secret.
- * Uses crypto.randomBytes (CSPRNG) — FIPS 140-2 compliant on Node.js.
+ * Uses the active Node.js runtime cryptographic provider via crypto.randomBytes.
  */
 export function generateSharedSecret(): string {
   return randomBytes(32).toString('hex');

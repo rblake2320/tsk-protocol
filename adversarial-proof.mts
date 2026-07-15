@@ -30,7 +30,9 @@ const replayMap: TumblerMap = {
   segments: map.segments.map((seg, index) => (
     index === 0
       ? { ...seg, type: 'static' as const, counter: undefined, windowSec: undefined }
-      : { ...seg, type: 'totp' as const, counter: undefined, windowSec: 30 }
+      : index === 1
+        ? { ...seg, type: 'hotp' as const, counter: 0, windowSec: undefined }
+        : { ...seg, type: 'totp' as const, counter: undefined, windowSec: 30 }
   )),
 };
 
@@ -94,7 +96,7 @@ console.log('\n[Attack 3] Brute Force Position Guessing — attacker constructs 
     if (result.ok) anyPassed = true;
   }
   assert('Positionally-shifted keys all rejected', !anyPassed,
-    'Structural secrecy holds — position shift breaks validation');
+    'A shifted key must fail integrity or segment validation');
 }
 
 // ─── Attack 4: Oversized Header DoS ───────────────────────────────────────
@@ -164,7 +166,11 @@ console.log('\n[Attack 6] Missing TSK Headers — request without TSK layer reje
 // ─── Full Flow Test ────────────────────────────────────────────────────────
 console.log('\n[Full Flow] Provision → Generate → Validate → HOTP counter advance → replay rejected');
 {
-  const { store, provisioner } = createTSKServer();
+  const { store } = createTSKServer();
+  const { TSKProvisioner } = await import('./packages/server/src/provisioner.js');
+  const provisioner = new TSKProvisioner(store, {
+    lifecycleAuthorizer: async request => request.requestorId === 'security-suite',
+  });
   const provision = await provisioner.provision({ keyLength: 96 });
   assert('Provisioning succeeded', provision.ok, `Error: ${provision.error}`);
 
@@ -187,7 +193,7 @@ console.log('\n[Full Flow] Provision → Generate → Validate → HOTP counter 
   assert('Valid key accepted', validResult.ok, `Error: ${validResult.error}`);
 
   // Revoke client
-  await provisioner.revoke(provision.clientId!);
+  await provisioner.revoke(provision.clientId!, 'security-suite', 'adversarial revocation case');
   const revokeResult = await verifyTSKRequest(req, store);
   assert('Revoked client rejected', !revokeResult.ok, `Expected rejection after revoke`);
 }
@@ -198,7 +204,7 @@ const passed = results.filter(r => r.passed).length;
 const total = results.length;
 console.log(`TSK Adversarial Proof: ${passed}/${total} tests passed`);
 if (passed === total) {
-  console.log('ALL TESTS PASSED — TSK Protocol adversarially proven');
+  console.log('Named TSK adversarial cases passed');
 } else {
   const failed = results.filter(r => !r.passed);
   console.log('FAILURES:');

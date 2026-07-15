@@ -26,8 +26,8 @@ function ScreenProvision() {
     'Selecting segment count + types',
     'Jittering segment lengths',
     'Shuffling segment positions',
-    'Persisting tumbler map · server-only',
-    'Sealing provision payload · positions stripped',
+    'Persisting authoritative server map',
+    'Creating ordered client metadata',
   ];
 
   const regen = async () => {
@@ -66,7 +66,7 @@ function ScreenProvision() {
       <SectionHead
         eyebrow="Provisioning Console"
         title="Mint a client. Build a tumbler map."
-        sub="Real server call: POST /tsk/provision. The server generates the map, stores positions privately, and returns a sealed payload with positions stripped."
+        sub="Demo server call: POST /tsk/provision. The server stores the authoritative map and returns ordered client metadata."
         right={
           <button className="btn primary" onClick={regen} disabled={stage === 'rolling'}>
             {stage === 'rolling' ? 'Provisioning…' : 'Provision new client'}
@@ -132,7 +132,7 @@ function ScreenProvision() {
             }>
               {stage === 'rolling'
                 ? <><span className="live-dot" style={{ background: 'var(--warning)', boxShadow: '0 0 10px var(--warning)' }} /> running on server</>
-                : stage === 'done' ? '✓ sealed'
+                : stage === 'done' ? '✓ created'
                 : stage === 'error' ? '✗ failed'
                 : 'idle · awaiting trigger'}
             </Pill>
@@ -183,7 +183,7 @@ function ScreenProvision() {
               <div>
                 <h3>Client receives · provision payload</h3>
                 <div className="muted" style={{ fontSize: 11.5, marginTop: 2 }}>
-                  Returned by POST /tsk/provision · positions stripped
+                  Returned by POST /tsk/provision · ordered client metadata
                 </div>
               </div>
               <Pill tone="primary">≤ what client needs</Pill>
@@ -206,7 +206,7 @@ function ScreenProvision() {
             </pre>
           </div>
 
-          {/* Server map — with the secret positions */}
+          {/* Server map — with authoritative absolute positions */}
           <div className="card flush" style={{ position: 'relative', overflow: 'hidden' }}>
             <div style={{
               position: 'absolute', inset: 0,

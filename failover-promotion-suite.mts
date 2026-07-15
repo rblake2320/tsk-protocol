@@ -1,126 +1,221 @@
-/**
- * TSK HA — promotion gate + FailoverTransport suite
- * Run with: npx tsx failover-promotion-suite.mts
- *
- * Tests the REAL promotion gate (server) and FailoverTransport (client). Both
- * are protocol-agnostic copies shared with BPC; this proves the TSK copies
- * behave identically under the Option A contract.
- */
 import {
-  PromotionController, assertWritable, handlePromotionCommand,
+  MemoryFencingStore,
+  FencedTumblerStore,
+  PromotionController,
+  WriterFencedError,
+  assertWritable,
+  handlePromotionCommand,
+  signGuardCommand,
+  type GuardCommand,
 } from './packages/server/src/promotion.ts';
-import {
-  FailoverTransport, PrimaryUnavailableError,
-} from './packages/client-sdk/src/failover-transport.ts';
+import { generateTumblerMap } from './packages/core/src/tumbler-map.ts';
+import { MemoryTumblerStore } from './packages/server/src/store.ts';
+import { FailoverTransport, PrimaryUnavailableError } from './packages/client-sdk/src/failover-transport.ts';
+import type { ReplicationCheckpoint } from './packages/server/src/replicating-tumbler-store.ts';
 
-let passed = 0, failed = 0;
-const failures: string[] = [];
-async function test(name: string, fn: () => Promise<void> | void) {
+const GUARD = 'guard-signing-secret-32-bytes-minimum-value';
+const NOW = 1_750_000_000_000;
+const CHECKPOINT: ReplicationCheckpoint = { streamId: 'stream-a', epoch: 4, sequence: 19, headHash: 'a'.repeat(64) };
+let passed = 0;
+let failed = 0;
+
+async function test(name: string, fn: () => void | Promise<void>) {
   try { await fn(); passed++; console.log(`  ✓ ${name}`); }
-  catch (e: any) { failed++; failures.push(`${name}: ${e?.message ?? e}`); console.log(`  ✗ ${name}\n    ${e?.message ?? e}`); }
+  catch (error) { failed++; console.error(`  ✗ ${name}:`, error); }
 }
-function assert(c: boolean, m: string) { if (!c) throw new Error(m); }
+function assert(condition: unknown, message: string) { if (!condition) throw new Error(message); }
 
-const GUARD = 'guard-token-xyz';
-const PRIMARY = 'https://primary.test';
-const REPLICA = 'https://replica.test';
-
-function makeNet() {
-  const up: Record<string, boolean> = {};
-  const hits: string[] = [];
-  const impl = (async (url: any) => {
-    const u = String(url);
-    hits.push(u);
-    const base = Object.keys(up).find((b) => u.startsWith(b));
-    if (base && up[base]) return new Response('{}', { status: 200 });
-    throw new Error(`network down: ${u}`);
-  }) as unknown as typeof fetch;
-  return { impl, hits, set: (b: string, v: boolean) => { up[b] = v; } };
+function command(input: {
+  command: 'activate' | 'promote' | 'demote';
+  nodeId: string;
+  fenceEpoch: number;
+  requiredCheckpoint?: ReplicationCheckpoint;
+  issuedAt?: number;
+  expiresAt?: number;
+}): GuardCommand {
+  return signGuardCommand({
+    ...input,
+    issuedAt: input.issuedAt ?? NOW,
+    expiresAt: input.expiresAt ?? NOW + 60_000,
+    by: 'fleet-guard',
+    reason: 'controlled failover',
+  }, GUARD);
 }
 
-console.log('\nTSK Promotion Gate + FailoverTransport Suite\n' + '─'.repeat(60));
+console.log('\nTSK fenced promotion and failover suite');
 
-// ── Promotion gate (PR-01/02/03) ──
-await test('PR-01: fresh replica is NOT writable; promote makes it writable', () => {
-  const r = new PromotionController('replica');
-  assert(!r.isWritable(), 'fresh replica must be read-only');
-  assert(assertWritable(r).ok === false, 'assertWritable must 503 a fresh replica');
-  r.promote('fleet-guard', 'primary down');
-  assert(r.isWritable(), 'promoted replica must be writable');
-  assert(assertWritable(r).ok === true, 'assertWritable must pass a promoted replica');
+await test('no primary or replica is writable without a fresh signed lease', async () => {
+  const fence = new MemoryFencingStore();
+  const primary = new PromotionController('primary', 'primary-a', fence, { now: () => NOW });
+  const replica = new PromotionController('replica', 'replica-a', fence, { now: () => NOW, replicaCheckpoint: () => CHECKPOINT });
+  assert(!(await assertWritable(primary)).ok, 'unleased primary was writable');
+  assert(!(await assertWritable(replica)).ok, 'unpromoted replica was writable');
 });
 
-await test('PR-01: primary is always writable and cannot be promoted/demoted', () => {
-  const p = new PromotionController('primary');
-  assert(p.isWritable(), 'primary always writable');
-  let threw = false;
-  try { p.promote('g'); } catch { threw = true; }
-  assert(threw, 'promoting a primary must throw');
+await test('higher replica epoch fences the old primary through the shared store', async () => {
+  const fence = new MemoryFencingStore();
+  const primary = new PromotionController('primary', 'primary-a', fence, { now: () => NOW });
+  const replica = new PromotionController('replica', 'replica-a', fence, { now: () => NOW, replicaCheckpoint: () => CHECKPOINT });
+  const active = await handlePromotionCommand(primary, command({ command: 'activate', nodeId: 'primary-a', fenceEpoch: 10 }), GUARD);
+  assert(active.status === 200 && (await assertWritable(primary)).ok, 'primary activation failed');
+  const promoted = await handlePromotionCommand(replica, command({
+    command: 'promote', nodeId: 'replica-a', fenceEpoch: 11, requiredCheckpoint: CHECKPOINT,
+  }), GUARD);
+  assert(promoted.status === 200, JSON.stringify(promoted));
+  assert(!(await assertWritable(primary)).ok, 'old primary remained writable after newer epoch');
+  assert((await assertWritable(replica)).ok, 'promoted replica not writable');
 });
 
-await test('PR-02: promoted state never auto-clears (explicit demote only)', () => {
-  const r = new PromotionController('replica');
-  r.promote('guard');
-  assert(r.isWritable(), 'still writable');
-  assert(r.isWritable(), 'still writable on re-check (no auto-expiry)');
-  r.demote('guard', 'primary recovered');
-  assert(!r.isWritable(), 'explicit demote reverts to read-only');
+await test('promotion fails when local checkpoint is missing, lossy, or behind', async () => {
+  const fence = new MemoryFencingStore();
+  const behind = { ...CHECKPOINT, sequence: CHECKPOINT.sequence - 1, headHash: 'b'.repeat(64) };
+  const replica = new PromotionController('replica', 'replica-a', fence, { now: () => NOW, replicaCheckpoint: () => behind });
+  const result = await handlePromotionCommand(replica, command({
+    command: 'promote', nodeId: 'replica-a', fenceEpoch: 1, requiredCheckpoint: CHECKPOINT,
+  }), GUARD);
+  assert(result.status === 409, JSON.stringify(result));
+  assert(!(await assertWritable(replica)).ok, 'non-converged replica was writable');
 });
 
-await test('PR-03: guard-only admin command (401 wrong token, 200 valid, 409 on primary)', () => {
-  const r = new PromotionController('replica');
-  assert(handlePromotionCommand(r, { 'x-guard-token': 'bad' }, { command: 'promote', by: 'x' }, GUARD).status === 401, 'wrong token → 401');
-  assert(!r.isWritable(), 'unchanged after 401');
-  const ok = handlePromotionCommand(r, { 'x-guard-token': GUARD }, { command: 'promote', by: 'guard', reason: 'failover' }, GUARD);
-  assert(ok.status === 200, 'valid guard token → 200');
-  assert(r.isWritable(), 'promoted via command');
-  const p = new PromotionController('primary');
-  assert(handlePromotionCommand(p, { 'x-guard-token': GUARD }, { command: 'promote', by: 'g' }, GUARD).status === 409, 'promote on primary → 409');
+await test('tampered, stale, expired, and replayed grants are denied', async () => {
+  const fence = new MemoryFencingStore();
+  const primary = new PromotionController('primary', 'primary-a', fence, { now: () => NOW });
+  const valid = command({ command: 'activate', nodeId: 'primary-a', fenceEpoch: 5 });
+  const tampered = { ...valid, fenceEpoch: 6 };
+  assert((await handlePromotionCommand(primary, tampered, GUARD)).status === 401, 'tamper accepted');
+  const stale = command({ command: 'activate', nodeId: 'primary-a', fenceEpoch: 5, issuedAt: NOW - 60_001, expiresAt: NOW + 1 });
+  assert((await handlePromotionCommand(primary, stale, GUARD)).status === 401, 'stale grant accepted');
+  const expired = command({ command: 'activate', nodeId: 'primary-a', fenceEpoch: 5, issuedAt: NOW - 1000, expiresAt: NOW });
+  assert((await handlePromotionCommand(primary, expired, GUARD)).status === 401, 'expired grant accepted');
+  assert((await handlePromotionCommand(primary, valid, GUARD)).status === 200, 'valid grant failed');
+  assert((await handlePromotionCommand(primary, valid, GUARD)).status === 409, 'replayed epoch accepted');
 });
 
-// ── FailoverTransport (FT-01/02/03) ──
-await test('FT-02: writes are primary-only; PrimaryUnavailableError, never replica', async () => {
-  const net = makeNet(); net.set(PRIMARY, false); net.set(REPLICA, true);
-  const t = new FailoverTransport({ primary: PRIMARY, replicas: [REPLICA], missThreshold: 1, fetchImpl: net.impl });
-  let firstThrew = false;
-  try { await t.write('/provision', {}); } catch { firstThrew = true; }
-  assert(firstThrew, 'first write attempt fails (trips primary unhealthy)');
-  let isPrimaryUnavail = false;
-  try { await t.write('/provision', {}); } catch (e) { isPrimaryUnavail = e instanceof PrimaryUnavailableError; }
-  assert(isPrimaryUnavail, 'second write throws PrimaryUnavailableError');
-  assert(!net.hits.some((h) => h.startsWith(REPLICA)), 'replica must NEVER receive a write');
+await test('lease expiry and fencing-store failure deny writes', async () => {
+  let now = NOW;
+  const fence = new MemoryFencingStore();
+  const primary = new PromotionController('primary', 'primary-a', fence, { now: () => now });
+  assert((await handlePromotionCommand(primary, command({ command: 'activate', nodeId: 'primary-a', fenceEpoch: 1, expiresAt: NOW + 10 }), GUARD)).status === 200, 'activation failed');
+  now += 11;
+  assert(!(await assertWritable(primary)).ok, 'expired lease remained writable');
+
+  const broken = new PromotionController('primary', 'broken', {
+    current: async () => { throw new Error('fence unavailable'); },
+    claim: async () => true,
+    release: async () => false,
+  }, { now: () => NOW });
+  assert((await handlePromotionCommand(broken, command({ command: 'activate', nodeId: 'broken', fenceEpoch: 2 }), GUARD)).status === 200, 'test activation failed');
+  assert(!(await assertWritable(broken)).ok, 'fence outage failed open');
 });
 
-await test('FT-01: reads fail over to replica and stay sticky after threshold', async () => {
-  const net = makeNet(); net.set(PRIMARY, false); net.set(REPLICA, true);
-  const t = new FailoverTransport({ primary: PRIMARY, replicas: [REPLICA], missThreshold: 3, fetchImpl: net.impl });
-  for (let i = 0; i < 3; i++) {
-    const res = await t.read('/status');
-    assert(res.status === 200, 'read should be served by replica');
-  }
-  assert(t.primaryHealthy === false, 'primary marked unhealthy after 3 misses');
-  assert(t.activeReadUrl === REPLICA, 'sticky to replica');
+await test('signed demotion releases the active fence and cannot be replayed', async () => {
+  const fence = new MemoryFencingStore();
+  const replica = new PromotionController('replica', 'replica-a', fence, { now: () => NOW, replicaCheckpoint: () => CHECKPOINT });
+  assert((await handlePromotionCommand(replica, command({ command: 'promote', nodeId: 'replica-a', fenceEpoch: 9, requiredCheckpoint: CHECKPOINT }), GUARD)).status === 200, 'promotion failed');
+  const demote = command({ command: 'demote', nodeId: 'replica-a', fenceEpoch: 9 });
+  assert((await handlePromotionCommand(replica, demote, GUARD)).status === 200, 'demotion failed');
+  assert(!(await assertWritable(replica)).ok, 'demoted replica remained writable');
+  assert((await handlePromotionCommand(replica, demote, GUARD)).status === 409, 'demotion replay accepted');
 });
 
-await test('FT-03: primary probe restores health and reads fail back', async () => {
-  const net = makeNet(); net.set(PRIMARY, false); net.set(REPLICA, true);
-  const t = new FailoverTransport({ primary: PRIMARY, replicas: [REPLICA], missThreshold: 1, fetchImpl: net.impl });
-  await t.read('/status');
-  assert(t.primaryHealthy === false, 'primary down after miss');
-  net.set(PRIMARY, true);
-  const ok = await t.probePrimary();
-  assert(ok === true, 'probe passes after recovery');
-  assert(t.primaryHealthy === true, 'primary failed back');
-  assert(t.activeReadUrl === PRIMARY, 'reads return to primary');
+await test('fenced store denies every mutation until the primary has a fresh lease', async () => {
+  const fence = new MemoryFencingStore();
+  const controller = new PromotionController('primary', 'primary-a', fence, { now: () => NOW });
+  const inner = new MemoryTumblerStore();
+  const store = new FencedTumblerStore(inner, controller);
+  const map = generateTumblerMap({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+
+  let denied = false;
+  try { await store.set(map.clientId, map); }
+  catch (error) { denied = error instanceof WriterFencedError; }
+  assert(denied, 'unleased set was not denied by the store boundary');
+  assert(await inner.get(map.clientId) === null, 'denied set mutated the inner store');
+
+  const activation = await handlePromotionCommand(
+    controller,
+    command({ command: 'activate', nodeId: 'primary-a', fenceEpoch: 1 }),
+    GUARD,
+  );
+  assert(activation.status === 200, 'primary activation failed');
+  await store.set(map.clientId, map);
+  assert(await inner.get(map.clientId) !== null, 'leased set did not reach the inner store');
 });
 
-console.log('\n' + '─'.repeat(60));
-console.log(`TSK Promotion + Failover Suite: ${passed}/${passed + failed} passed`);
-if (failed > 0) {
-  console.log(`\nFAILURES (${failed}):`);
-  for (const f of failures) console.log(`  ✗ ${f}`);
-  process.exit(1);
-} else {
-  console.log('ALL TESTS PASSED — TSK promotion gate + failover transport verified');
-  process.exit(0);   // explicit: a pending backoff setTimeout would otherwise keep node alive
-}
+await test('fenced store stops mutations after a higher-epoch replica promotion', async () => {
+  const fence = new MemoryFencingStore();
+  const primaryController = new PromotionController('primary', 'primary-a', fence, { now: () => NOW });
+  const replicaController = new PromotionController(
+    'replica',
+    'replica-a',
+    fence,
+    { now: () => NOW, replicaCheckpoint: () => CHECKPOINT },
+  );
+  const inner = new MemoryTumblerStore();
+  const store = new FencedTumblerStore(inner, primaryController);
+  const map = generateTumblerMap({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+
+  assert((await handlePromotionCommand(
+    primaryController,
+    command({ command: 'activate', nodeId: 'primary-a', fenceEpoch: 20 }),
+    GUARD,
+  )).status === 200, 'primary activation failed');
+  await store.set(map.clientId, map);
+  assert((await handlePromotionCommand(
+    replicaController,
+    command({
+      command: 'promote',
+      nodeId: 'replica-a',
+      fenceEpoch: 21,
+      requiredCheckpoint: CHECKPOINT,
+    }),
+    GUARD,
+  )).status === 200, 'replica promotion failed');
+
+  let denied = false;
+  try { await store.delete(map.clientId); }
+  catch (error) { denied = error instanceof WriterFencedError; }
+  assert(denied, 'old primary delete remained writable after fencing');
+  assert(await inner.get(map.clientId) !== null, 'fenced delete mutated the inner store');
+});
+
+await test('FailoverTransport never redirects a write to a read replica', async () => {
+  const calls: string[] = [];
+  const fetchImpl = async (url: string | URL | Request) => {
+    calls.push(String(url));
+    throw new Error('primary down');
+  };
+  const transport = new FailoverTransport({
+    primary: 'https://primary', replicas: ['https://replica'], missThreshold: 1,
+    fetchImpl: fetchImpl as typeof fetch,
+  });
+  let unavailable = false;
+  try { await transport.write('/mutate', { method: 'POST' }); }
+  catch (error) { unavailable = error instanceof Error; }
+  assert(unavailable, 'write failure not surfaced');
+  assert(calls.every(url => !url.startsWith('https://replica')), `write hit replica: ${calls}`);
+  let typed = false;
+  try { await transport.write('/mutate'); } catch (error) { typed = error instanceof PrimaryUnavailableError; }
+  assert(typed, 'subsequent write did not fail closed with PrimaryUnavailableError');
+});
+
+await test('reads may fail over and later fail back independently of writer leases', async () => {
+  let primaryUp = false;
+  const fetchImpl = async (url: string | URL | Request) => {
+    const value = String(url);
+    if (value.startsWith('https://primary') && !primaryUp) throw new Error('down');
+    return new Response(value, { status: 200 });
+  };
+  const transport = new FailoverTransport({
+    primary: 'https://primary', replicas: ['https://replica'], missThreshold: 1,
+    fetchImpl: fetchImpl as typeof fetch,
+  });
+  const failedOver = await transport.read('/state');
+  assert((await failedOver.text()).startsWith('https://replica'), 'read did not fail over');
+  primaryUp = true;
+  assert(await transport.probePrimary(), 'primary probe failed');
+  const failedBack = await transport.read('/state');
+  assert((await failedBack.text()).startsWith('https://primary'), 'read did not fail back');
+});
+
+console.log(`\nTSK fenced promotion suite: ${passed}/${passed + failed} passed`);
+if (failed) process.exit(1);

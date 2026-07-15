@@ -3,9 +3,8 @@
  * Tumbler-Style Rotating Segment Keys
  *
  * A TSKKey is a fixed-length string where individual character segments rotate
- * independently on TOTP/HOTP schedules. The map of WHICH positions rotate (and
- * at what rate) is a per-client secret stored only on the server — this "structural
- * secrecy" is the core novel security property.
+ * independently on time- and counter-based schedules. The server retains the
+ * authoritative lifecycle and counter state used to validate each key.
  */
 
 export type SegmentType = 'static' | 'totp' | 'hotp';
@@ -60,6 +59,13 @@ export interface TumblerMap {
   maxRequests?: number;
 
   /**
+   * Number of requests remaining at which the server starts returning a
+   * rotation-required signal. Defaults to 10% of maxRequests (minimum 1).
+   * This is a warning window, not a grace period: the hard cap still denies.
+   */
+  rotationWarningRequests?: number;
+
+  /**
    * Total number of successful validations served by this key.
    * Incremented by the server middleware after each successful verifyTSKRequest.
    */
@@ -73,31 +79,21 @@ export interface TumblerMap {
 
   /**
    * Key lifecycle status.
-   * - 'active':   Key is valid and accepting requests.
-   * - 'revoked':  Key was explicitly revoked by an operator.
-   * - 'expired':  Key has passed its expiresAt timestamp or hit its maxRequests cap.
+   * - 'active':    Key is valid and accepting requests.
+   * - 'expiring':  Key is valid but inside its configured rotation warning window.
+   * - 'revoked':   Key was explicitly revoked by an operator.
+   * - 'expired':   Key has passed its expiresAt timestamp or hit its maxRequests cap.
    */
-  status?: 'active' | 'revoked' | 'expired';
+  status?: 'active' | 'expiring' | 'revoked' | 'expired';
 }
 
 export interface TSKProvisionPayload {
   /** Client identifier */
   clientId: string;
   /**
-   * Segments the client needs to regenerate values.
-   *
-   * STRUCTURAL SECRECY CONTRACT:
-   * - Each entry includes segmentLength so the client can truncate/pad its HMAC
-   *   output to the correct size before concatenation.
-   * - Entries are in the same order as the server's positional layout, so the
-   *   client's concatenated output is byte-for-byte identical to the server's
-   *   expected key layout.
-   * - The client knows LENGTHS but NOT POSITIONS (start offsets). Without knowing
-   *   where each segment starts in the key, the client cannot reconstruct the
-   *   structural map — it only knows "I have N segments of these sizes in this order."
-   * - The server holds the absolute positions privately. An attacker who intercepts
-   *   the provision payload learns segment sizes and order, but NOT the absolute
-   *   positions within the key (which is the structural secret).
+   * Ordered segment descriptions the client needs to regenerate values. The
+   * ordering and lengths are sufficient to reconstruct segment boundaries;
+   * they are not treated as a secret or authentication factor.
    */
   clientSegments: ClientSegmentConfig[];
   /**
@@ -118,10 +114,8 @@ export interface TSKProvisionPayload {
 /**
  * What the client receives per segment.
  *
- * STRUCTURAL SECRECY:
- * - segmentLength: included so client can truncate/pad HMAC output to correct size.
- *   Knowing lengths does NOT reveal positions — the client has no start offsets.
- * - position: intentionally ABSENT — this is the server's private structural secret.
+ * Absolute offsets are omitted, but the ordered lengths reveal the same
+ * boundaries cumulatively. Security must not depend on hiding this layout.
  */
 export interface ClientSegmentConfig {
   segmentId: string;
@@ -129,7 +123,7 @@ export interface ClientSegmentConfig {
   /**
    * Number of characters this segment occupies in the assembled key.
    * The client uses this to truncate/pad its HMAC output before concatenation.
-   * Knowing the length does NOT reveal the segment's position (start offset) in the key.
+   * Ordered lengths allow the client to assemble the key deterministically.
    */
   segmentLength: number;
   /** TOTP window in seconds */
@@ -170,6 +164,7 @@ export type TSKError =
   | 'CLIENT_NOT_FOUND'
   | 'KEY_LENGTH_MISMATCH'
   | 'MAP_INVALID_NO_SEGMENTS'
+  | 'MAP_INVALID_NO_HOTP'
   | 'MAP_INVALID_ZERO_LENGTH_SEGMENT'
   | 'INVALID_KEY';   // TSK-06: generic external error for all auth failures
 

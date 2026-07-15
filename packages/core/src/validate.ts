@@ -1,9 +1,9 @@
 /**
- * TSK Protocol — Key Validation (IL4/5/6/7 Hardened)
+ * TSK Protocol — Key Validation
  *
  * Security properties:
  * - Checksum-first validation (DoS guard: rejects ~99.99% of invalid keys with 1 HMAC op)
- * - Constant-time comparison for all segment values (timing oracle prevention)
+ * - timingSafeEqual-backed comparison for equal-length segment candidates
  * - HOTP counter exhaustion detection
  * - Type-safe segment result reporting (for anomaly engine)
  * - counterUpdates stores {newCounter, matchedCounter} for correct CAS in middleware
@@ -58,7 +58,7 @@ export interface ValidationResultWithCounterUpdates extends TSKValidationResult 
 /**
  * Validate a submitted TSK key string.
  *
- * Validation order (optimized for DoS resistance):
+ * Validation order (rejects malformed/random input before segment work):
  * 1. Key length check (O(1))
  * 2. Checksum verification (1 HMAC op — rejects ~99.99% of invalid keys here)
  * 3. Per-segment validation (only reached by keys with valid checksums)
@@ -76,6 +76,9 @@ export function validateTSKKey(
   // - Zero-length segments: provide no authentication value and allow trivial matching
   if (!map.segments || map.segments.length === 0) {
     return { ok: false, error: 'MAP_INVALID_NO_SEGMENTS' };
+  }
+  if (!map.segments.some(segment => segment.type === 'hotp')) {
+    return { ok: false, error: 'MAP_INVALID_NO_HOTP' };
   }
   for (const seg of map.segments) {
     const segLen = seg.position[1] - seg.position[0];
@@ -129,7 +132,7 @@ export function validateTSKKey(
     } else if (seg.type === 'totp') {
       const windowSec = seg.windowSec ?? 60;
       const T = Math.floor(nowMs / 1000 / windowSec);
-      // Check T-tolerance to T+tolerance (constant-time for each window)
+      // Check T-tolerance to T+tolerance with equal-length timingSafeEqual calls.
       for (let delta = -cfg.totpToleranceWindows; delta <= cfg.totpToleranceWindows; delta++) {
         const expected = deriveSegmentForWindow(map.sharedSecret, seg, T + delta);
         if (constantTimeEqual(providedSegValue, expected)) {

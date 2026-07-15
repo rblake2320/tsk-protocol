@@ -4,13 +4,18 @@
  * Survives server restarts. Suitable for single-node deployments,
  * local dev with persistence, and terminal identity management in PKA.
  *
- * Preserves all IL4/5/6/7 hardening: atomic HOTP CAS (single-process),
- * TTL expiry, bounded entry count. For multi-node: use PgTumblerStore.
+ * Provides single-process atomic counter/lifecycle commits, TTL expiry, and a
+ * bounded entry count. It is not a multi-process or multi-node store.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { TumblerMap } from '@tsk/core';
-import type { TumblerMapStore } from './store.js';
+import {
+  commitValidationToMap,
+  type TumblerMapStore,
+  type ValidationCommitInput,
+  type ValidationCommitResult,
+} from './store.js';
 
 interface FileTumblerData {
   maps: Record<string, TumblerMap>;
@@ -50,15 +55,19 @@ export class FileTumblerStore implements TumblerMapStore {
           }
         }
       }
-    } catch {
-      this.data = { maps: {}, lastAccess: {} };
+    } catch (error) {
+      throw new Error(
+        `TSK_FILE_STORE_CORRUPT: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
   private flush(): void {
     const dir = dirname(this.filePath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf8');
+    const temporary = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(temporary, JSON.stringify(this.data, null, 2), { encoding: 'utf8', mode: 0o600 });
+    renameSync(temporary, this.filePath);
   }
 
   private evictLRU(): void {
@@ -72,9 +81,9 @@ export class FileTumblerStore implements TumblerMapStore {
 
   async set(clientId: string, map: TumblerMap): Promise<void> {
     if (!this.data.maps[clientId] && Object.keys(this.data.maps).length >= this.maxEntries) {
-      this.evictLRU();
+      throw new Error('TSK_STORE_CAPACITY_REACHED');
     }
-    this.data.maps[clientId] = { ...map };
+    this.data.maps[clientId] = structuredClone(map);
     this.data.lastAccess[clientId] = Date.now();
     this.flush();
   }
@@ -89,7 +98,7 @@ export class FileTumblerStore implements TumblerMapStore {
       return null;
     }
     this.data.lastAccess[clientId] = Date.now();
-    return map;
+    return structuredClone(map);
   }
 
   async delete(clientId: string): Promise<void> {
@@ -126,6 +135,32 @@ export class FileTumblerStore implements TumblerMapStore {
     const stored = seg.counter ?? 0;
     if (stored > matchedCounter) return Promise.resolve(false); // already consumed
     seg.counter = matchedCounter + 1;
+    this.flush();
+    return Promise.resolve(true);
+  }
+
+  commitValidation(clientId: string, input: ValidationCommitInput): Promise<ValidationCommitResult> {
+    const map = this.data.maps[clientId];
+    if (!map) return Promise.resolve({ ok: false, error: 'TSK_KEY_EXPIRED' });
+    const result = commitValidationToMap(map, input);
+    this.flush();
+    return Promise.resolve(result);
+  }
+
+  replaceCredential(oldClientId: string, replacement: TumblerMap): Promise<boolean> {
+    const current = this.data.maps[oldClientId];
+    if (!current || (current.status !== undefined && current.status !== 'active' && current.status !== 'expiring')) {
+      return Promise.resolve(false);
+    }
+    if (this.data.maps[replacement.clientId]) return Promise.resolve(false);
+    current.status = 'revoked';
+    if (Object.keys(this.data.maps).length >= this.maxEntries) {
+      delete this.data.maps[oldClientId];
+      delete this.data.lastAccess[oldClientId];
+    }
+    this.data.maps[replacement.clientId] = structuredClone(replacement);
+    this.data.lastAccess[oldClientId] = Date.now();
+    this.data.lastAccess[replacement.clientId] = Date.now();
     this.flush();
     return Promise.resolve(true);
   }

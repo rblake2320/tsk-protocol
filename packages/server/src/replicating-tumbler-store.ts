@@ -1,86 +1,77 @@
 /**
- * ReplicatingTumblerStore — async write-mirroring decorator for HA TSK.
+ * Ordered, authenticated write mirroring for a TSK primary.
  *
- * Wraps ANY primary TumblerMapStore and mirrors every mutation to a remote
- * replica over HTTPS. Mirrors the BPC ReplicatingPairStore HA pattern, but the
- * mutation surface and wire format follow TumblerMapStore — NOT the BPC pair
- * shape. The decisive divergence is secret handling (HA-03'), below.
- *
- *  HA-01 Local-first authority:
- *    The primary mutation completes and its result is returned to the caller
- *    BEFORE the replica is touched. A slow/down/unreachable replica NEVER blocks
- *    or fails a primary operation. consumeCounter() — the replay-critical atomic
- *    CAS — is decided entirely by the primary; only a SUCCESSFUL consume is then
- *    mirrored, so the replica's counter stays monotonic and replay-safe too.
- *
- *  HA-02 Bounded retry queue (no memory exhaustion):
- *    Failed pushes retry with exponential backoff. The queue is capped and sheds
- *    OLDEST entries when full, surfacing the loss via onDrop. A long replica
- *    outage cannot exhaust primary memory.
- *
- *  HA-03' Secret never leaks by default (TSK-specific):
- *    Unlike BPC (asymmetric — the replica only ever held a verifier), TSK is a
- *    SHARED-SECRET protocol: TumblerMap.sharedSecret is live signing material
- *    that the type contract says is "NEVER transmitted after provisioning".
- *    Therefore the DEFAULT policy ('strip') ensures sharedSecret NEVER crosses
- *    the wire — the replica receives a metadata-only map (sharedSecret = '') and
- *    can serve revocation / expiry / counter state, but cannot independently
- *    validate keys. Full-failover validation is an EXPLICIT opt-in: pass a
- *    SecretSealer that envelope-encrypts the secret so a passive replica
- *    compromise (DB dump) still leaks nothing. The dangerous path is never
- *    accidental.
- *
- * NIST SP 800-53 Rev 5: CP-9, CP-10, SC-5, SC-28 (protection of information at
- * rest), AU-9.
+ * The replication stream is hash-linked and monotonically sequenced. Queue loss
+ * permanently disqualifies the stream from promotion until an operator performs
+ * an explicit full resynchronization with a new stream/epoch.
  */
-import type { TumblerMapStore } from './store.js';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { TumblerMap } from '@tsk/core';
+import type {
+  TumblerMapStore,
+  ValidationCommitInput,
+  ValidationCommitResult,
+} from './store.js';
 
-/**
- * Seals a per-client sharedSecret before it crosses the wire. Return value
- * replaces TumblerMap.sharedSecret on the replicated copy. Implement with
- * envelope encryption under a key the replica controls; NEVER return the raw
- * secret. Only used when secretPolicy is set to a sealer (opt-in).
- */
-export type SecretSealer = (clientId: string, sharedSecretHex: string) => Promise<string> | string;
+export const REPLICATION_GENESIS_HASH = '0'.repeat(64);
+export const MIN_REPLICATION_TOKEN_BYTES = 32;
 
-export type TumblerReplicaOp =
+export interface ReplicationCheckpoint {
+  streamId: string;
+  epoch: number;
+  sequence: number;
+  headHash: string;
+}
+
+export type TumblerReplicaMutation =
   | { op: 'set'; clientId: string; map: TumblerMap; secretSealed: boolean }
   | { op: 'delete'; clientId: string }
   | { op: 'updateCounters'; clientId: string; updates: Array<[string, number]> }
   | { op: 'consumeCounter'; clientId: string; segmentId: string; matchedCounter: number };
 
+/** Wire envelope. `signature` authenticates every field except itself. */
+export interface TumblerReplicaOp extends ReplicationCheckpoint {
+  previousHash: string;
+  sentAt: number;
+  mutation: TumblerReplicaMutation;
+  signature: string;
+}
+
+interface PendingReplicaOp {
+  checkpoint: ReplicationCheckpoint;
+  previousHash: string;
+  mutation: TumblerReplicaMutation;
+}
+
+/** Seal a shared secret before it leaves the primary. */
+export type SecretSealer = (clientId: string, sharedSecretHex: string) => Promise<string> | string;
+
 export interface ReplicaTarget {
-  /** Base URL of the replica ingest endpoint, e.g. https://srv1740069.hstgr.cloud/replica */
   url: string;
-  /** Shared replication auth token (sent as x-replica-token). NOT a TSK secret. */
+  /** At least 32 bytes; used for request authentication and envelope signing. */
   token: string;
-  /** Per-request timeout. Default 5000ms. */
   timeoutMs?: number;
 }
 
 export interface ReplicatingTumblerOptions {
-  /**
-   * sharedSecret handling before transmission.
-   * - 'strip' (DEFAULT, SECURE): sharedSecret is NEVER replicated. Replica holds
-   *   metadata only and cannot independently validate keys.
-   * - SecretSealer: envelope-encrypt for full-failover validation, accepting
-   *   sealed key material on the replica. Use only with a replica held to the
-   *   same standard as the primary.
-   */
   secretPolicy?: 'strip' | SecretSealer;
-  /** Max queued ops before oldest are shed. Default 5000. */
   maxQueue?: number;
-  /** Base backoff in ms for retries. Default 1000. */
   backoffBaseMs?: number;
-  /** Max backoff in ms. Default 30_000. */
   backoffMaxMs?: number;
-  /** Called when an op is shed because the queue is full (replication lag alarm). */
-  onDrop?: (op: TumblerReplicaOp, queueDepth: number) => void;
-  /** Called on each push outcome — wire to metrics/health. */
-  onPush?: (ok: boolean, op: TumblerReplicaOp, attempt: number) => void;
-  /** Injectable fetch for tests. Defaults to global fetch. */
+  onDrop?: (op: TumblerReplicaMutation, queueDepth: number) => void;
+  onPush?: (ok: boolean, op: TumblerReplicaMutation, attempt: number) => void;
   fetchImpl?: typeof fetch;
+  /** Persist these values with the primary. A changed stream requires full resync. */
+  streamId?: string;
+  epoch?: number;
+  initialCheckpoint?: ReplicationCheckpoint;
+  now?: () => number;
+  /**
+   * Confirms that the primary mutation, pending operation, and source
+   * checkpoint are durably recoverable as one deployment transaction.
+   * Omit to make promotion fail closed.
+   */
+  promotionDurability?: (checkpoint: ReplicationCheckpoint) => boolean;
 }
 
 const DEFAULTS = {
@@ -90,24 +81,83 @@ const DEFAULTS = {
   timeoutMs: 5000,
 };
 
+function assertStrongSecret(secret: string, name: string): void {
+  if (Buffer.byteLength(secret, 'utf8') < MIN_REPLICATION_TOKEN_BYTES) {
+    throw new Error(`${name} must contain at least ${MIN_REPLICATION_TOKEN_BYTES} bytes`);
+  }
+}
+
+function canonical(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(item => canonical(item === undefined ? null : item)).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).filter(key => record[key] !== undefined).sort()
+    .map(key => `${JSON.stringify(key)}:${canonical(record[key])}`).join(',')}}`;
+}
+
+export function computeReplicationHash(input: {
+  streamId: string;
+  epoch: number;
+  sequence: number;
+  previousHash: string;
+  mutation: TumblerReplicaMutation;
+}): string {
+  return createHash('sha256').update(canonical(input), 'utf8').digest('hex');
+}
+
+function unsignedEnvelope(op: TumblerReplicaOp): Omit<TumblerReplicaOp, 'signature'> {
+  const { signature: _signature, ...unsigned } = op;
+  return unsigned;
+}
+
+export function signReplicaEnvelope(
+  input: Omit<TumblerReplicaOp, 'signature'>,
+  token: string,
+): TumblerReplicaOp {
+  assertStrongSecret(token, 'replica token');
+  const signature = createHmac('sha256', token).update(canonical(input), 'utf8').digest('base64url');
+  return { ...input, signature };
+}
+
+export function verifyReplicaEnvelopeSignature(op: TumblerReplicaOp, token: string): boolean {
+  try {
+    assertStrongSecret(token, 'replica token');
+    const expected = createHmac('sha256', token)
+      .update(canonical(unsignedEnvelope(op)), 'utf8')
+      .digest();
+    const presented = Buffer.from(op.signature, 'base64url');
+    return presented.toString('base64url') === op.signature &&
+      presented.length === expected.length && timingSafeEqual(presented, expected);
+  } catch {
+    return false;
+  }
+}
+
 export class ReplicatingTumblerStore implements TumblerMapStore {
-  private readonly queue: TumblerReplicaOp[] = [];
+  private readonly queue: PendingReplicaOp[] = [];
   private draining = false;
   private attempt = 0;
-
+  private integrityLost = false;
   private readonly secretPolicy: 'strip' | SecretSealer;
   private readonly maxQueue: number;
   private readonly backoffBaseMs: number;
   private readonly backoffMaxMs: number;
-  private readonly onDrop?: (op: TumblerReplicaOp, queueDepth: number) => void;
-  private readonly onPush?: (ok: boolean, op: TumblerReplicaOp, attempt: number) => void;
+  private readonly onDrop?: (op: TumblerReplicaMutation, queueDepth: number) => void;
+  private readonly onPush?: (ok: boolean, op: TumblerReplicaMutation, attempt: number) => void;
   private readonly fetchImpl?: typeof fetch;
+  private readonly now: () => number;
+  private readonly promotionDurability?: (checkpoint: ReplicationCheckpoint) => boolean;
+  private checkpoint: ReplicationCheckpoint;
 
   constructor(
     private readonly primary: TumblerMapStore,
     private readonly replica: ReplicaTarget,
     options: ReplicatingTumblerOptions = {},
   ) {
+    assertStrongSecret(replica.token, 'replica token');
+    if (!Number.isInteger(options.maxQueue ?? DEFAULTS.maxQueue) || (options.maxQueue ?? DEFAULTS.maxQueue) < 1) {
+      throw new Error('maxQueue must be a positive integer');
+    }
     this.secretPolicy = options.secretPolicy ?? 'strip';
     this.maxQueue = options.maxQueue ?? DEFAULTS.maxQueue;
     this.backoffBaseMs = options.backoffBaseMs ?? DEFAULTS.backoffBaseMs;
@@ -115,65 +165,125 @@ export class ReplicatingTumblerStore implements TumblerMapStore {
     this.onDrop = options.onDrop;
     this.onPush = options.onPush;
     this.fetchImpl = options.fetchImpl;
+    this.now = options.now ?? Date.now;
+    this.promotionDurability = options.promotionDurability;
+
+    if (options.initialCheckpoint) {
+      this.checkpoint = { ...options.initialCheckpoint };
+    } else {
+      const epoch = options.epoch ?? 1;
+      if (!Number.isSafeInteger(epoch) || epoch < 1) throw new Error('replication epoch must be a positive safe integer');
+      this.checkpoint = {
+        streamId: options.streamId ?? randomUUID(),
+        epoch,
+        sequence: 0,
+        headHash: REPLICATION_GENESIS_HASH,
+      };
+    }
   }
 
-  // ── Reads always hit the authoritative primary ──────────────────────────────
   get(clientId: string) { return this.primary.get(clientId); }
   list() { return this.primary.list(); }
 
-  // ── Writes: primary first (authoritative), then async mirror ────────────────
   async set(clientId: string, map: TumblerMap): Promise<void> {
     await this.primary.set(clientId, map);
     const { map: wireMap, secretSealed } = await this.sealMap(map);
-    this.enqueue({ op: 'set', clientId, map: wireMap, secretSealed });
+    this.enqueueMutation({ op: 'set', clientId, map: wireMap, secretSealed });
   }
 
   async delete(clientId: string): Promise<void> {
     await this.primary.delete(clientId);
-    this.enqueue({ op: 'delete', clientId });
+    this.enqueueMutation({ op: 'delete', clientId });
   }
 
   async updateCounters(clientId: string, updates: Map<string, number>): Promise<void> {
     await this.primary.updateCounters(clientId, updates);
-    // HA: a JS Map does NOT survive JSON.stringify — serialize to entries.
-    this.enqueue({ op: 'updateCounters', clientId, updates: [...updates] });
+    this.enqueueMutation({ op: 'updateCounters', clientId, updates: [...updates] });
   }
 
   async consumeCounter(clientId: string, segmentId: string, matchedCounter: number): Promise<boolean> {
-    // HA-01: the primary is authoritative for the replay decision.
-    if (!this.primary.consumeCounter) {
-      // Underlying store has no atomic CAS — nothing to mirror, nothing to claim.
-      return false;
-    }
+    if (!this.primary.consumeCounter) return false;
     const ok = await this.primary.consumeCounter(clientId, segmentId, matchedCounter);
-    // Only mirror a SUCCESSFUL consume so the replica advances identically and
-    // a rejected replay is never propagated.
-    if (ok) this.enqueue({ op: 'consumeCounter', clientId, segmentId, matchedCounter });
+    if (ok) this.enqueueMutation({ op: 'consumeCounter', clientId, segmentId, matchedCounter });
     return ok;
   }
 
-  // ── Secret sealing (HA-03') ─────────────────────────────────────────────────
+  async commitValidation(clientId: string, input: ValidationCommitInput): Promise<ValidationCommitResult> {
+    const result = await this.primary.commitValidation(clientId, input);
+    const current = await this.primary.get(clientId);
+    if (current) {
+      const { map, secretSealed } = await this.sealMap(current);
+      this.enqueueMutation({ op: 'set', clientId, map, secretSealed });
+    }
+    return result;
+  }
+
+  async replaceCredential(oldClientId: string, replacement: TumblerMap): Promise<boolean> {
+    const replaced = await this.primary.replaceCredential(oldClientId, replacement);
+    if (!replaced) return false;
+    for (const clientId of [oldClientId, replacement.clientId]) {
+      const current = await this.primary.get(clientId);
+      if (current) {
+        const { map, secretSealed } = await this.sealMap(current);
+        this.enqueueMutation({ op: 'set', clientId, map, secretSealed });
+      }
+    }
+    return true;
+  }
 
   private async sealMap(map: TumblerMap): Promise<{ map: TumblerMap; secretSealed: boolean }> {
     if (this.secretPolicy === 'strip') {
-      // Metadata-only: sharedSecret NEVER crosses the wire.
       return { map: { ...map, sharedSecret: '' }, secretSealed: false };
     }
     const sealed = await this.secretPolicy(map.clientId, map.sharedSecret);
     return { map: { ...map, sharedSecret: sealed }, secretSealed: true };
   }
 
-  // ── Replication queue ───────────────────────────────────────────────────────
-
-  /** Current number of unreplicated ops — wire to a "replication lag" gauge. */
   get queueDepth(): number { return this.queue.length; }
+  get replicationIntegrityLost(): boolean { return this.integrityLost; }
 
-  private enqueue(op: TumblerReplicaOp): void {
-    if (this.queue.length >= this.maxQueue) {
-      const dropped = this.queue.shift();
-      if (dropped) this.onDrop?.(dropped, this.queue.length);
+  /**
+   * Source checkpoint eligible for a signed promotion grant. A missing result is
+   * a hard stop: the replica may not be promoted.
+   */
+  promotionCheckpoint(): ReplicationCheckpoint | null {
+    if (this.integrityLost || this.draining || this.queue.length !== 0) return null;
+    const checkpoint = { ...this.checkpoint };
+    try {
+      if (!this.promotionDurability?.(checkpoint)) return null;
+    } catch {
+      return null;
     }
-    this.queue.push(op);
+    return checkpoint;
+  }
+
+  private enqueueMutation(mutation: TumblerReplicaMutation): void {
+    const previousHash = this.checkpoint.headHash;
+    const sequence = this.checkpoint.sequence + 1;
+    const base = {
+      streamId: this.checkpoint.streamId,
+      epoch: this.checkpoint.epoch,
+      sequence,
+      previousHash,
+      mutation,
+    };
+    const headHash = computeReplicationHash(base);
+    const pending: PendingReplicaOp = {
+      checkpoint: { streamId: base.streamId, epoch: base.epoch, sequence, headHash },
+      previousHash,
+      mutation,
+    };
+    this.checkpoint = { ...pending.checkpoint };
+
+    if (this.queue.length >= this.maxQueue) {
+      // Never remove index 0 while it may be in flight. Drop the incoming op,
+      // retain its hash in the source chain, and permanently mark the stream as
+      // non-promotable. The receiver will reject the resulting sequence gap.
+      this.integrityLost = true;
+      this.onDrop?.(mutation, this.queue.length);
+      return;
+    }
+    this.queue.push(pending);
     void this.drain();
   }
 
@@ -182,9 +292,15 @@ export class ReplicatingTumblerStore implements TumblerMapStore {
     this.draining = true;
     try {
       while (this.queue.length > 0) {
-        const op = this.queue[0];
-        const ok = await this.push(op);
+        const pending = this.queue[0];
+        const ok = await this.push(pending);
         if (ok) {
+          // Remove only the exact operation that completed. A queue mutation may
+          // never acknowledge a different operation.
+          if (this.queue[0] !== pending) {
+            this.integrityLost = true;
+            return;
+          }
           this.queue.shift();
           this.attempt = 0;
         } else {
@@ -198,42 +314,45 @@ export class ReplicatingTumblerStore implements TumblerMapStore {
   }
 
   private backoff(): number {
-    const ms = this.backoffBaseMs * 2 ** Math.min(this.attempt, 10);
+    const ms = this.backoffBaseMs * 2 ** Math.min(this.attempt - 1, 10);
     return Math.min(ms, this.backoffMaxMs);
   }
 
   private sleep(ms: number): Promise<void> {
-    return new Promise((r) => setTimeout(r, ms));
+    return new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
   }
 
-  private async push(op: TumblerReplicaOp): Promise<boolean> {
+  private async push(pending: PendingReplicaOp): Promise<boolean> {
     const doFetch = this.fetchImpl ?? fetch;
+    const unsigned: Omit<TumblerReplicaOp, 'signature'> = {
+      ...pending.checkpoint,
+      previousHash: pending.previousHash,
+      sentAt: this.now(),
+      mutation: pending.mutation,
+    };
+    const envelope = signReplicaEnvelope(unsigned, this.replica.token);
     try {
-      const res = await doFetch(`${this.replica.url}/tumbler`, {
+      const response = await doFetch(`${this.replica.url}/tumbler`, {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-replica-token': this.replica.token,
-        },
-        body: JSON.stringify({ ...op, ts: Date.now() }),
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(envelope),
         signal: AbortSignal.timeout(this.replica.timeoutMs ?? DEFAULTS.timeoutMs),
       });
-      const ok = res.ok;
-      this.onPush?.(ok, op, this.attempt);
+      const ok = response.ok;
+      this.onPush?.(ok, pending.mutation, this.attempt);
       return ok;
     } catch {
-      this.onPush?.(false, op, this.attempt);
+      this.onPush?.(false, pending.mutation, this.attempt);
       return false;
     }
   }
 
-  /** Test/operational hook: wait until the queue is fully replicated or timeout. */
   async flush(timeoutMs = 10_000): Promise<boolean> {
-    const start = Date.now();
-    while (this.queue.length > 0) {
-      if (Date.now() - start > timeoutMs) return false;
+    const start = this.now();
+    while (this.draining || this.queue.length > 0) {
+      if (this.now() - start > timeoutMs) return false;
       await this.sleep(25);
     }
-    return true;
+    return !this.integrityLost;
   }
 }

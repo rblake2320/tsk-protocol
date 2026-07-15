@@ -14,7 +14,7 @@ function ScreenAbout({ goto }) {
       <SectionHead
         eyebrow="About"
         title="TSK Protocol"
-        sub="Tumbler-Style Rotating Segment Keys — a novel API authentication protocol where the key's internal structure is itself a secret."
+        sub="Tumbler-Style Rotating Segment Keys — a beta shared-secret protocol with independently derived segment schedules."
       />
 
       {/* Protocol identity */}
@@ -22,19 +22,18 @@ function ScreenAbout({ goto }) {
         <div className="card" style={{ padding: 28 }}>
           <div className="upper" style={{ color: 'var(--primary)', marginBottom: 12 }}>What it is</div>
           <h3 style={{ fontSize: 20, marginBottom: 12, letterSpacing: '-0.02em' }}>
-            An API key that is structurally secret.
+            A credential with rotating server-held state.
           </h3>
           <p style={{ fontSize: 14, lineHeight: 1.65 }}>
-            TSK is an authentication protocol where an API key is composed of independently-rotating
-            segments whose <strong style={{ color: 'var(--text)' }}>positional map is a per-client
-            server secret</strong>. The client generates segments. The server holds their positions.
-            Neither party can reconstruct what the other knows.
+            TSK composes static, time-window, and counter-based HMAC-SHA-256 values.
+            The server retains authoritative counters and lifecycle state. Ordered segment
+            lengths reveal the layout, so security does not depend on hiding it.
           </p>
           <div className="divider" />
           <p style={{ fontSize: 13, lineHeight: 1.6 }}>
-            A captured TSK key cannot be replayed after its shortest segment window. A forged key
-            cannot pass without knowing the exact positional map. An attacker who exfiltrates the
-            client SDK learns <em>which</em> segments exist — not <em>where</em> they live.
+            Generated credentials include a counter-based segment, and the bundled stores consume
+            counter and usage state atomically. Shared-secret compromise remains a credential
+            compromise and requires revocation or authorized replacement.
           </p>
         </div>
 
@@ -44,13 +43,12 @@ function ScreenAbout({ goto }) {
             <div className="row" style={{ gap: 10, marginBottom: 8 }}>
               <Pill tone="primary">
                 <span className="live-dot" style={{ background: 'var(--primary)', boxShadow: '0 0 10px var(--primary)' }} />
-                Patent-pending · v1.1
+                Beta reference · wire v1
               </Pill>
             </div>
             <p style={{ fontSize: 13, lineHeight: 1.55 }}>
-              Provisional patent filed. The core novelty — structural secrecy, per-client
-              randomized positional maps, and independent segment rotation — has no equivalent
-              in existing standards or prior art.
+              Patent-related design history is preserved separately. This runtime page does not
+              assert filing status, novelty over prior art, compliance, or authorization.
             </p>
           </div>
 
@@ -58,8 +56,8 @@ function ScreenAbout({ goto }) {
             <div className="upper" style={{ marginBottom: 10 }}>Inventor</div>
             <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>R. Blake</div>
             <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.5 }}>
-              All rights reserved. Confidential pre-patent-filing intellectual property.
-              Do not distribute without authorization.
+              Repository license, confidentiality, and distribution controls govern use of this
+              code; protocol tests do not determine patent or legal status.
             </p>
           </div>
 
@@ -67,8 +65,8 @@ function ScreenAbout({ goto }) {
             <div className="upper" style={{ marginBottom: 10 }}>Version history</div>
             <div className="col" style={{ gap: 8 }}>
               {[
-                { v: 'v1.1', date: '2026-05-18', note: 'IL4/5/6/7 hardening — 72-bit checksum, atomic HOTP CAS, structural secrecy fixes' },
-                { v: 'v1.0', date: '2026-04-09', note: 'Initial specification — tumbler map, TOTP/HOTP segments, anomaly engine' },
+                { v: '0.1.x', date: '2026-07-15', note: 'Beta hardening: atomic lifecycle commit, replacement, and claim corrections' },
+                { v: 'wire 1', date: '2026-04-09', note: 'Initial wire format and segment derivation design' },
               ].map(r => (
                 <div key={r.v} className="row" style={{ gap: 12, alignItems: 'flex-start' }}>
                   <span className="mono" style={{ fontSize: 11, color: 'var(--primary)', minWidth: 32 }}>{r.v}</span>
@@ -86,12 +84,12 @@ function ScreenAbout({ goto }) {
         <h3 style={{ marginBottom: 16 }}>Core security properties</h3>
         <div className="g3" style={{ gap: 14 }}>
           {[
-            { label: 'Structural secrecy', desc: 'The positional map — which characters rotate, at what rate, and where they live — is a server-side secret never transmitted after provisioning.' },
-            { label: 'Independent rotation', desc: 'TOTP segments expire independently on 30–300s windows. HOTP segments are one-shot. Static segment anchors client identity.' },
-            { label: 'Checksum-first reject', desc: '72-bit HMAC checksum validates before any segment is touched. Rejects 1 − 2⁻⁷² of forgeries in O(1) — DoS-resistant by design.' },
-            { label: 'Atomic HOTP CAS', desc: 'HOTP counter advances via compare-and-swap. Concurrent replay of the same key across threads is blocked at the store layer.' },
-            { label: 'Anomaly fingerprinting', desc: 'Per-segment pass/fail results feed the anomaly engine. Static-passes-rotating-fails is a unique stolen-key fingerprint.' },
-            { label: 'BPC composability', desc: 'Stack TSK behind device-bound ECDSA (BPC) for a 7-layer orthogonal factor stack. Two independent attack surfaces, one bridge.' },
+            { label: 'Server-held state', desc: 'The server retains authoritative counters, lifecycle status, and validation state. Layout is not treated as secret.' },
+            { label: 'Independent schedules', desc: 'Time-window and counter-based values are derived independently from one provisioned shared secret.' },
+            { label: 'Integrity-first reject', desc: 'A truncated HMAC tag is checked before per-segment validation. It is not a digital signature.' },
+            { label: 'Atomic validation commit', desc: 'All matched counters and lifecycle usage commit together. Failed preconditions do not partially consume state.' },
+            { label: 'Anomaly telemetry', desc: 'Per-segment results can feed an anomaly engine. A score is telemetry, not proof that a request is safe or malicious.' },
+            { label: 'BPC composability', desc: 'Require both authorized BPC pair-key possession and TSK shared-secret validation, with mandatory principal matching.' },
           ].map(p => (
             <div key={p.label} style={{ padding: '14px 16px', borderRadius: 10,
               background: 'var(--bg-2)', border: '1px solid var(--border)' }}>
@@ -104,52 +102,52 @@ function ScreenAbout({ goto }) {
 
       {/* Industry verticals */}
       <div>
-        <div className="upper" style={{ color: 'var(--dim)', marginBottom: 16 }}>Designed for regulated industries</div>
+        <div className="upper" style={{ color: 'var(--dim)', marginBottom: 16 }}>Deployment evaluation boundaries</div>
         <div className="g2" style={{ gap: 16 }}>
           <div className="card" style={{ padding: 20, borderLeft: '3px solid #3dd68c' }}>
-            <div className="upper" style={{ color: '#3dd68c', marginBottom: 10 }}>Healthcare · HIPAA</div>
-            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>PHI APIs, medical device auth, health data pipelines</div>
+            <div className="upper" style={{ color: '#3dd68c', marginBottom: 10 }}>Healthcare evaluation</div>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>A deployment requires separate safeguards and assessment</div>
             <p style={{ fontSize: 12.5, lineHeight: 1.6 }}>
-              TSK's rotating key structure means a compromised credential is self-expiring — no manual rotation required. Static segment anchors the device identity (HIPAA §164.312(d)); TOTP segment creates a time-bounded access window; HOTP provides one-shot event receipts. Position map secrecy prevents reverse-engineering even from captured traffic.
+              TSK does not establish HIPAA compliance, device identity, PHI authorization, retention, or breach controls. Those must be implemented and assessed in the operating system.
             </p>
             <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
-              {['HIPAA §164.312(d)', 'HITECH', 'NIST IA-3'].map(t => (
+              {['No compliance claim', 'No device identity', 'Assessment required'].map(t => (
                 <span key={t} className="mono" style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'var(--bg-2)', color: 'var(--muted)' }}>{t}</span>
               ))}
             </div>
           </div>
           <div className="card" style={{ padding: 20, borderLeft: '3px solid var(--primary)' }}>
-            <div className="upper" style={{ color: 'var(--primary)', marginBottom: 10 }}>Fintech · PCI-DSS · SOC 2</div>
+            <div className="upper" style={{ color: 'var(--primary)', marginBottom: 10 }}>Financial-services evaluation</div>
             <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>Payment APIs, open banking, fraud-sensitive data access</div>
             <p style={{ fontSize: 12.5, lineHeight: 1.6 }}>
-              HOTP counter-rotation means each successful authentication produces a new credential state — replaying a captured payment API key fails immediately. TOTP window prevents offline brute-force. Anomaly fingerprinting detects stolen-key patterns (static passes, rotating fails) before fraud can execute.
+              Atomic counter consumption addresses tested duplicate-use cases. It does not establish PCI DSS, SOC 2, fraud prevention, transaction authorization, or protection after shared-secret compromise.
             </p>
             <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
-              {['PCI-DSS Req 8.3.9', 'SOC 2 CC6.3', 'PCI-DSS Req 10.2.1'].map(t => (
+              {['Candidate component only', 'No audit opinion', 'Application policy required'].map(t => (
                 <span key={t} className="mono" style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'var(--bg-2)', color: 'var(--muted)' }}>{t}</span>
               ))}
             </div>
           </div>
           <div className="card" style={{ padding: 20, borderLeft: '3px solid var(--warning)' }}>
-            <div className="upper" style={{ color: 'var(--warning)', marginBottom: 10 }}>Government · FedRAMP IL4/5 · NIST 800-53</div>
+            <div className="upper" style={{ color: 'var(--warning)', marginBottom: 10 }}>Government evaluation</div>
             <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>Federal agency APIs, CUI access, contractor credential management</div>
             <p style={{ fontSize: 12.5, lineHeight: 1.6 }}>
-              Positional map never transmitted after provisioning — SC-28 (protection of information at rest) by design. Atomic HOTP CAS prevents concurrent credential reuse across threads. 72-bit checksum validates key integrity before any segment processing — DoS-resistant by construction, not by rate limit.
+              Named tests may support a future assessed system, but this repository has no ATO, FedRAMP authorization, DoD Impact Level authorization, or qualified-assessor control determination.
             </p>
             <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
-              {['NIST SC-28', 'FedRAMP IL4/5', 'NIST IA-5(1)(f)'].map(t => (
+              {['No ATO', 'No Impact Level claim', 'Preliminary mappings only'].map(t => (
                 <span key={t} className="mono" style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'var(--bg-2)', color: 'var(--muted)' }}>{t}</span>
               ))}
             </div>
           </div>
           <div className="card" style={{ padding: 20, borderLeft: '3px solid var(--dim)' }}>
-            <div className="upper" style={{ color: 'var(--dim)', marginBottom: 10 }}>Enterprise SaaS · SOC 2 · ISO 27001</div>
+            <div className="upper" style={{ color: 'var(--dim)', marginBottom: 10 }}>Enterprise evaluation</div>
             <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>B2B API platforms, multi-tenant SaaS, developer ecosystems</div>
             <p style={{ fontSize: 12.5, lineHeight: 1.6 }}>
-              Per-client tumbler maps mean a breach at one tenant never exposes others — there is no shared key material. Structural secrecy (server-only position map) means developer SDK access does not reduce security. Pair with BPC for a full 8-layer stack: two orthogonal attack surfaces, one audit trail.
+              Each client receives distinct secret material, but tenant isolation, audit evidence, recovery, key custody, and authorization remain deployment responsibilities. The BPC bridge adds an identity-match check, not an audit trail.
             </p>
             <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
-              {['SOC 2 CC6.2', 'ISO 27001 A.9', 'Zero-trust compatible'].map(t => (
+              {['Tenant isolation required', 'Evidence required', 'External assessment required'].map(t => (
                 <span key={t} className="mono" style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'var(--bg-2)', color: 'var(--muted)' }}>{t}</span>
               ))}
             </div>
@@ -159,13 +157,13 @@ function ScreenAbout({ goto }) {
 
       {/* Self-service integration */}
       <div className="card">
-        <h3 style={{ marginBottom: 6 }}>Self-service integration — no support team required</h3>
+        <h3 style={{ marginBottom: 6 }}>Reference integration</h3>
         <p className="muted" style={{ fontSize: 13, marginBottom: 20 }}>Three steps from zero to TSK-verified requests.</p>
         <div className="g3" style={{ gap: 12, marginBottom: 16 }}>
           {[
             { n: '1', title: 'Install', code: 'npm i @tsk/server @tsk/core' },
             { n: '2', title: 'Server', code: 'createTSKServer() + verifyTSKRequest() wraps any endpoint.' },
-            { n: '3', title: 'Provision', code: 'POST /tsk/provision → tumbler map sealed. Client receives payload. Done.' },
+            { n: '3', title: 'Provision', code: 'Protect the endpoint, store server state, and deliver secret + metadata through approved channels.' },
           ].map(s => (
             <div key={s.n} style={{ padding: 16, borderRadius: 10, background: 'var(--bg-2)', border: '1px solid var(--border)' }}>
               <div className="row" style={{ gap: 8, marginBottom: 8 }}>
@@ -177,7 +175,7 @@ function ScreenAbout({ goto }) {
           ))}
         </div>
         <div style={{ padding: '12px 14px', borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)', fontSize: 12, lineHeight: 1.6 }}>
-          <strong style={{ color: 'var(--text)' }}>Zero-fail error design:</strong> Every rejection returns a typed error — <code className="mono">tsk_key_invalid</code>, <code className="mono">tsk_checksum_fail</code>, <code className="mono">tsk_order_mismatch</code>, <code className="mono">tsk_window_expired</code> — with HTTP status. No silent failures. Every code maps to an anomaly event.
+          <strong style={{ color: 'var(--text)' }}>Error boundary:</strong> The verifier returns structured internal results. HTTP status mapping, response redaction, audit emission, and operator alerting are adapter responsibilities.
         </div>
       </div>
 
@@ -186,9 +184,9 @@ function ScreenAbout({ goto }) {
         <div className="ch" style={{ padding: '20px 24px', borderBottom: '1px solid var(--border)' }}>
           <div>
             <h3 style={{ marginBottom: 4 }}>Bond Architecture — how the ID is stored and linked</h3>
-            <p className="muted" style={{ fontSize: 13 }}>A TSK bond = clientId + sharedSecret + positional map. The map is a server-only structural secret. The bond cannot be forged without all three parts matching.</p>
+            <p className="muted" style={{ fontSize: 13 }}>A TSK credential combines client ID, shared secret, segment metadata, counters, and lifecycle state. Layout is not treated as secret.</p>
           </div>
-          <Pill tone="warn">STRUCTURAL SECRECY</Pill>
+          <Pill tone="warn">SERVER-HELD STATE</Pill>
         </div>
 
         <div className="cb">
@@ -206,14 +204,14 @@ function ScreenAbout({ goto }) {
                 color: 'var(--warning)',
                 body: 'Hex string. Both server and client store it. Used as HMAC-SHA256 key for ALL segment derivation \u2014 static, TOTP, HOTP, checksum. Changing it invalidates the entire tumbler.',
                 server: 'TumblerMap.sharedSecret',
-                client: 'provision payload \u2014 sharedSecret field',
+                client: 'deployment secret storage \u2014 separate from provision payload',
               },
               {
-                label: 'Segment positions (SERVER ONLY)',
+                label: 'Segment boundaries',
                 color: 'var(--danger)',
-                body: 'The structural secret. Server stores [start, end) positions for every segment. Client receives segment IDs and types but NEVER positions. Client assembles full key; server extracts by position. Neither side can reconstruct what the other holds.',
-                server: 'TumblerMap.segments[].position \u2014 NEVER transmitted after provisioning',
-                client: 'clientSegments \u2014 types and windows only, NO positions',
+                body: 'The server stores absolute [start, end) positions. The client receives ordered lengths and can reconstruct equivalent boundaries cumulatively. They are not an authentication factor.',
+                server: 'TumblerMap.segments[].position',
+                client: 'clientSegments[].segmentLength in positional order',
               },
               {
                 label: 'HOTP counter (atomic CAS)',
@@ -260,7 +258,7 @@ function ScreenAbout({ goto }) {
 
           <div style={{ padding: 12, borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)', fontSize: 12, lineHeight: 1.6 }}>
             <strong style={{ color: 'var(--text)' }}>Universal scope:</strong>{' '}
-            <code className="mono">verifyTSKRequest()</code> is middleware — it doesn't care what your endpoint does. After verification: <code className="mono">result.clientId</code> is a provable identity. Pair with BPC for the full 8-layer stack: ECDSA device binding + tumbler key structural secrecy + behavioral anomaly detection — all in one verification call.
+            <code className="mono">verifyTSKRequest()</code> authenticates the provisioned TSK client identifier. Pair it with BPC to require both protocol checks and an explicit principal binding. Downstream authorization remains required.
           </div>
         </div>
       </div>
@@ -269,23 +267,23 @@ function ScreenAbout({ goto }) {
       <div className="card">
         <h3 style={{ marginBottom: 4 }}>Three demo deployments</h3>
         <p className="muted" style={{ fontSize: 13, marginBottom: 16 }}>
-          Each site runs a real backend with no mocks. All demos share the same protocol implementation.
+          Demo deployments share the protocol implementation; they are not production or authorization evidence.
         </p>
         <div className="g3">
           {[
             {
               port: ':3200', label: 'TSK Standalone', current: true,
-              desc: 'Layers 6 + 7. Tumbler key + structural secrecy. This site.',
+              desc: 'Layers 6 + 7. Segment derivation plus atomic counter and lifecycle state.',
               tone: 'primary',
             },
             {
-              port: ':3100', label: 'Full 8-Layer Stack',
-              desc: 'BPC (1–5) + TSK (6–7) + Active Defense (8). The flagship.',
+              port: ':3100', label: 'Composed Verifier',
+              desc: 'BPC + TSK checks with principal identity binding.',
               tone: 'warn', href: 'http://localhost:3100',
             },
             {
               port: ':3101', label: 'BPC Standalone',
-              desc: 'Layers 1–5. Device-bound ECDSA + behavioral anomaly engine.',
+              desc: 'Layers 1–5. Authorized BPC pair-key verification and behavioral telemetry.',
               tone: 'default', href: 'http://localhost:3101',
             },
           ].map(s => (
@@ -321,7 +319,7 @@ function ScreenAbout({ goto }) {
         <div>
           <h2 style={{ fontSize: 22, marginBottom: 8 }}>Interested in TSK?</h2>
           <p style={{ fontSize: 14, maxWidth: 520 }}>
-            TSK is pre-release and patent-pending. For licensing inquiries, integration
+            TSK is pre-release. For licensing inquiries, integration
             partnerships, or early access, reach out directly.
           </p>
         </div>
@@ -331,7 +329,7 @@ function ScreenAbout({ goto }) {
             Request access
           </button>
           <button className="btn sm ghost" onClick={() => goto('stack')}>
-            View the 8-layer stack →
+            View the composed verifier →
           </button>
         </div>
       </div>
@@ -339,9 +337,8 @@ function ScreenAbout({ goto }) {
       {/* Legal footer */}
       <div style={{ padding: '16px 0', borderTop: '1px solid var(--border)' }}>
         <p className="mono" style={{ fontSize: 11, color: 'var(--dim)', lineHeight: 1.7 }}>
-          CONFIDENTIAL — Pre-patent-filing intellectual property of R. Blake. All rights reserved.
-          This document and its contents may not be reproduced or distributed without written authorization.
-          TSK Protocol v1.1 · Provisional patent pending · © 2026 R. Blake
+          TSK beta reference implementation · Wire protocol 1 · © 2026 R. Blake.
+          Patent and distribution status must be established by the applicable legal records and repository license.
         </p>
       </div>
     </div>

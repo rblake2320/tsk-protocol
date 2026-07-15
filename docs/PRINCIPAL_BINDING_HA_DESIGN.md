@@ -305,7 +305,9 @@ Required Option A guarantees:
 2. A non-promoted replica returns `503 replica_not_promoted` for authoritative
    client writes, so a buggy or bypassing client still fails closed.
 3. The guard promotion command requires `x-guard-token` validation using a
-   constant-time comparison; neither the client nor the replica may self-promote.
+   `timingSafeEqual` comparison for equal-length values; neither the client nor
+   the replica may self-promote. This does not establish whole-path
+   constant-time behavior in JavaScript.
 4. Promotion state is sticky and explicit demotion is required before fail-back;
    it must not auto-clear on a transient primary health probe.
 5. The promotion gate is protocol-agnostic and must preserve the same contract

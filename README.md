@@ -1,65 +1,80 @@
-# TSK (Tumbler Secret Key) Protocol
+# TSK Protocol
 
-A structural authentication layer designed to defeat credential theft and replay attacks.
+TSK is a beta reference implementation of shared-secret API credentials made
+from independently derived static, time-window, and counter-based segments.
+The server retains authoritative counter and lifecycle state.
 
-## What is TSK?
+## Established Behavior
 
-Traditional API keys are static bearer tokens. If an attacker steals one, they can replay it indefinitely until it is manually revoked.
+- HMAC-SHA-256 derives every segment and a 12-character truncated integrity tag.
+- Generated maps contain at least one counter-based segment.
+- One atomic store commit advances all matched counters and the credential usage
+  count; a concurrent duplicate is denied.
+- Expiry, revocation, hard request caps, and a pre-cap rotation signal are
+  enforced by the server middleware.
+- Replacement requires a deployment-supplied authorizer and atomically creates
+  the new credential while revoking the old one.
+- File-backed client storage persists counters across restarts with atomic file
+  replacement.
+- The BPC bridge denies when independently verified BPC and TSK identities do
+  not resolve to the same principal.
+- HA envelopes are signed, hash-linked, ordered, and checked for freshness.
+- `FencedTumblerStore` makes shared writer leases mandatory at the store
+  mutation boundary; `RedisFencingStore` provides an atomic cross-process
+  authority verified against Redis 7.4.
 
-TSK replaces static keys with a **rotating, multi-segment key** where the format and position of the segments are themselves a server-side secret. A TSK key looks like a single opaque string, but it is actually composed of:
-1.  **Static Segments**: Fixed alphanumeric strings.
-2.  **TOTP Segments**: Time-based One-Time Passwords (valid for a specific time window).
-3.  **HOTP Segments**: HMAC-based One-Time Passwords (valid for exactly one request).
-4.  **Checksum**: An Ed25519 signature over the canonically serialized segments.
+These are bounded properties established by named tests. They are not a claim
+that the protocol, host, deployment, or product is compliant or unbreakable.
 
-## Why it works
+## Important Boundaries
 
-Even if an attacker intercepts a TSK key in transit:
-*   They cannot replay it because the HOTP segment counter advances on every successful request.
-*   They cannot forge a new key because they do not know the structural map (which segments are TOTP vs HOTP, what the segment lengths are, or where they are positioned).
-*   They cannot tamper with the key because the Ed25519 checksum covers the entire payload.
+- TSK is a symmetric protocol. Provisioning transfers the shared secret to the
+  client through a deployment-controlled protected channel.
+- Ordered segment lengths reveal cumulative segment boundaries. Layout is not a
+  secret authentication factor.
+- The checksum is a truncated HMAC-SHA-256 tag, not Ed25519 and not a digital
+  signature.
+- The time/counter schedules are inspired by TOTP/HOTP, but segment derivation
+  uses project-specific HMAC-SHA-256 inputs and does not emit RFC OTP codes.
+- TLS, endpoint authorization, secret custody, durable distributed stores,
+  monitoring, and recovery are deployment responsibilities.
+- Promotion evidence is unavailable by default. A deployment must prove that
+  primary mutations, replication operations, receiver applies, and checkpoints
+  are transactionally durable before supplying the promotion durability hook.
+- Algorithm selection does not establish FIPS 140 validation. Tests and control
+  mappings do not create an ATO or DoD Impact Level authorization.
 
-The window of exploitation for a stolen TSK key is effectively **zero requests**.
+See [SECURITY.md](SECURITY.md), [WHY.md](WHY.md), and [PARKED.md](PARKED.md).
 
 ## Packages
 
-This repository contains a monorepo with four packages:
+- `@tsk/core`: map generation, key assembly, and validation.
+- `@tsk/server`: stores, verification, lifecycle, replacement, HA, and promotion.
+- `@tsk/client-sdk`: client key generation and persistent counter handling.
+- `@tsk/bpc-bridge`: composed BPC/TSK verification with identity binding.
 
-*   `@tsk/core`: Core cryptographic primitives, key assembly, and validation logic.
-*   `@tsk/server`: Server middleware, Nonce Deduplication Store, and Anomaly Engine.
-*   `@tsk/client-sdk`: Client SDK with automatic HOTP counter management and `fetch` wrapper.
-*   `@tsk/bpc-bridge`: Ultra Bridge combining TSK and BPC into a 7-layer authentication stack.
+## HTTP Adapter Contract
 
-## Getting Started
+After `verifyTSKRequest()` succeeds, apply the headers returned by
+`buildTSKResponseHeaders()` to the final response, including non-2xx application
+responses. The client advances counters only when it receives
+`X-TSK-Authenticated: 1`; a bare `2xx` is not sufficient.
 
-### 1. Provisioning
-The server provisions a `TumblerMap` and generates a `ClientPayload` containing the shared secret and structural map. The `TumblerMap` stays on the server; the `ClientPayload` is sent to the client.
+When `X-TSK-Rotation-Required: 1` is present, provision an authorized
+replacement before `X-TSK-Requests-Remaining` reaches zero. There is no
+post-cap grace mode.
 
-### 2. Client Usage
-```typescript
-import { TSKClient } from '@tsk/client-sdk';
+## Verification
 
-const client = new TSKClient({
-  clientId: 'tsk_12345',
-  storage: myPersistentStorage
-});
-
-await client.init(provisionPayload, sharedSecret);
-
-// The fetch wrapper automatically generates the key, adds headers,
-// and advances the HOTP counters ONLY on a successful 2xx response.
-const response = await client.fetch('https://api.example.com/data');
+```powershell
+npm ci
+npm run build
+npm run typecheck
+npm test
+npm run test:ha
+npm run test:redis
+npm audit
 ```
 
-### 3. Server Validation
-```typescript
-import { verifyTSKRequest } from '@tsk/server';
-
-const result = await verifyTSKRequest(req, tskStore);
-if (!result.ok) {
-  return res.status(401).json({ error: result.error });
-}
-```
-
-## Security & Compliance
-TSK is designed for high-security environments and relies exclusively on FIPS-approved algorithms (SHA-256, HMAC-SHA-256, Ed25519). See `SECURITY.md` for the Adversarial Break Report and compliance mappings.
+Current package version: `0.1.0` (beta reference implementation). Wire protocol
+version: `1`.

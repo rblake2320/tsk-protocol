@@ -1,7 +1,7 @@
 {
   "name": "@tsk/bpc-bridge",
   "version": "0.1.0",
-  "description": "TSK + BPC Ultra Enhancement — 7-layer authentication combining BPC's ECDSA device binding with TSK's structural tumbler secrecy",
+  "description": "Composed BPC and TSK verification with mandatory principal identity binding",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

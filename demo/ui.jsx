@@ -19,7 +19,7 @@ function Logo({ size = 24 }) {
 
 // ── KeyGlyph: tumbler key rendered as colored segments ──────────────────────
 // parts: { id: charString }, map: tumbler map (gives segment metadata)
-// view = 'server' (shows positions/types) | 'client' (flat, no info) | 'attacker' (flat, no info)
+// view = 'server' (shows positions/types) | 'client' (simplified wire view) | 'attacker' (wire view)
 function KeyGlyph({ map, parts, view = 'server', flashing = {}, showLabels = false }) {
   if (!map || !parts) return null;
   const ordered = map.segments.slice().sort((a, b) => a.position[0] - b.position[0]);

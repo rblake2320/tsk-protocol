@@ -5,19 +5,17 @@
  * BPC's verifyBPCRequest is a pure exported function — we wrap it.
  *
  * Layer Stack:
- *   1. BPC: Device-bound ECDSA P-256 (TPM, extractable: false)
+ *   1. BPC: possession of an authorized ECDSA P-256 pair key
  *   2. BPC: Explicit pair registry (closed whitelist, owner approval)
  *   3. BPC: User-chosen secret HMAC'd into every signature
  *   4. BPC: Per-request nonce + ±60s timestamp anti-replay
  *   5. BPC: Behavioral anomaly engine (per-pair threat scoring)
- *   6. TSK: Tumbler key with per-client secret position map
- *   7. TSK: Structural secrecy (key format/positions themselves are secrets)
+ *   6. TSK: independently derived time/counter segment values
+ *   7. TSK: atomic counter and lifecycle state transition
  *
- * A stolen credential set (pair ID + env vars) defeats BPC layers 1-3 because
- * the TPM private key is non-extractable and the user secret isn't in env vars.
- * TSK adds an independent second factor: even if BPC were somehow bypassed,
- * the attacker would also need to know which tumbler positions are live and
- * at what temporal state — information that exists only on the server.
+ * TSK adds an independent shared-secret verifier. Compromise of either factor
+ * does not by itself satisfy this bridge, but host/client compromise may expose
+ * both factors and remains outside the bridge's protection boundary.
  *
  * NO BPC CODE CHANGES REQUIRED. This file is the entire bridge.
  */
@@ -162,11 +160,11 @@ export async function verifyUltraRequest(
  * The 7 security properties of the ultra stack, for documentation/audit.
  */
 export const ULTRA_SECURITY_LAYERS = [
-  { id: 1, source: 'BPC', property: 'Device-bound ECDSA P-256 private key (TPM, extractable: false)' },
+  { id: 1, source: 'BPC', property: 'Possession of an authorized ECDSA P-256 pair signing key' },
   { id: 2, source: 'BPC', property: 'Explicit pair registry — closed whitelist with owner approval gate' },
   { id: 3, source: 'BPC', property: 'User-chosen secret HMAC\'d into every request signature' },
   { id: 4, source: 'BPC', property: 'Per-request cryptographic nonce + ±60s timestamp (anti-replay)' },
   { id: 5, source: 'BPC', property: 'Behavioral anomaly engine — per-pair threat scoring 0-100' },
-  { id: 6, source: 'TSK', property: 'Tumbler key — TOTP/HOTP rotating segments, independent per-position' },
-  { id: 7, source: 'TSK', property: 'Structural secrecy — tumbler map positions are a per-client server-side secret' },
+  { id: 6, source: 'TSK', property: 'HMAC-SHA-256 segment values on time and counter schedules' },
+  { id: 7, source: 'TSK', property: 'Atomic counter consumption and credential lifecycle enforcement' },
 ] as const;

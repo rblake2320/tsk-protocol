@@ -1,4 +1,4 @@
-// screen-attack.jsx — Attack Lab: real server validation for all attacks
+// screen-attack.jsx — Attack Lab: real server validation for implemented cases
 
 function ScreenAttack() {
   const map = window.DEMO_MAP;
@@ -306,7 +306,7 @@ function ScreenAttack() {
               danger disabled={firing} onFire={() => fire('brute-burst')} />
             <AttackCard
               kind="distributed" label="Distributed (×100 clientIds)"
-              desc="Rotate clientId per request to slip under the per-client anomaly window. Coming v1.2 — IP cross-correlation."
+              desc="Not implemented. Distributed-source correlation requires deployment-level telemetry and policy."
               disabled />
           </div>
         </div>

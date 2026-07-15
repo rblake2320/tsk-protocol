@@ -14,7 +14,8 @@
  *   4. Appends a checksumLength-char HMAC checksum of the concatenated body
  *
  * The resulting key is byte-for-byte identical to the server's expected positional layout.
- * The client knows segment lengths but NOT start offsets — it cannot reconstruct positions.
+ * Ordered segment lengths reveal the cumulative start/end offsets. Layout is
+ * therefore metadata, not a secret or an authentication factor.
  */
 
 import type { TumblerMap, ClientSegmentConfig, TSKProvisionPayload } from './types.js';
@@ -25,7 +26,8 @@ import type { KeyGenerationCaptureOptions } from './runtime-capture.js';
 
 /**
  * Generate a TSK key using the FULL tumbler map (server-side / test path).
- * Uses absolute positions from the map — not available to clients in production.
+ * Uses the server map's absolute positions. A provisioned client receives
+ * equivalent cumulative layout information as ordered segment lengths.
  */
 export function generateKeyFromMap(map: TumblerMap, nowMs: number = Date.now()): string {
   const keyBuffer = new Array<string>(map.keyLength).fill('\x00');

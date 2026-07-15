@@ -1,5 +1,5 @@
 /**
- * TSK Protocol — Segment Value Generation (IL4/5/6/7 Hardened)
+ * TSK Protocol — Segment Value Generation
  *
  * Each segment in the tumbler map derives its value from HMAC(sharedSecret, derivationInput).
  * The derivation input encodes the segment type and its temporal/counter factor.
@@ -10,7 +10,7 @@
  *
  * The segment value is a slice of the HMAC output, sized to fill the segment's position range.
  *
- * SECURITY FIX (IL4/5/6/7): padOrTruncate now uses hmacRaw with the original secret Buffer
+ * SECURITY FIX: padOrTruncate uses hmacRaw with the original secret Buffer
  * instead of calling hmac(hmacOutput, ...) which would fail secret validation (HMAC output
  * is base64url, not a valid 64-char hex secret). The original implementation had a latent
  * bug where the recursive padding call used the HMAC output as the key — now fixed to always

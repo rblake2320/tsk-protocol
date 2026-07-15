@@ -1,30 +1,40 @@
 # Changelog
 
-All notable changes to the TSK Protocol will be documented in this file.
+## Unreleased - 2026-07-15
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+### Security
 
-## [1.1.0] - 2026-05-27
+- Enforced writer fencing at every `TumblerMapStore` mutation through
+  `FencedTumblerStore` and added atomic Redis-backed fencing transitions.
+- Authenticated and hash-linked replication operations; rejected stale,
+  replayed, gapped, malformed, rolled-back, or lifecycle-resurrecting state.
+- Required secret unsealing, exact stream convergence, and explicit durable
+  checkpoint evidence before a replica can qualify for promotion.
+- Added atomic multi-counter and lifecycle usage commits.
+- Guaranteed at least one counter-based segment in generated maps and rejected
+  maps without one.
+- Added pre-cap rotation signaling and fail-closed authorized replacement that
+  atomically revokes the prior credential.
+- Required external authorization for lifecycle update and revocation.
+- Changed client counter commit to require explicit authentication acceptance,
+  independent of downstream HTTP business status.
+- Added atomic persistent counter-vector storage and restart tests.
+- Recorded checksum-first rejections in anomaly telemetry.
+- Removed unused Jest dependencies.
+- Corrected layout, checksum, FIPS, Impact Level, device identity, and compliance
+  descriptions to match implemented evidence.
 
-### Added
-- **HIGH-06**: Added `SECURITY.md` detailing the adversarial break history (TSK-01 through TSK-07), IL4-7 compliance mapping, and secure deployment recommendations.
-- **HIGH-01**: Added lifecycle management fields (`status`, `expiresAt`, `maxRequests`, `label`) to `TSKClientRecord`.
-- Added Ultra Server lifecycle API endpoints (`GET /tsk/keys`, `PATCH /tsk/keys/:clientId`) for programmatic key management and revocation.
-- Added `requestCount` tracking to enforce `maxRequests` quota limits.
+### Evidence
 
-### Changed
-- **HIGH-03**: Updated the Ultra Bridge (`verifyUltraRequest`) to extract and propagate the BPC `scope` field to `UltraVerifyResult`, enabling cross-layer scope coherence enforcement.
-- Updated `verifyTSKRequest` to enforce `expiresAt` and `maxRequests` constraints before cryptographic validation.
+- Replaced duplicated attack logic with production-backed bounded cases and
+  removed secret/key logging and unsupported statistical/performance claims.
+- Added live Redis fencing and browser attack-path verification.
+- Added named concurrent-cap, replacement, application-error, restart, and
+  no-confirmation cases.
+- Added repository CI/typecheck/HA commands to the release gate.
 
-### Fixed
-- Fixed HOTP client desynchronization on network failure (Adversarial Break Report 2.2) by implementing the commit-after-success pattern in the client SDK `fetch` wrapper.
+## 0.1.0
 
-## [1.0.0] - 2026-05-20
-
-### Added
-- Initial release of the TSK (Tumbler Secret Key) Protocol.
-- Client SDK with automatic HOTP counter management and `fetch` wrapper.
-- Server middleware with Ed25519 signature verification and Nonce Deduplication Store.
-- BPC Bridge (`ultra-verify`) combining BPC and TSK into a 7-layer authentication stack.
-- Adversarial Break Report documenting the mitigation of 7 identified attack vectors.
+Initial beta reference implementation. Historical descriptions that called the
+integrity tag Ed25519, treated layout as secret, or asserted compliance are
+superseded and preserved in Git history and `PARKED.md`.

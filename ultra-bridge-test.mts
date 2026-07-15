@@ -54,9 +54,18 @@ const identityBinding = {
   resolve: async (pid: string) => identityMap.get(pid) ?? null,
 };
 
-// Build valid TSK headers for a given time
-function tskHeaders(nowMs = Date.now()): Record<string, string> {
-  const key = generateKeyFromMap(map, nowMs);
+// Build valid TSK headers from the authoritative counter state. Validation
+// advances HOTP counters, so reusing the originally provisioned map would
+// create a stale key and prevent later cases from reaching the branch they
+// actually assert.
+async function currentMap(): Promise<TumblerMap> {
+  const stored = await store.get(clientId);
+  if (!stored) throw new Error('shared TSK fixture disappeared');
+  return stored;
+}
+
+async function tskHeaders(nowMs = Date.now()): Promise<Record<string, string>> {
+  const key = generateKeyFromMap(await currentMap(), nowMs);
   return {
     'x-tsk-client-id': clientId,
     'x-tsk-key': key,
@@ -65,13 +74,16 @@ function tskHeaders(nowMs = Date.now()): Record<string, string> {
 }
 
 // Build a request object with both BPC and TSK headers (BPC headers are fake — verified by mock)
-function makeReq(extraHeaders: Record<string, string> = {}): TSKRequestData {
+async function makeReq(
+  extraHeaders: Record<string, string> = {},
+  nowMs = Date.now(),
+): Promise<TSKRequestData> {
   return {
     headers: {
       'x-bpc-pair-id': pairId,
       'x-bpc-signature': 'fake_sig',
       'x-bpc-signed-data': 'fake_data',
-      ...tskHeaders(),
+      ...await tskHeaders(nowMs),
       ...extraHeaders,
     },
   };
@@ -95,7 +107,7 @@ const NOW = Date.now();
 // ── Group 1: Happy path ────────────────────────────────────────────────────────
 console.log('\n[1] Happy Path — BPC pass + TSK pass + identity match');
 {
-  const req = makeReq(tskHeaders(NOW));
+  const req = await makeReq({}, NOW);
   const r = await verifyUltraRequest(req, bpcPass(), { tskStore: store, identityBinding });
 
   assert('result.ok is true', r.ok, `Got ok=${r.ok}, error=${r.error}`);
@@ -110,7 +122,7 @@ console.log('\n[1] Happy Path — BPC pass + TSK pass + identity match');
 // ── Group 2: BPC layer failure ────────────────────────────────────────────────
 console.log('\n[2] BPC Layer Failure — TSK never called');
 {
-  const req = makeReq();
+  const req = await makeReq();
   const r = await verifyUltraRequest(req, bpcFail('SIGNATURE_INVALID'), { tskStore: store, identityBinding });
 
   assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
@@ -214,7 +226,7 @@ console.log('\n[5] Identity Binding Mismatch — BPC pairId maps to different cl
 // ── Group 6: Identity binding — pairId resolves to null (unknown pair) ───────
 console.log('\n[6] Identity Binding — pairId unknown (resolves to null)');
 {
-  const req = makeReq(tskHeaders(NOW));
+  const req = await makeReq({}, NOW);
   const unknownPairId = 'bpc_pair_unknown_9999';
   const r = await verifyUltraRequest(req, bpcPass(unknownPairId), { tskStore: store, identityBinding });
 
@@ -226,7 +238,7 @@ console.log('\n[6] Identity Binding — pairId unknown (resolves to null)');
 // ── Group 7: Identity binding unavailable — BPC returns no pairId ─────────────
 console.log('\n[7] Identity Binding Unavailable — BPC result missing pairId');
 {
-  const req = makeReq(tskHeaders(NOW));
+  const req = await makeReq({}, NOW);
   const r = await verifyUltraRequest(req, bpcPassNoPairId(), { tskStore: store, identityBinding });
 
   assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
@@ -240,7 +252,7 @@ console.log('\n[7] Identity Binding Unavailable — BPC result missing pairId');
 // ── Group 8: Tampered TSK key — single character mutation ────────────────────
 console.log('\n[8] Tampered TSK Key — 1-char mutation at position 10');
 {
-  const validKey = generateKeyFromMap(map, NOW);
+  const validKey = generateKeyFromMap(await currentMap(), NOW);
   const tampered = validKey.slice(0, 10) + (validKey[10] === 'A' ? 'Z' : 'A') + validKey.slice(11);
   const req: TSKRequestData = {
     headers: {
@@ -264,7 +276,7 @@ console.log('\n[9] Wrong TSK Client ID — valid key but wrong clientId header')
   const req: TSKRequestData = {
     headers: {
       'x-tsk-client-id': 'tsk_nonexistent_client',
-      'x-tsk-key': generateKeyFromMap(map, NOW),
+      'x-tsk-key': generateKeyFromMap(await currentMap(), NOW),
       'x-tsk-version': '1',
     },
   };
@@ -290,8 +302,8 @@ console.log('\n[10] ULTRA_SECURITY_LAYERS Contract');
   assert('layer IDs are 1-7 in order',
     ULTRA_SECURITY_LAYERS.every((l, i) => l.id === i + 1),
     `Got IDs: ${ULTRA_SECURITY_LAYERS.map(l => l.id)}`);
-  assert('Layer 7 describes structural secrecy',
-    ULTRA_SECURITY_LAYERS[6].property.toLowerCase().includes('structural'),
+  assert('Layer 7 describes atomic lifecycle enforcement',
+    ULTRA_SECURITY_LAYERS[6].property.toLowerCase().includes('atomic'),
     `Got: ${ULTRA_SECURITY_LAYERS[6].property}`);
 }
 
@@ -304,7 +316,7 @@ console.log('\n[11] BPC Scope Propagation (HIGH-03)');
   const req11a: TSKRequestData = {
     headers: {
       'x-tsk-client-id': clientId,
-      'x-tsk-key': generateKeyFromMap(map, NOW),
+      'x-tsk-key': generateKeyFromMap(await currentMap(), NOW),
       'x-tsk-version': '1',
     },
   };
@@ -316,7 +328,7 @@ console.log('\n[11] BPC Scope Propagation (HIGH-03)');
   const req11b: TSKRequestData = {
     headers: {
       'x-tsk-client-id': clientId,
-      'x-tsk-key': generateKeyFromMap(map, NOW),
+      'x-tsk-key': generateKeyFromMap(await currentMap(), NOW),
       'x-tsk-version': '1',
     },
   };
@@ -327,7 +339,7 @@ console.log('\n[11] BPC Scope Propagation (HIGH-03)');
   const req11c: TSKRequestData = {
     headers: {
       'x-tsk-client-id': clientId,
-      'x-tsk-key': generateKeyFromMap(map, NOW),
+      'x-tsk-key': generateKeyFromMap(await currentMap(), NOW),
       'x-tsk-version': '1',
     },
   };
@@ -339,7 +351,7 @@ console.log('\n[11] BPC Scope Propagation (HIGH-03)');
   const req11d: TSKRequestData = {
     headers: {
       'x-tsk-client-id': clientId,
-      'x-tsk-key': generateKeyFromMap(map, NOW),
+      'x-tsk-key': generateKeyFromMap(await currentMap(), NOW),
       'x-tsk-version': '1',
     },
   };
@@ -363,5 +375,5 @@ if (failed.length > 0) {
   }
   process.exit(1);
 } else {
-  console.log('ALL TESTS PASSED — Ultra Bridge fully verified');
+  console.log('Named Ultra Bridge cases passed');
 }

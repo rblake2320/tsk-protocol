@@ -1,22 +1,21 @@
 {
   "name": "tsk-protocol",
   "version": "0.1.0",
-  "description": "Tumbler-Style Rotating Segment Keys — per-client randomized positional tumbler maps for API authentication",
+  "description": "Beta shared-secret API authentication with server-authoritative segmented credential state",
   "private": true,
   "workspaces": [
     "packages/*"
   ],
   "scripts": {
     "build": "npm run build -w packages/core && npm run build -w packages/server && npm run build -w packages/client-sdk && npm run build -w packages/bpc-bridge",
-    "test": "npx tsx test-suite.mts && npx tsx lifecycle-suite.mts && npx tsx attack-suite.mts && npx tsx adversarial-proof.mts && npx tsx ultra-bridge-test.mts && npx tsx runtime-capture-suite.mts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "test": "npx tsx test-suite.mts && npx tsx lifecycle-suite.mts && npx tsx client-lifecycle-suite.mts && npx tsx store-durability-suite.mts && npx tsx anomaly-integration-suite.mts && npx tsx attack-suite.mts && npx tsx adversarial-proof.mts && npx tsx ultra-bridge-test.mts && npx tsx runtime-capture-suite.mts",
+    "test:ha": "npx tsx replicating-tumbler-suite.mts && npx tsx replica-receiver-suite.mts && npx tsx failover-promotion-suite.mts",
+    "test:redis": "npx tsx redis-fencing-integration.mts",
+    "typecheck": "tsc --noEmit --allowImportingTsExtensions -p tsconfig.json"
   },
   "devDependencies": {
-    "@types/jest": "^29.0.0",
     "@types/node": "^20.0.0",
-    "jest": "^29.0.0",
-    "ts-jest": "^29.0.0",
-    "tsx": "^4.21.0",
+    "tsx": "^4.23.1",
     "typescript": "^5.4.0"
   }
 }

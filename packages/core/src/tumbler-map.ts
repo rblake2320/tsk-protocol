@@ -1,17 +1,14 @@
 /**
  * TSK Protocol — Tumbler Map Generation & Provision Payload
- * IL4/5/6/7-hardened.
  *
  * Key security fixes in this version:
- * 1. STRUCTURAL SECRECY RESTORED: toProvisionPayload() no longer includes
- *    segment lengths or segmentOrder. The client cannot reconstruct positions.
+ * 1. CLIENT CONTRACT ACCURACY: ordered segment lengths reveal the cumulative
+ *    boundaries and are not treated as a secret or authentication factor.
  *    The client sends raw segment values; the server assembles the key.
- * 2. CHECKSUM ENTROPY: upgraded from 8 chars (48 bits) to 12 chars (72 bits),
- *    exceeding NIST SP 800-107 recommendation of ≥64 bits for MACs.
+ * 2. CHECKSUM LENGTH: upgraded from 8 chars (48 bits) to 12 chars (72 bits).
  * 3. INPUT VALIDATION: keyLength, minTumblers, maxTumblers, windowSec all
  *    validated against safe bounds before map generation.
- * 4. SECURE RANDOMNESS: uses secureRandomInt() (rejection sampling) instead
- *    of crypto.randomInt() which has modulo bias for non-power-of-2 ranges.
+ * 4. SECURE RANDOMNESS: uses secureRandomInt() with rejection sampling.
  * 5. MINIMUM SEGMENT LENGTH: enforced at 8 chars (48 bits entropy per segment).
  */
 import {
@@ -32,7 +29,7 @@ import type {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/** Checksum length in base64url chars. 12 chars = 72 bits > NIST ≥64 bit MAC requirement. */
+/** Checksum length in base64url chars. 12 chars carry 72 bits. */
 export const CHECKSUM_LENGTH = 12;
 
 /** Minimum segment length in chars. 8 chars = 48 bits of HMAC output per segment. */
@@ -126,8 +123,8 @@ function validateOptions(options: TumblerMapOptions): Required<TumblerMapOptions
 /**
  * Generate a new randomized tumbler map for a client.
  *
- * The positions of segments are randomized and shuffled — this is the
- * structural secrecy layer. The client NEVER receives position information.
+ * Segment boundaries are randomized per client. Security does not depend on
+ * hiding those boundaries from the provisioned client.
  */
 export function generateTumblerMap(
   options: TumblerMapOptions = {},
@@ -140,6 +137,7 @@ export function generateTumblerMap(
 
   // Decide how many rotating segments (between min and max, inclusive)
   const numTumblers = minTumblers + secureRandomInt(maxTumblers - minTumblers + 1);
+  const requiredHotpIndex = 1 + secureRandomInt(numTumblers);
 
   // Reserve last CHECKSUM_LENGTH chars for checksum
   const checksumStart = keyLength - CHECKSUM_LENGTH;
@@ -160,8 +158,9 @@ export function generateTumblerMap(
       };
     }
 
-    // Randomly assign TOTP (70%) or HOTP (30%)
-    const isTotp = secureRandomInt(10) >= 3; // 0,1,2 = HOTP; 3-9 = TOTP
+    // Guarantee at least one counter-based segment so a generated credential
+    // cannot be replayed repeatedly inside a time window.
+    const isTotp = i !== requiredHotpIndex && secureRandomInt(10) >= 3;
     const windowSec = allowedWindows[secureRandomInt(allowedWindows.length)];
 
     return {
@@ -204,25 +203,19 @@ export function generateTumblerMap(
 /**
  * Extract the client-facing portion of a tumbler map.
  *
- * STRUCTURAL SECRECY CONTRACT:
- * - Positions (start offsets) are NOT included — these are the server's private secret.
- * - segmentLength IS included — the client needs this to truncate/pad its HMAC output
- *   to the correct size before concatenation. Knowing lengths does NOT reveal positions
- *   because the client has no start offsets.
+ * CLIENT CONTRACT:
+ * - Absolute offsets are omitted because they are redundant on the client.
+ * - segmentLength is included so the client can truncate/pad its HMAC output.
  * - Segments are emitted in positional order (sorted by position[0]). The client
  *   concatenates in this order, producing a key that is byte-for-byte identical to the
- *   server's positional layout. The client cannot reconstruct absolute positions from
- *   lengths alone (it would need cumulative sums AND a known starting offset).
+ *   server's positional layout. Cumulative lengths reveal the boundaries.
  *
  * SECURITY ANALYSIS:
  * An attacker who intercepts the provision payload learns:
  *   - Segment count, types, and sizes (in positional order)
  *   - Total key length and checksum length
- * An attacker does NOT learn:
- *   - The absolute start position of any segment
- *   - The sharedSecret (never transmitted after provisioning)
- * Without start positions, the attacker cannot forge a key by placing known
- * segment values at the correct offsets — they only know sizes, not locations.
+ * Provisioning necessarily transfers the shared secret through a protected
+ * deployment channel. It must subsequently remain in approved secret storage.
  */
 export function toProvisionPayload(map: TumblerMap): TSKProvisionPayload {
   // Sort segments by position[0] so client concatenation order matches server layout
@@ -234,7 +227,7 @@ export function toProvisionPayload(map: TumblerMap): TSKProvisionPayload {
       segmentId: seg.segmentId,
       type: seg.type,
       segmentLength,
-      // NOTE: position (start offset) is intentionally OMITTED — this is the structural secret.
+      // Absolute offset is redundant because ordered lengths define boundaries.
     };
     if (seg.type === 'totp') cs.windowSec = seg.windowSec;
     if (seg.type === 'hotp') cs.initialCounter = seg.counter ?? 0;
@@ -257,8 +250,7 @@ export function toProvisionPayload(map: TumblerMap): TSKProvisionPayload {
  * Compute the checksum for a partially-assembled key.
  * Returns exactly CHECKSUM_LENGTH (12) base64url characters = 72 bits.
  *
- * SECURITY: 72 bits exceeds NIST SP 800-107 >= 64 bit MAC recommendation.
- * Birthday attack requires ~2^36 ~= 68 billion attempts.
+ * The checksum is a truncated integrity tag, not a digital signature.
  */
 export function computeChecksum(sharedSecret: string, keyWithoutChecksum: string): string {
   const full = hmac(sharedSecret, `checksum:${keyWithoutChecksum}`);
@@ -300,8 +292,7 @@ function randomNonOverlappingSegments(
   }
   boundaries.push(totalLength);
 
-  // Shuffle the interior boundaries (not 0 or end) to randomize which segment
-  // gets which slot — this is the core structural secrecy mechanism.
+  // Jitter and shuffle the interior boundaries to diversify layouts per client.
   const midBoundaries = boundaries.slice(1, -1);
   for (let i = midBoundaries.length - 1; i > 0; i--) {
     const j = secureRandomInt(i + 1);

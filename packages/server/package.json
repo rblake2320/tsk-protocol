@@ -15,10 +15,11 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@tsk/core": "*"
+    "@tsk/core": "*",
+    "ioredis": "^5.7.0"
   },
   "devDependencies": {
-    "typescript": "^5.4.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
   }
 }

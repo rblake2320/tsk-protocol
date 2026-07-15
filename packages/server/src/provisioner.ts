@@ -1,6 +1,5 @@
 /**
  * TSK Protocol — Server-Side Provisioner
- * IL4/5/6/7-hardened.
  *
  * Key security fixes in this version:
  * 1. INPUT VALIDATION: all provisioning parameters validated before use.
@@ -10,7 +9,7 @@
  *    prevent provisioner spam exhausting memory.
  * 4. REVOCATION: revoke() now returns a boolean indicating whether the
  *    client existed (useful for audit logging).
- * 5. AUDIT LOGGING: structured audit log interface for IL4+ compliance.
+ * 5. AUDIT LOGGING: structured audit callback interface for deployment evidence.
  */
 import {
   generateTumblerMap,
@@ -86,13 +85,27 @@ export class MemoryProvisionRateLimiter implements ProvisionRateLimiter {
 // ─── Audit Logger Interface ───────────────────────────────────────────────────
 
 /**
- * Audit logger interface for IL4+ compliance.
+ * Audit logger interface for deployment evidence.
  * All provisioning and revocation events must be logged.
  */
 export interface ProvisionAuditLogger {
   logProvision(clientId: string, requestorId?: string): void;
   logRevocation(clientId: string, requestorId?: string): void;
   logRateLimitExceeded(requestorId?: string): void;
+  logReplacement?(oldClientId: string, newClientId: string, requestorId: string, reason: string): void;
+}
+
+export interface ReplacementAuthorizationRequest {
+  oldClientId: string;
+  requestorId: string;
+  reason: string;
+}
+
+export interface LifecycleAuthorizationRequest {
+  clientId: string;
+  requestorId: string;
+  reason: string;
+  action: 'revoke' | 'update';
 }
 
 // ─── Provision Result ─────────────────────────────────────────────────────────
@@ -112,10 +125,14 @@ export interface ProvisionResult {
 export interface ProvisionerOptions {
   /** Rate limiter for provisioning requests (optional, recommended for production) */
   rateLimiter?: ProvisionRateLimiter;
-  /** Audit logger for IL4+ compliance (optional) */
+  /** Optional deployment audit callback. Its presence establishes no authorization status. */
   auditLogger?: ProvisionAuditLogger;
   /** Max total provisioned clients (memory guard, default: unlimited) */
   maxClients?: number;
+  /** Mandatory external authorization boundary for credential replacement. */
+  replacementAuthorizer?: (request: ReplacementAuthorizationRequest) => Promise<boolean>;
+  /** Mandatory external authorization boundary for revoke/update operations. */
+  lifecycleAuthorizer?: (request: LifecycleAuthorizationRequest) => Promise<boolean>;
 }
 
 // ─── Provisioner ──────────────────────────────────────────────────────────────
@@ -124,6 +141,8 @@ export class TSKProvisioner {
   private readonly rateLimiter?: ProvisionRateLimiter;
   private readonly auditLogger?: ProvisionAuditLogger;
   private readonly maxClients?: number;
+  private readonly replacementAuthorizer?: (request: ReplacementAuthorizationRequest) => Promise<boolean>;
+  private readonly lifecycleAuthorizer?: (request: LifecycleAuthorizationRequest) => Promise<boolean>;
 
   constructor(
     private store: TumblerMapStore,
@@ -132,6 +151,8 @@ export class TSKProvisioner {
     this.rateLimiter = options.rateLimiter;
     this.auditLogger = options.auditLogger;
     this.maxClients = options.maxClients;
+    this.replacementAuthorizer = options.replacementAuthorizer;
+    this.lifecycleAuthorizer = options.lifecycleAuthorizer;
   }
 
   /**
@@ -152,6 +173,8 @@ export class TSKProvisioner {
       expiresAt?: number;
       /** Hard cap on successful validations. 0 or omitted = unlimited. */
       maxRequests?: number;
+      /** Explicit number of remaining requests at which rotation is required. */
+      rotationWarningRequests?: number;
     },
   ): Promise<ProvisionResult> {
     // ── Rate limit check ────────────────────────────────────────────────────
@@ -184,6 +207,15 @@ export class TSKProvisioner {
         if (lifecycle.expiresAt !== undefined) map.expiresAt = lifecycle.expiresAt;
         if (lifecycle.maxRequests !== undefined && lifecycle.maxRequests > 0) {
           map.maxRequests = lifecycle.maxRequests;
+        }
+        if (lifecycle.rotationWarningRequests !== undefined) {
+          if (!Number.isInteger(lifecycle.rotationWarningRequests) || lifecycle.rotationWarningRequests < 1) {
+            return { ok: false, error: 'INVALID_ROTATION_WARNING_REQUESTS' };
+          }
+          if (map.maxRequests !== undefined && lifecycle.rotationWarningRequests > map.maxRequests) {
+            return { ok: false, error: 'INVALID_ROTATION_WARNING_REQUESTS' };
+          }
+          map.rotationWarningRequests = lifecycle.rotationWarningRequests;
         }
       }
       // Initialize lifecycle tracking fields
@@ -225,7 +257,9 @@ export class TSKProvisioner {
    * Revoke a client's tumbler map.
    * Returns true if the client existed and was revoked, false if not found.
    */
-  async revoke(clientId: string, requestorId?: string): Promise<boolean> {
+  async revoke(clientId: string, requestorId: string, reason: string): Promise<boolean> {
+    if (!this.lifecycleAuthorizer || !requestorId || !reason) return false;
+    if (!await this.lifecycleAuthorizer({ clientId, requestorId, reason, action: 'revoke' })) return false;
     const existing = await this.store.get(clientId);
     if (!existing) return false;
 
@@ -235,8 +269,69 @@ export class TSKProvisioner {
   }
 
   /**
+   * Create a replacement credential and revoke the prior credential in one
+   * store transaction. No authorizer means replacement is disabled.
+   */
+  async replaceKey(
+    oldClientId: string,
+    options: TumblerMapOptions,
+    lifecycle: {
+      label?: string;
+      expiresAt?: number;
+      maxRequests?: number;
+      rotationWarningRequests?: number;
+    },
+    requestorId: string,
+    reason: string,
+  ): Promise<ProvisionResult> {
+    if (!this.replacementAuthorizer || !requestorId || !reason) {
+      return { ok: false, error: 'REPLACEMENT_NOT_AUTHORIZED' };
+    }
+    const authorized = await this.replacementAuthorizer({ oldClientId, requestorId, reason });
+    if (!authorized) return { ok: false, error: 'REPLACEMENT_NOT_AUTHORIZED' };
+
+    const old = await this.store.get(oldClientId);
+    if (!old || (old.status !== undefined && old.status !== 'active' && old.status !== 'expiring')) {
+      return { ok: false, error: 'REPLACEMENT_NOT_AVAILABLE' };
+    }
+    const validationError = validateProvisionOptions(options);
+    if (validationError) return { ok: false, error: validationError };
+
+    try {
+      const replacement = generateTumblerMap(options);
+      replacement.status = 'active';
+      replacement.requestCount = 0;
+      replacement.lastUsedAt = null;
+      replacement.label = lifecycle.label;
+      replacement.expiresAt = lifecycle.expiresAt;
+      if (lifecycle.maxRequests !== undefined && lifecycle.maxRequests > 0) {
+        replacement.maxRequests = lifecycle.maxRequests;
+      }
+      if (lifecycle.rotationWarningRequests !== undefined) {
+        if (!Number.isInteger(lifecycle.rotationWarningRequests) || lifecycle.rotationWarningRequests < 1 ||
+            (replacement.maxRequests !== undefined && lifecycle.rotationWarningRequests > replacement.maxRequests)) {
+          return { ok: false, error: 'INVALID_ROTATION_WARNING_REQUESTS' };
+        }
+        replacement.rotationWarningRequests = lifecycle.rotationWarningRequests;
+      }
+
+      const committed = await this.store.replaceCredential(oldClientId, replacement);
+      if (!committed) return { ok: false, error: 'REPLACEMENT_COMMIT_FAILED' };
+      this.auditLogger?.logReplacement?.(oldClientId, replacement.clientId, requestorId, reason);
+      return {
+        ok: true,
+        clientId: replacement.clientId,
+        provisionPayload: toProvisionPayload(replacement),
+        tumblerMap: replacement,
+      };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'REPLACEMENT_FAILED' };
+    }
+  }
+
+  /**
    * Update lifecycle metadata on an existing key.
-   * Allows changing label, expiry, maxRequests, and status without re-provisioning.
+   * Allows changing label, expiry, maxRequests, warning window, and status.
    *
    * @returns true if the key was found and updated, false if not found.
    */
@@ -246,12 +341,20 @@ export class TSKProvisioner {
       label?: string;
       expiresAt?: number | null;
       maxRequests?: number | null;
-      status?: 'active' | 'revoked' | 'expired';
+      rotationWarningRequests?: number | null;
+      status?: 'active' | 'expiring' | 'revoked' | 'expired';
     },
-    requestorId?: string,
+    requestorId: string,
+    reason: string,
   ): Promise<boolean> {
+    if (!this.lifecycleAuthorizer || !requestorId || !reason) return false;
+    if (!await this.lifecycleAuthorizer({ clientId, requestorId, reason, action: 'update' })) return false;
     const existing = await this.store.get(clientId);
     if (!existing) return false;
+
+    // Revoked and expired credentials cannot be reactivated or weakened through
+    // metadata update. Recovery and replacement are separate ceremonies.
+    if (existing.status === 'revoked' || existing.status === 'expired') return false;
 
     const updated = { ...existing };
     if ('label' in updates) updated.label = updates.label;
@@ -261,7 +364,21 @@ export class TSKProvisioner {
     if ('maxRequests' in updates) {
       updated.maxRequests = updates.maxRequests ?? undefined;
     }
-    if (updates.status !== undefined) updated.status = updates.status;
+    if ('rotationWarningRequests' in updates) {
+      const warning = updates.rotationWarningRequests;
+      if (warning !== null && warning !== undefined && (!Number.isInteger(warning) || warning < 1)) {
+        return false;
+      }
+      if (warning !== null && warning !== undefined && updated.maxRequests !== undefined && warning > updated.maxRequests) {
+        return false;
+      }
+      updated.rotationWarningRequests = warning ?? undefined;
+    }
+    if (updates.status === 'revoked' || updates.status === 'expired') {
+      updated.status = updates.status;
+    } else if (updates.status !== undefined && updates.status !== existing.status) {
+      return false;
+    }
 
     await this.store.set(clientId, updated);
     this.auditLogger?.logProvision(clientId, requestorId); // reuse for audit trail
@@ -279,6 +396,7 @@ export class TSKProvisioner {
     createdAt: number;
     expiresAt?: number;
     maxRequests?: number;
+    rotationWarningRequests?: number;
     requestCount: number;
     lastUsedAt: number | null;
     keyLength: number;
@@ -295,6 +413,7 @@ export class TSKProvisioner {
         createdAt: m.createdAt,
         expiresAt: m.expiresAt,
         maxRequests: m.maxRequests,
+        rotationWarningRequests: m.rotationWarningRequests,
         requestCount: m.requestCount ?? 0,
         lastUsedAt: m.lastUsedAt ?? null,
         keyLength: m.keyLength,
@@ -313,6 +432,7 @@ export class TSKProvisioner {
     createdAt: number;
     expiresAt?: number;
     maxRequests?: number;
+    rotationWarningRequests?: number;
     requestCount: number;
     lastUsedAt: number | null;
     keyLength: number;
@@ -327,6 +447,7 @@ export class TSKProvisioner {
       createdAt: m.createdAt,
       expiresAt: m.expiresAt,
       maxRequests: m.maxRequests,
+      rotationWarningRequests: m.rotationWarningRequests,
       requestCount: m.requestCount ?? 0,
       lastUsedAt: m.lastUsedAt ?? null,
       keyLength: m.keyLength,

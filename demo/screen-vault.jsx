@@ -70,7 +70,7 @@ function ScreenVault() {
       <SectionHead
         eyebrow="Live Vault · port 3200"
         title="Watch a key tumble."
-        sub="The same key string from three perspectives. Server sees the positional map. Client sees only the assembled string. Attacker sees nothing useful at all."
+        sub="The same key string from three perspectives. The client also retains ordered metadata and the shared secret outside this simplified wire view."
         right={
           <div className="row" style={{ gap: 8 }}>
             <Pill tone={paused ? 'warn' : 'success'}>
@@ -136,14 +136,14 @@ function ScreenVault() {
           {view === 'server' && <div style={{ marginTop: 24 }}><SegmentLegend /></div>}
           {view === 'client' && (
             <div className="muted" style={{ marginTop: 18, fontSize: 13, maxWidth: 680 }}>
-              The SDK assembles segments locally and sends the string. It knows segment <em>IDs</em> and <em>types</em>,
-              but never <em>positions</em> or <em>lengths</em> — those live only on the server.
+              The SDK assembles segments locally from ordered metadata. The lengths reveal cumulative
+              boundaries; layout is not treated as a secret authentication factor.
             </div>
           )}
           {view === 'attacker' && (
             <div className="muted" style={{ marginTop: 18, fontSize: 13, maxWidth: 680 }}>
-              Every character looks alike. There is no boundary marker, no length prefix, no type tag. Replay the string
-              and most of its bytes have already expired into garbage.
+              The wire key has no boundary markers. A previously accepted generated key is denied by atomic
+              counter consumption; an intercepted unused credential can still be raced and must be protected by TLS.
             </div>
           )}
         </div>

@@ -7,6 +7,7 @@ Uses Python Playwright.  Run: python demo/e2e_browser_test.py
 """
 
 import json, time, sys, traceback
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
 BASE = "http://localhost:3200"
@@ -26,7 +27,7 @@ def run_tests():
 
         # Collect all network requests to /analytics/event
         analytics_requests = []
-        all_network_errors = []
+        all_http_errors = []
 
         def on_response(response):
             url = response.url
@@ -36,13 +37,22 @@ def run_tests():
                     "status": response.status,
                     "method": response.request.method,
                 })
-            if response.status >= 500:
-                all_network_errors.append({
+            if response.status >= 400:
+                all_http_errors.append({
                     "url": url,
                     "status": response.status,
                 })
 
         page.on("response", on_response)
+
+        failed_requests = []
+        page.on("requestfailed", lambda request: failed_requests.append({
+            "url": request.url,
+            "failure": request.failure,
+        }))
+
+        page_errors = []
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
 
         # Collect console errors
         console_errors = []
@@ -224,9 +234,12 @@ def run_tests():
             return { pills: [], reasons: [] };
         }""")
 
-        has_danger_verdict = any(v in ["attack", "suspicious"] for v in anomaly_post_burst.get("pills", []))
+        verdict_text = " ".join(
+            anomaly_post_burst.get("pills", []) + anomaly_post_burst.get("reasons", [])
+        ).lower()
+        has_danger_verdict = "verdict: suspicious" in verdict_text or "verdict: attack" in verdict_text
         record("F3-03", "After brute burst: score registers (attack/suspicious)",
-               "pass" if has_danger_verdict else "warn",
+               "pass" if has_danger_verdict else "fail",
                f"Pills: {anomaly_post_burst.get('pills')}, Reasons: {anomaly_post_burst.get('reasons')}")
 
         # =====================================================================
@@ -362,28 +375,32 @@ def run_tests():
             record("PROV-02", "Mint button found", "fail", "No mint/provision button found")
 
         # =====================================================================
-        # FULL FEATURE: 8-Layer Stack
+        # FULL FEATURE: Composed BPC + TSK verifier
         # =====================================================================
-        print("\n=== 8-Layer Stack ===")
+        print("\n=== Composed Verifier ===")
         page.goto(f"{BASE}#stack", wait_until="networkidle")
         page.wait_for_timeout(1500)
 
         stack_text = page.evaluate("document.querySelector('.main')?.textContent || ''")
         has_layers = any(w in stack_text.lower() for w in ["layer", "stack", "bpc", "tsk", "defense"])
-        record("STACK-01", "8-Layer Stack screen renders",
+        record("STACK-01", "Composed verifier screen renders",
                "pass" if has_layers else "fail",
                f"Content length: {len(stack_text)} chars")
 
-        # Check all 8 layers render
-        layer_count = page.evaluate("""() => {
-            // Count layer cards or sections
-            const text = document.querySelector('.main')?.textContent || '';
-            const matches = text.match(/Layer\\s+\\d/gi);
-            return matches ? matches.length : 0;
-        }""")
-        record("STACK-02", "All layers present",
-               "pass" if layer_count >= 7 else "warn",
-               f"Found {layer_count} layer references")
+        # Check the documented BPC and TSK checks render
+        layer_titles = page.locator(".main button.layer .lt").all_text_contents()
+        expected_stage_fragments = [
+            "Authorized ECDSA", "Explicit pair registry", "User-secret HMAC",
+            "nonce + timestamp", "Behavioral anomaly", "Derived segment",
+            "Atomic state transition",
+        ]
+        stages_match = len(layer_titles) == 7 and all(
+            any(fragment.lower() in title.lower() for title in layer_titles)
+            for fragment in expected_stage_fragments
+        )
+        record("STACK-02", "All documented verification stages render",
+               "pass" if stages_match else "fail",
+               f"Found {len(layer_titles)} stages: {layer_titles}")
 
         # Scroll through
         for i in range(5):
@@ -434,27 +451,65 @@ def run_tests():
         # Console Errors Summary
         # =====================================================================
         print("\n=== Console Errors ===")
-        if console_errors:
-            # Filter out known non-critical errors
-            critical_errors = [e for e in console_errors if "favicon" not in e.lower()]
-            if critical_errors:
-                record("CONSOLE-01", "No critical console errors",
-                       "fail", f"{len(critical_errors)} errors: {critical_errors[:5]}")
-            else:
-                record("CONSOLE-01", "No critical console errors", "pass",
-                       f"Only non-critical errors (favicon etc): {len(console_errors)}")
+        if page_errors:
+            record("CONSOLE-01", "No application exceptions",
+                   "fail", f"{len(page_errors)} exceptions: {page_errors[:5]}")
         else:
-            record("CONSOLE-01", "No console errors", "pass", "Clean console")
+            resource_messages = [
+                error for error in console_errors
+                if error.startswith("Failed to load resource")
+            ]
+            other_console_errors = [
+                error for error in console_errors
+                if not error.startswith("Failed to load resource")
+                and "favicon" not in error.lower()
+            ]
+            record("CONSOLE-01", "No application exceptions",
+                   "pass" if not other_console_errors else "fail",
+                   f"application_errors={other_console_errors}; "
+                   f"resource_messages_checked_by_network_assertions={len(resource_messages)}")
 
         # =====================================================================
         # Network errors summary
         # =====================================================================
         print("\n=== Network Errors ===")
-        if all_network_errors:
-            record("NET-01", "No 5xx network errors",
-                   "fail", f"{len(all_network_errors)} server errors: {all_network_errors[:5]}")
-        else:
-            record("NET-01", "No 5xx network errors", "pass")
+        server_errors = [error for error in all_http_errors if error["status"] >= 500]
+        record("NET-01", "No 5xx network errors",
+               "pass" if not server_errors else "fail",
+               f"server_errors={server_errors[:5]}")
+
+        allowed_negative_paths = {"/api/data", "/api/secret", "/api/action", "/api/admin/config"}
+        unexpected_client_errors = [
+            error for error in all_http_errors
+            if 400 <= error["status"] < 500
+            and not (
+                error["status"] == 401
+                and urlparse(error["url"]).path in allowed_negative_paths
+            )
+        ]
+        expected_denials = [
+            error for error in all_http_errors
+            if error["status"] == 401
+            and urlparse(error["url"]).path in allowed_negative_paths
+        ]
+        record("NET-02", "Only expected attack-path 4xx responses occurred",
+               "pass" if expected_denials and not unexpected_client_errors else "fail",
+               f"expected_denials={len(expected_denials)}; "
+               f"unexpected_client_errors={unexpected_client_errors[:5]}")
+
+        unexpected_failures = [
+            failure for failure in failed_requests
+            if not failure["url"].startswith("http://localhost:3101/")
+            and not (
+                urlparse(failure["url"]).path == "/analytics/event"
+                and failure["failure"] == "net::ERR_ABORTED"
+                and success_analytics == total_analytics
+                and total_analytics > 0
+            )
+        ]
+        record("NET-03", "Only verified analytics aborts and the offline BPC probe failed",
+               "pass" if not unexpected_failures else "fail",
+               f"request_failures={failed_requests[:5]}")
 
         browser.close()
 
