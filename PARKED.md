@@ -68,3 +68,26 @@ security claims.
 - **Restore only with:** a durable transactional outbox in the primary authority,
   atomic receiver apply/checkpoint persistence, crash/restart fault injection,
   backup/restore evidence, and loss/reordering tests against the selected stores.
+
+## P-009: Legacy red-team runners as current release evidence
+
+- **Parked:** the original `redteam-*` scripts and adversarial report as current
+  release gates.
+- **Reason:** they mix useful historical diagnostics with assertions about
+  superseded implementations, stale specifications, and behavior that now
+  fails closed by design.
+- **Location:** `parked/legacy-redteam/`.
+- **Current evidence:** `npm test`, `npm run test:ha`, `npm run test:redis`, and
+  `npm run test:pack` call maintained production code or verify the package
+  boundary and fail on unmet assertions.
+- **Restore only with:** every scenario rewritten against current interfaces,
+  obsolete findings removed, deterministic fixtures, and inclusion in CI.
+
+## P-010: Reimplemented rotation simulation as protocol evidence
+
+- **Parked:** `rotation-gap-suite.mts` as evidence for production behavior.
+- **Reason:** it implements a separate local generator and validator rather
+  than calling the maintained TSK packages.
+- **Location:** `parked/legacy-simulations/rotation-gap-suite.mts`.
+- **Current evidence:** lifecycle, adversarial, and HA suites call production
+  package code directly.

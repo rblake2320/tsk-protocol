@@ -66,6 +66,8 @@ post-cap grace mode.
 
 ## Verification
 
+Validation baseline: Node 24 LTS.
+
 ```powershell
 npm ci
 npm run build
@@ -73,6 +75,7 @@ npm run typecheck
 npm test
 npm run test:ha
 npm run test:redis
+npm run test:pack
 npm audit
 ```
 

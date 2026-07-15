@@ -10,7 +10,7 @@ not a public issue.
 
 | Property | Executable evidence | Boundary |
 |---|---|---|
-| Secret validation | `attack-suite.mts`, `redteam-crypto.mts` | Requires exactly 32 random bytes encoded as 64 hex characters. |
+| Secret and time-input validation | `attack-suite.mts` | Requires exactly 32 random bytes encoded as 64 hex characters and rejects non-finite authentication times. |
 | Integrity tag | `test-suite.mts`, `attack-suite.mts` | Truncated HMAC-SHA-256 detects tested mutations; it is not a signature. |
 | Counter replay rejection | `lifecycle-suite.mts`, `adversarial-proof.mts` | Requires a store with atomic `commitValidation()`. |
 | Usage cap | `lifecycle-suite.mts` | Atomic with all counter updates in bundled stores. |
@@ -19,6 +19,7 @@ not a public issue.
 | HA replication | `npm run test:ha` | Signed ordered streams fail closed on gaps; metadata-only replicas and volatile checkpoints cannot qualify for promotion. |
 | Writer fencing | `failover-promotion-suite.mts`, `redis-fencing-integration.mts` | Every authority must use `FencedTumblerStore`; Redis durability/topology remains deployment-specific. |
 | Cross-protocol identity | `ultra-bridge-test.mts` | BPC and TSK results must bind to the same principal. |
+| Package entry integrity | `package-boundary-suite.mts`, `npm run test:pack` | Verifies declared local entry points and dry-run tarball contents; it does not establish registry provenance or consumer deployment policy. |
 
 Passing finite tests establishes only the named propositions and inputs. It does
 not prove the absence of other attacks.
@@ -67,5 +68,6 @@ not prove the absence of other attacks.
 - The library does not supply TLS termination, operator identity, an HSM/TPM
   integration, external ledger anchoring, or an authorization package.
 
-Historical findings remain in `Adversarial_Break_Report.md`; superseded claims
-and restoration criteria are recorded in `PARKED.md`.
+Historical findings remain in
+`parked/legacy-redteam/Adversarial_Break_Report.md`; superseded claims,
+simulations, and restoration criteria are recorded in `PARKED.md`.

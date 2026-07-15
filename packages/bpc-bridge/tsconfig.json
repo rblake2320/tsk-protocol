@@ -3,7 +3,11 @@
   "compilerOptions": {
     "outDir": "./dist",
     "rootDir": "./src",
-    "baseUrl": "."
+    "baseUrl": ".",
+    "paths": {
+      "@tsk/core": ["../core/dist/index.d.ts"],
+      "@tsk/server": ["../server/dist/index.d.ts"]
+    }
   },
   "include": ["src/**/*"]
 }

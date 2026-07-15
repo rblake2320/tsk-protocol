@@ -14,6 +14,7 @@ import {
   computeChecksum,
   generateKeyFromMap,
   generateSharedSecret,
+  hmac,
   validateTSKKey,
 } from './packages/core/src/index.js';
 import type { TumblerMap } from './packages/core/src/index.js';
@@ -78,6 +79,36 @@ function testCase(
 
 console.log('TSK bounded adversarial suite (production implementation)');
 console.log(`fixture_key_length=${map.keyLength}; secret/key values intentionally not logged`);
+
+testCase('invalid shared-secret encodings fail closed', () => {
+  const invalidSecrets = ['not-hex', '00'.repeat(31)];
+  let rejected = 0;
+  for (const secret of invalidSecrets) {
+    try {
+      hmac(secret, 'bounded-secret-validation');
+    } catch {
+      rejected++;
+    }
+  }
+  return {
+    attempts: invalidSecrets.length,
+    failed: rejected !== invalidSecrets.length,
+    detail: `rejected=${rejected}/${invalidSecrets.length}`,
+  };
+});
+
+testCase('non-finite authentication times fail closed', () => {
+  const invalidTimes = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY];
+  const rejected = invalidTimes.filter(nowMs => {
+    const result = validateTSKKey(validKey, { map, nowMs });
+    return !result.ok && result.error === 'INVALID_KEY';
+  }).length;
+  return {
+    attempts: invalidTimes.length,
+    failed: rejected !== invalidTimes.length,
+    detail: `rejected=${rejected}/${invalidTimes.length}`,
+  };
+});
 
 testCase('random exact-length keys are rejected', () => {
   const attempts = 100_000;

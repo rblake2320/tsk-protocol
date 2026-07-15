@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Composed BPC and TSK verification with mandatory principal identity binding",
   "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -11,20 +14,24 @@
       "types": "./dist/index.d.ts"
     }
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build --prefix ../..",
     "test": "npx tsx ../../ultra-bridge-test.mts"
   },
   "dependencies": {
-    "@tsk/core": "*",
-    "@tsk/server": "*"
+    "@tsk/core": "^0.1.0",
+    "@tsk/server": "^0.1.0"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^24.13.3"
   },
   "peerDependencies": {
-    "@bpc/server": "^1.0.0"
+    "@bpc/server": "^0.2.0"
   },
   "peerDependenciesMeta": {
     "@bpc/server": {
