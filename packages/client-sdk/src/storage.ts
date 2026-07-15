@@ -6,7 +6,21 @@
  * is provided separately and is not written by this storage abstraction.
  */
 
-import type { TSKProvisionPayload } from '@tsk/core';
+import {
+  assertValidClientHOTPInitialCounters,
+  assertValidHOTPStoredCounter,
+  type TSKProvisionPayload,
+} from '@tsk/core';
+
+function assertValidPayload(payload: TSKProvisionPayload): void {
+  assertValidClientHOTPInitialCounters(payload.clientSegments);
+}
+
+function assertValidCounterVector(counters: ReadonlyMap<string, number>): void {
+  for (const [segmentId, counter] of counters) {
+    assertValidHOTPStoredCounter(counter, `persisted HOTP counter for ${segmentId}`);
+  }
+}
 
 export interface TSKClientStorage {
   save(payload: TSKProvisionPayload): Promise<void>;
@@ -37,11 +51,15 @@ export class MemoryClientStorage implements TSKClientStorage {
   private counters = new Map<string, number>(); // key: `${clientId}:${segmentId}`
 
   async save(payload: TSKProvisionPayload): Promise<void> {
-    this.store.set(payload.clientId, payload);
+    assertValidPayload(payload);
+    this.store.set(payload.clientId, structuredClone(payload));
   }
 
   async load(clientId: string): Promise<TSKProvisionPayload | null> {
-    return this.store.get(clientId) ?? null;
+    const payload = this.store.get(clientId);
+    if (!payload) return null;
+    assertValidPayload(payload);
+    return structuredClone(payload);
   }
 
   async delete(clientId: string): Promise<void> {
@@ -53,17 +71,23 @@ export class MemoryClientStorage implements TSKClientStorage {
   }
 
   async saveCounter(clientId: string, segmentId: string, counter: number): Promise<void> {
+    assertValidHOTPStoredCounter(counter, `persisted HOTP counter for ${segmentId}`);
     this.counters.set(`${clientId}:${segmentId}`, counter);
   }
 
   async saveCounters(clientId: string, counters: ReadonlyMap<string, number>): Promise<void> {
+    assertValidCounterVector(counters);
     for (const [segmentId, counter] of counters) {
       this.counters.set(`${clientId}:${segmentId}`, counter);
     }
   }
 
   async loadCounter(clientId: string, segmentId: string): Promise<number | undefined> {
-    return this.counters.get(`${clientId}:${segmentId}`);
+    const counter = this.counters.get(`${clientId}:${segmentId}`);
+    if (counter !== undefined) {
+      assertValidHOTPStoredCounter(counter, `persisted HOTP counter for ${segmentId}`);
+    }
+    return counter;
   }
 }
 
@@ -85,14 +109,21 @@ export class FileClientStorage implements TSKClientStorage {
     try {
       const parsed = JSON.parse(await readFile(this.filePath, 'utf-8')) as Record<string, unknown>;
       if (parsed['version'] === 1 && parsed['payloads'] && parsed['counters']) {
-        return parsed as unknown as {
+        const data = parsed as unknown as {
           version: 1;
           payloads: Record<string, TSKProvisionPayload>;
           counters: Record<string, number>;
         };
+        for (const payload of Object.values(data.payloads)) assertValidPayload(payload);
+        for (const [key, counter] of Object.entries(data.counters)) {
+          assertValidHOTPStoredCounter(counter, `persisted HOTP counter ${key}`);
+        }
+        return data;
       }
       // Backward-compatible read of the original payload-only object.
-      return { version: 1, payloads: parsed as Record<string, TSKProvisionPayload>, counters: {} };
+      const payloads = parsed as Record<string, TSKProvisionPayload>;
+      for (const payload of Object.values(payloads)) assertValidPayload(payload);
+      return { version: 1, payloads, counters: {} };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return { version: 1, payloads: {}, counters: {} };
@@ -130,6 +161,7 @@ export class FileClientStorage implements TSKClientStorage {
   }
 
   async save(payload: TSKProvisionPayload): Promise<void> {
+    assertValidPayload(payload);
     await this.mutate(data => { data.payloads[payload.clientId] = payload; });
   }
 
@@ -147,10 +179,12 @@ export class FileClientStorage implements TSKClientStorage {
   }
 
   async saveCounter(clientId: string, segmentId: string, counter: number): Promise<void> {
+    assertValidHOTPStoredCounter(counter, `persisted HOTP counter for ${segmentId}`);
     await this.mutate(data => { data.counters[`${clientId}:${segmentId}`] = counter; });
   }
 
   async saveCounters(clientId: string, counters: ReadonlyMap<string, number>): Promise<void> {
+    assertValidCounterVector(counters);
     await this.mutate(data => {
       for (const [segmentId, counter] of counters) {
         data.counters[`${clientId}:${segmentId}`] = counter;

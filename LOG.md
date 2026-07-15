@@ -1,5 +1,22 @@
 # Change Log
 
+## 2026-07-15 - Numeric HOTP boundary hardening
+
+- Re-audited closed issue #1 and confirmed its stated `maxRequests` lifecycle
+  was completed by PR #2; preserved that issue as closed rather than expanding
+  its history.
+- Opened issue #7 for the distinct numeric moving-factor boundary found in the
+  post-merge audit.
+- Added one canonical wire-v1 counter ceiling, an exhausted MAX sentinel,
+  clipped lookahead, complete-vector atomic commits, counter-capacity rotation
+  signaling, and server/client/file/replica range enforcement.
+- Added `hotp-exhaustion-suite.mts`; the final focused run passed 17/17 named
+  cases. Full build, typecheck, release tests, HA tests, digest-pinned live
+  Redis fencing, package dry runs, and the dependency audit passed before
+  publication.
+- Rollback: revert the dedicated HOTP-boundary commit. Do not partially revert
+  only client or server enforcement because their counter contracts must match.
+
 ## 2026-07-15
 
 - Post-merge review confirmed PR #2 was already merged at `0d22a93` with both

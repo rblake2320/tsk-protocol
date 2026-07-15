@@ -18,6 +18,16 @@ The server returns a rotation-required signal inside a configured window.
 Replacement requires an external authorizer and atomically revokes the old key.
 Automatic issuance or post-cap acceptance was rejected.
 
+## 2026-07-15: Treat numeric HOTP exhaustion as a separate lifecycle boundary
+
+`maxRequests` limits credential usage by policy; the moving-factor counter has
+its own finite representation. Wire v1 keeps its existing 31-bit project limit:
+MAX is an exhausted stored sentinel, the last legal derivation commits MAX, and
+lookahead never crosses it. The segment with the least capacity governs the
+warning. Replacement remains externally authorized and atomic; normal traffic
+cannot auto-issue a credential. Expanding to RFC 4226's 8-byte counter would
+require BigInt/canonical encoding and is therefore a wire-v2 decision.
+
 ## 2026-07-15: Authentication acceptance controls client counters
 
 Business status and authentication status are different. An authenticated

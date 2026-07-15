@@ -19,6 +19,13 @@
 
 ### Security
 
+- Closed numeric HOTP rollover paths across core derivation, lookahead, atomic
+  stores, client persistence, and replica input. Wire v1 now commits MAX only as
+  an exhausted sentinel and never writes or derives MAX+1.
+- Added an independent HOTP-capacity warning and response header; the segment
+  closest to exhaustion governs rotation even without `maxRequests`.
+- Required atomic validation commits to contain the complete HOTP counter
+  vector, preventing partial lifecycle commits.
 - Enforced writer fencing at every `TumblerMapStore` mutation through
   `FencedTumblerStore` and added atomic Redis-backed fencing transitions.
 - Authenticated and hash-linked replication operations; rejected stale,
@@ -41,6 +48,9 @@
 
 ### Evidence
 
+- Added maintained numeric-boundary tests for warning thresholds, final-use
+  concurrency, lookahead clipping, corrupt persistence, client restart, and
+  replica rejection.
 - Replaced duplicated attack logic with production-backed bounded cases and
   removed secret/key logging and unsupported statistical/performance claims.
 - Added live Redis fencing and browser attack-path verification.

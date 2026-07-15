@@ -125,9 +125,12 @@ console.log('\n[TSK Lifecycle] Atomic concurrent cap');
 
 {
   const { store, map } = await provisionWith({ maxRequests: 1, requestCount: 0 });
+  const counterMatches = map.segments
+    .filter(segment => segment.type === 'hotp')
+    .map(segment => ({ segmentId: segment.segmentId, matchedCounter: segment.counter ?? 0 }));
   const concurrent = await Promise.all([
-    store.commitValidation(map.clientId, { counterMatches: [], usedAt: Date.now() }),
-    store.commitValidation(map.clientId, { counterMatches: [], usedAt: Date.now() }),
+    store.commitValidation(map.clientId, { counterMatches, usedAt: Date.now() }),
+    store.commitValidation(map.clientId, { counterMatches, usedAt: Date.now() }),
   ]);
   assert('exactly one concurrent request succeeds at maxRequests=1', concurrent.filter(result => result.ok).length === 1, JSON.stringify(concurrent));
   assert('the losing concurrent request is denied by the hard cap', concurrent.some(result => result.error === 'TSK_KEY_USAGE_CAP_EXCEEDED'), JSON.stringify(concurrent));

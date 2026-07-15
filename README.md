@@ -12,6 +12,9 @@ The server retains authoritative counter and lifecycle state.
   count; a concurrent duplicate is denied.
 - Expiry, revocation, hard request caps, and a pre-cap rotation signal are
   enforced by the server middleware.
+- Wire v1 bounds every HOTP counter to `0..2,147,483,647`. The maximum is an
+  exhausted persisted sentinel, lookahead never crosses it, and the segment
+  closest to exhaustion drives a separate rotation warning.
 - Replacement requires a deployment-supplied authorizer and atomically creates
   the new credential while revoking the old one.
 - File-backed client storage persists counters across restarts with atomic file
@@ -61,8 +64,10 @@ responses. The client advances counters only when it receives
 `X-TSK-Authenticated: 1`; a bare `2xx` is not sufficient.
 
 When `X-TSK-Rotation-Required: 1` is present, provision an authorized
-replacement before `X-TSK-Requests-Remaining` reaches zero. There is no
-post-cap grace mode.
+replacement before either `X-TSK-Requests-Remaining` or
+`X-TSK-HOTP-Counters-Remaining` reaches zero. The usage-cap header is omitted
+when no `maxRequests` cap exists. There is no post-cap or post-counter grace
+mode.
 
 ## Verification
 

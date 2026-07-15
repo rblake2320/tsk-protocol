@@ -18,6 +18,7 @@
  */
 import { hmac, hmacRaw, validateHexSecret } from './crypto.js';
 import type { SegmentConfig } from './types.js';
+import { assertUsableHOTPDerivationCounter } from './hotp-counter.js';
 
 /**
  * Derive the current segment value for a given config, at the given timestamp.
@@ -39,6 +40,7 @@ export function deriveSegmentValue(
   } else {
     // hotp
     const counter = seg.counter ?? 0;
+    assertUsableHOTPDerivationCounter(counter, `HOTP counter for ${seg.segmentId}`);
     derivationInput = `hotp:${seg.segmentId}:${counter}`;
   }
   const secretBuf = toSecretBuf(sharedSecret);
@@ -70,6 +72,7 @@ export function deriveSegmentForCounter(
   seg: SegmentConfig,
   counter: number,
 ): string {
+  assertUsableHOTPDerivationCounter(counter, `HOTP counter for ${seg.segmentId}`);
   const segLen = seg.position[1] - seg.position[0];
   const derivationInput = `hotp:${seg.segmentId}:${counter}`;
   const secretBuf = toSecretBuf(sharedSecret);

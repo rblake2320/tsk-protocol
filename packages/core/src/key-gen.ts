@@ -23,6 +23,7 @@ import { deriveSegmentValue } from './segment.js';
 import { hmac, hmacRaw, sha256, validateHexSecret } from './crypto.js';
 import { emitKeyGenerationCapture } from './runtime-capture.js';
 import type { KeyGenerationCaptureOptions } from './runtime-capture.js';
+import { assertUsableHOTPDerivationCounter } from './hotp-counter.js';
 
 /**
  * Generate a TSK key using the FULL tumbler map (server-side / test path).
@@ -102,6 +103,7 @@ export function generateKeyFromClientPayload(
     } else {
       // hotp
       const counter = counters.get(seg.segmentId) ?? seg.initialCounter ?? 0;
+      assertUsableHOTPDerivationCounter(counter, `HOTP counter for ${seg.segmentId}`);
       derivationInput = `hotp:${seg.segmentId}:${counter}`;
     }
 
@@ -160,6 +162,7 @@ export function generateClientSegmentValues(
     } else {
       // hotp
       const counter = counters.get(seg.segmentId) ?? seg.initialCounter ?? 0;
+      assertUsableHOTPDerivationCounter(counter, `HOTP counter for ${seg.segmentId}`);
       derivationInput = `hotp:${seg.segmentId}:${counter}`;
     }
 
