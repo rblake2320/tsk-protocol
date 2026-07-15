@@ -72,3 +72,18 @@ workspace now rebuilds before packing, publishes only `dist`, and has its
 declared runtime and type entry points checked for existence and runtime import.
 This prevents a tarball from passing a dry run while omitting or misplacing the
 files that consumers load.
+
+## 2026-07-15: Protocol compatibility must be executable and commit-pinned
+
+A peer dependency range documents an intended package line but does not prove
+that the reviewed BPC and TSK implementations compose correctly. CI therefore
+builds an exact BPC commit and exercises the real packages together. Updating
+that pin requires a reviewed repository change and a new compatibility run.
+
+## 2026-07-15: Reject malformed BPC results before consuming TSK state
+
+BPC 0.2 deliberately uses the closed coarse scopes `read`, `read-write`, and
+`admin`; fine-grained authorization belongs to application policy. A missing,
+wildcard, namespaced, or contradictory scope is a broken composition contract.
+The bridge rejects it before TSK verification so an invalid BPC result cannot
+advance counters or lifecycle state.

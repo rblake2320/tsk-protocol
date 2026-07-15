@@ -15,6 +15,7 @@
     "test:ha": "npx tsx replicating-tumbler-suite.mts && npx tsx replica-receiver-suite.mts && npx tsx failover-promotion-suite.mts",
     "test:redis": "npx tsx redis-fencing-integration.mts",
     "test:pack": "npm run build && npx tsx package-boundary-suite.mts && npm pack --dry-run --workspaces",
+    "test:bpc-compat": "npx tsx bpc-compatibility-suite.mts",
     "typecheck": "tsc --noEmit --allowImportingTsExtensions -p tsconfig.json"
   },
   "devDependencies": {

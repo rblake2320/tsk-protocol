@@ -2,6 +2,28 @@
 
 ## 2026-07-15
 
+- Re-audited closed BPC issue #1 rather than assuming its earlier closure meant
+  every shipped surface enforced the decision. BPC TypeScript rejected
+  wildcard scopes, but BPC Python accepted arbitrary scope strings at intake.
+  The companion BPC correction was independently tested and merged as BPC PR
+  #5 at `d306aadeb33141fffffafacf28781a41c1e92664`.
+- Found that the generic TSK BPC bridge also trusted any scope supplied by an
+  `ok: true` BPC-like verifier. The bridge now accepts only `read`,
+  `read-write`, or `admin`, rejects missing or contradictory scope evidence,
+  and fails before TSK validation so malformed BPC results cannot consume TSK
+  counter state.
+- Added a real package compatibility suite and a CI checkout pinned to the BPC
+  merge commit. The suite builds BPC and checks version alignment, wildcard
+  rejection, BPC signing and verification, replay ordering, closed-scope
+  propagation, TSK identity binding, and TSK state preservation after a BPC
+  denial.
+- Verification after the companion changes: build and typecheck passed;
+  176/176 maintained protocol, lifecycle, client, store, anomaly, adversarial,
+  bridge, and runtime assertions passed; 25/25 HA assertions passed; 10/10 real
+  BPC/TSK package compatibility assertions passed; 6/6 live Redis fencing
+  assertions passed; 4/4 package boundaries passed; 33/33 live browser/backend
+  assertions passed; `npm audit` reported zero known vulnerabilities.
+
 - Post-merge review confirmed PR #2 was already merged at `0d22a93` with both
   hosted checks green; the earlier draft/open status was stale.
 - Found CI still using EOL Node 20 and legacy root-level red-team scripts that

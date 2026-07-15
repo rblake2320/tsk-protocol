@@ -23,6 +23,14 @@
 import { verifyTSKRequest, type TSKRequestData, type TSKServerConfig, type TSKVerifyResult } from '@tsk/server';
 import type { TumblerMapStore } from '@tsk/server';
 
+export type BPCScope = 'read' | 'read-write' | 'admin';
+
+const BPC_SCOPES = new Set<BPCScope>(['read', 'read-write', 'admin']);
+
+function isBPCScope(value: unknown): value is BPCScope {
+  return typeof value === 'string' && BPC_SCOPES.has(value as BPCScope);
+}
+
 /**
  * BPC verification result shape (compatible with @bpc/server BPCVerifyResult).
  * Typed generically so this file doesn't require @bpc/server as a hard dep
@@ -39,15 +47,15 @@ export interface BPCLikeResult {
   error?: string;
   /**
    * The BPC pair scope ('read' | 'read-write' | 'admin').
-   * Set this directly if you want to override scope extraction from `pair`.
+   * If `pair.scope` is also present, both values must agree.
    */
-  scope?: string;
+  scope?: BPCScope;
   /**
    * The full BPC StoredPair object returned by verifyBPCRequest on success.
    * The bridge reads pair.scope from this if `scope` is not set directly.
    * Typed loosely to avoid a hard dep on @bpc/server types.
    */
-  pair?: { scope?: string; [key: string]: unknown };
+  pair?: { scope?: BPCScope; [key: string]: unknown };
 }
 
 export interface UltraVerifyResult {
@@ -61,9 +69,9 @@ export interface UltraVerifyResult {
    * the caller. Callers MUST use this scope to enforce access control on
    * the downstream resource — the TSK layer alone does not enforce scope.
    *
-   * Values: 'read' | 'read-write' | 'admin' | undefined (if BPC did not return scope)
+   * Successful results always contain one BPC 0.2 closed coarse scope.
    */
-  scope?: string;
+  scope?: BPCScope;
 }
 
 export interface UltraVerifyOptions {
@@ -88,7 +96,7 @@ export interface UltraVerifyOptions {
  *     { tskStore, identityBinding }
  *   );
  *
- * HIGH-03: The returned `result.scope` is the BPC pair scope. Callers MUST
+ * HIGH-03: A successful result contains the verified BPC pair scope. Callers MUST
  * enforce this scope on the downstream resource. The Ultra Bridge does NOT
  * automatically block write operations for read-scoped pairs — that enforcement
  * is the caller's responsibility using result.scope.
@@ -104,6 +112,28 @@ export async function verifyUltraRequest(
     return {
       ok: false,
       error: `BPC: ${bpcResult.error ?? 'VERIFICATION_FAILED'}`,
+      layers: [],
+    };
+  }
+
+  // BPC 0.2 deliberately uses a closed scope enum. Enforce that contract at
+  // the composition boundary before TSK can consume counter/lifecycle state.
+  const directScope: unknown = bpcResult.scope;
+  const pairScope: unknown = bpcResult.pair?.scope;
+  if (directScope !== undefined && pairScope !== undefined && directScope !== pairScope) {
+    return {
+      ok: false,
+      pairId: bpcResult.pairId,
+      error: 'BPC: SCOPE_MISMATCH',
+      layers: [],
+    };
+  }
+  const resolvedScope = directScope ?? pairScope;
+  if (!isBPCScope(resolvedScope)) {
+    return {
+      ok: false,
+      pairId: bpcResult.pairId,
+      error: 'BPC: INVALID_SCOPE',
       layers: [],
     };
   }
@@ -140,12 +170,6 @@ export async function verifyUltraRequest(
       layers: ['bpc', 'tsk'],
     };
   }
-
-  // HIGH-03 FIX: Extract BPC scope from the result and surface it to the caller.
-  // Priority: bpcResult.scope > bpcResult.pair?.scope > undefined
-  const resolvedScope: string | undefined =
-    bpcResult.scope ??
-    (bpcResult.pair as { scope?: string } | undefined)?.scope;
 
   return {
     ok: true,

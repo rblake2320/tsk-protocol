@@ -17,7 +17,8 @@ The server retains authoritative counter and lifecycle state.
 - File-backed client storage persists counters across restarts with atomic file
   replacement.
 - The BPC bridge denies when independently verified BPC and TSK identities do
-  not resolve to the same principal.
+  not resolve to the same principal, and it accepts only BPC 0.2 closed scopes
+  (`read`, `read-write`, or `admin`).
 - HA envelopes are signed, hash-linked, ordered, and checked for freshness.
 - `FencedTumblerStore` makes shared writer leases mandatory at the store
   mutation boundary; `RedisFencingStore` provides an atomic cross-process
@@ -76,8 +77,13 @@ npm test
 npm run test:ha
 npm run test:redis
 npm run test:pack
+npm run test:bpc-compat
 npm audit
 ```
+
+`test:bpc-compat` runs against a built BPC checkout at `../bpc-protocol` by
+default. Set `BPC_PROTOCOL_PATH` to test a different checkout. CI checks out
+the reviewed BPC commit recorded in the workflow rather than a floating branch.
 
 Current package version: `0.1.0` (beta reference implementation). Wire protocol
 version: `1`.

@@ -14,6 +14,12 @@
 - Replaced wildcard internal package dependencies with the tested `0.1.x`
   range, aligned the BPC bridge peer with BPC `0.2.x`, and declared Node 24 on
   every publishable workspace.
+- Enforced the BPC 0.2 closed scope contract at the BPC/TSK composition
+  boundary. Missing, wildcard, namespaced, and contradictory scopes are denied
+  before TSK can consume counter or lifecycle state.
+- Added a cross-repository compatibility gate that builds a commit-pinned BPC
+  checkout and exercises real BPC signing, verification, replay rejection,
+  closed-scope propagation, and TSK identity binding.
 - Made client lifecycle evidence counts deterministic while still asserting
   every generated counter-based segment.
 

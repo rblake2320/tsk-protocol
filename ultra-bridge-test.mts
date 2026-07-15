@@ -91,13 +91,13 @@ async function makeReq(
 
 // BPC mock stubs
 function bpcPass(pid = pairId): () => Promise<BPCLikeResult> {
-  return async () => ({ ok: true, pairId: pid });
+  return async () => ({ ok: true, pairId: pid, pair: { scope: 'read-write' } });
 }
 function bpcFail(error = 'INVALID_SIGNATURE'): () => Promise<BPCLikeResult> {
   return async () => ({ ok: false, error });
 }
 function bpcPassNoPairId(): () => Promise<BPCLikeResult> {
-  return async () => ({ ok: true }); // pairId absent
+  return async () => ({ ok: true, pair: { scope: 'read-write' } }); // pairId absent
 }
 
 // ─── Test groups ──────────────────────────────────────────────────────────────
@@ -312,7 +312,7 @@ console.log('\n[10] ULTRA_SECURITY_LAYERS Contract');
 console.log('\n[11] BPC Scope Propagation (HIGH-03)');
 {
   // Test 1: scope field set directly on BPCLikeResult
-  const bpcWithScope = async () => ({ ok: true, pairId, scope: 'read' });
+  const bpcWithScope = async (): Promise<BPCLikeResult> => ({ ok: true, pairId, scope: 'read' });
   const req11a: TSKRequestData = {
     headers: {
       'x-tsk-client-id': clientId,
@@ -324,7 +324,9 @@ console.log('\n[11] BPC Scope Propagation (HIGH-03)');
   assert('scope=read propagated from bpcResult.scope', r11a.scope === 'read', `Got: ${r11a.scope}`);
 
   // Test 2: scope extracted from bpcResult.pair.scope
-  const bpcWithPair = async () => ({ ok: true, pairId, pair: { scope: 'read-write', id: pairId } });
+  const bpcWithPair = async (): Promise<BPCLikeResult> => (
+    { ok: true, pairId, pair: { scope: 'read-write', id: pairId } }
+  );
   const req11b: TSKRequestData = {
     headers: {
       'x-tsk-client-id': clientId,
@@ -335,7 +337,9 @@ console.log('\n[11] BPC Scope Propagation (HIGH-03)');
   const r11b = await verifyUltraRequest(req11b, bpcWithPair, { tskStore: store, identityBinding });
   assert('scope=read-write extracted from bpcResult.pair.scope', r11b.scope === 'read-write', `Got: ${r11b.scope}`);
 
-  // Test 3: no scope — result.scope is undefined (not a failure, just not set)
+  // Test 3: a successful verifier with no scope violates the BPC 0.2 contract.
+  // Reuse the exact TSK key afterward to prove the invalid BPC result did not
+  // consume TSK counter state.
   const req11c: TSKRequestData = {
     headers: {
       'x-tsk-client-id': clientId,
@@ -343,11 +347,17 @@ console.log('\n[11] BPC Scope Propagation (HIGH-03)');
       'x-tsk-version': '1',
     },
   };
-  const r11c = await verifyUltraRequest(req11c, bpcPass(), { tskStore: store, identityBinding });
-  assert('scope=undefined when BPC does not return scope', r11c.scope === undefined, `Got: ${r11c.scope}`);
+  const missingScope = async () => ({ ok: true, pairId }) as BPCLikeResult;
+  const r11c = await verifyUltraRequest(req11c, missingScope, { tskStore: store, identityBinding });
+  assert('missing BPC scope is rejected', !r11c.ok && r11c.error === 'BPC: INVALID_SCOPE', `Got: ${r11c.error}`);
+  assert('missing BPC scope fails before TSK', r11c.layers.length === 0, `Got: ${JSON.stringify(r11c.layers)}`);
+  const r11cRetry = await verifyUltraRequest(req11c, bpcPass(), { tskStore: store, identityBinding });
+  assert('same TSK key remains usable after invalid BPC scope', r11cRetry.ok, `Got: ${r11cRetry.error}`);
 
-  // Test 4: scope field takes priority over pair.scope
-  const bpcBoth = async () => ({ ok: true, pairId, scope: 'admin', pair: { scope: 'read', id: pairId } });
+  // Test 4: contradictory authenticated scope representations fail closed.
+  const bpcBoth = async (): Promise<BPCLikeResult> => (
+    { ok: true, pairId, scope: 'admin', pair: { scope: 'read', id: pairId } }
+  );
   const req11d: TSKRequestData = {
     headers: {
       'x-tsk-client-id': clientId,
@@ -356,7 +366,29 @@ console.log('\n[11] BPC Scope Propagation (HIGH-03)');
     },
   };
   const r11d = await verifyUltraRequest(req11d, bpcBoth, { tskStore: store, identityBinding });
-  assert('scope field takes priority over pair.scope', r11d.scope === 'admin', `Got: ${r11d.scope}`);
+  assert('direct and pair scope disagreement is rejected',
+    !r11d.ok && r11d.error === 'BPC: SCOPE_MISMATCH', `Got: ${r11d.error}`);
+  assert('scope disagreement fails before TSK', r11d.layers.length === 0, `Got: ${JSON.stringify(r11d.layers)}`);
+
+  // Test 5: runtime validation rejects values that bypass TypeScript typing.
+  const req11e = await makeReq({}, NOW);
+  const wildcardScope = async () => ({ ok: true, pairId, scope: 'read:*' }) as unknown as BPCLikeResult;
+  const r11e = await verifyUltraRequest(req11e, wildcardScope, { tskStore: store, identityBinding });
+  assert('wildcard BPC scope is rejected',
+    !r11e.ok && r11e.error === 'BPC: INVALID_SCOPE', `Got: ${r11e.error}`);
+
+  const namespacedScope = async () => (
+    { ok: true, pairId, pair: { scope: 'read:quotes' } }
+  ) as unknown as BPCLikeResult;
+  const r11f = await verifyUltraRequest(req11e, namespacedScope, { tskStore: store, identityBinding });
+  assert('namespaced BPC scope is rejected',
+    !r11f.ok && r11f.error === 'BPC: INVALID_SCOPE', `Got: ${r11f.error}`);
+
+  const matchingAdmin = async () => (
+    { ok: true, pairId, scope: 'admin', pair: { scope: 'admin', id: pairId } }
+  ) satisfies BPCLikeResult;
+  const r11g = await verifyUltraRequest(req11e, matchingAdmin, { tskStore: store, identityBinding });
+  assert('matching closed admin scope is accepted', r11g.ok && r11g.scope === 'admin', `Got: ${r11g.error}`);
 }
 // ─── Results ──────────────────────────────────────────────────────────────────
 

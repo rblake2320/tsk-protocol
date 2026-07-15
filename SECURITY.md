@@ -18,7 +18,7 @@ not a public issue.
 | Restart persistence | `client-lifecycle-suite.mts` | File store is single-process and relies on host file protections. |
 | HA replication | `npm run test:ha` | Signed ordered streams fail closed on gaps; metadata-only replicas and volatile checkpoints cannot qualify for promotion. |
 | Writer fencing | `failover-promotion-suite.mts`, `redis-fencing-integration.mts` | Every authority must use `FencedTumblerStore`; Redis durability/topology remains deployment-specific. |
-| Cross-protocol identity | `ultra-bridge-test.mts` | BPC and TSK results must bind to the same principal. |
+| Cross-protocol identity and scope | `ultra-bridge-test.mts`, `bpc-compatibility-suite.mts` | BPC and TSK results must bind to the same principal. Only BPC 0.2 closed scopes are accepted; application authorization remains separate. CI tests the exact BPC commit pinned in the workflow. |
 | Package entry integrity | `package-boundary-suite.mts`, `npm run test:pack` | Verifies declared local entry points and dry-run tarball contents; it does not establish registry provenance or consumer deployment policy. |
 
 Passing finite tests establishes only the named propositions and inputs. It does
@@ -55,6 +55,9 @@ not prove the absence of other attacks.
    shared atomic `FencingStore`. The Redis implementation retains expired epoch
    tombstones intentionally; configure Redis persistence, ACLs, TLS, and HA.
 9. Treat anomaly scores as telemetry, not proof that a request is safe.
+10. Enforce the returned BPC scope at the application authorization boundary.
+    Bridge success authenticates a closed coarse scope; it does not authorize
+    arbitrary application actions by itself.
 
 ## Known Limits
 

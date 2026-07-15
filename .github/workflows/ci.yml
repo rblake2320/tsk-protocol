@@ -35,4 +35,14 @@ jobs:
         env:
           TSK_REDIS_URL: redis://127.0.0.1:6379
       - run: npm run test:pack
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rblake2320/bpc-protocol
+          ref: d306aadeb33141fffffafacf28781a41c1e92664
+          path: .compat/bpc-protocol
+      - run: npm ci --prefix .compat/bpc-protocol
+      - run: npm run build --prefix .compat/bpc-protocol
+      - run: npm run test:bpc-compat
+        env:
+          BPC_PROTOCOL_PATH: ${{ github.workspace }}/.compat/bpc-protocol
       - run: npm audit
