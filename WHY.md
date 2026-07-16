@@ -82,3 +82,27 @@ workspace now rebuilds before packing, publishes only `dist`, and has its
 declared runtime and type entry points checked for existence and runtime import.
 This prevents a tarball from passing a dry run while omitting or misplacing the
 files that consumers load.
+
+## 2026-07-15: Protocol compatibility must be executable and commit-pinned
+
+A peer dependency range documents an intended package line but does not prove
+that the reviewed BPC and TSK implementations compose correctly. CI therefore
+builds an exact BPC commit and exercises the real packages together. Updating
+that pin requires a reviewed repository change and a new compatibility run.
+
+## 2026-07-15: Reject malformed BPC results before consuming TSK state
+
+BPC 0.2 returns a runtime-frozen point-in-time `AuthSnapshot`; the bridge does
+not accept the earlier mutable `pair` object or direct-scope fallbacks. It also
+requires a fresh snapshot, matching result/snapshot pair IDs, a legitimate
+kind, and one closed coarse scope: `read`, `read-write`, or `admin`.
+
+The verified pair is resolved to an expected TSK client before TSK verification
+and compared with the claimed client header. Only then may TSK consume counter
+or lifecycle state, followed by a second comparison with the authenticated TSK
+identity. Focused tests retry the exact same TSK key after every preflight
+denial to prove that the denial did not consume state.
+
+BPC's audit event remains stage-scoped. A `verify_pass` proves the BPC stage
+completed; it does not claim that identity binding, TSK, or application
+authorization succeeded. Deployments must record the final composed decision.

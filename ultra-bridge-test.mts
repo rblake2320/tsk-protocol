@@ -1,378 +1,499 @@
 /**
- * TSK + BPC Ultra Bridge — Integration Test Suite
+ * Strict BPC/TSK composition tests.
  *
- * Tests every logical branch of verifyUltraRequest:
- *   - Happy path (BPC pass + TSK pass + identity match)
- *   - BPC layer failure
- *   - TSK layer failure after BPC passes
- *   - Identity binding mismatch (pairId → wrong clientId)
- *   - Identity binding unavailable (pairId or clientId absent)
- *   - Null identity resolution (unknown pairId)
- *   - Real TSK key generation and validation (no mocked TSK)
- *   - ULTRA_SECURITY_LAYERS contract (7 layers, correct metadata)
- *
- * Run with: npx tsx ultra-bridge-test.mts
+ * Every preflight denial is followed by a successful retry with the same TSK
+ * key. That proves malformed BPC evidence and identity-binding failures cannot
+ * consume HOTP or lifecycle state.
  */
 
-import { verifyUltraRequest, ULTRA_SECURITY_LAYERS } from './packages/bpc-bridge/src/ultra-verify.js';
-import { createTSKServer } from './packages/server/src/index.js';
+import {
+  ULTRA_SECURITY_LAYERS,
+  verifyUltraRequest,
+  type BPCAuthSnapshot,
+  type BPCLikeResult,
+  type UltraVerifyOptions,
+} from './packages/bpc-bridge/src/ultra-verify.js';
 import { generateKeyFromMap } from './packages/core/src/key-gen.js';
-import { generateSharedSecret, generateClientId, generateSegmentId } from './packages/core/src/crypto.js';
-import { MemoryTumblerStore } from './packages/server/src/store.js';
+import { createTSKServer, MemoryTumblerStore } from './packages/server/src/index.js';
 import type { TumblerMap } from './packages/core/src/types.js';
 import type { TSKRequestData } from './packages/server/src/middleware.js';
-import type { BPCLikeResult } from './packages/bpc-bridge/src/ultra-verify.js';
 
-// ─── Test harness ─────────────────────────────────────────────────────────────
+type AsyncTest = () => Promise<void>;
 
-type TestResult = { name: string; passed: boolean; detail: string };
-const results: TestResult[] = [];
+const tests: Array<{ name: string; run: AsyncTest }> = [];
 
-function assert(name: string, condition: boolean, detail = '') {
-  results.push({ name, passed: condition, detail });
-  console.log(`  ${condition ? '✓' : '✗'} ${name}`);
-  if (!condition) console.log(`    FAIL: ${detail}`);
+function test(name: string, run: AsyncTest): void {
+  tests.push({ name, run });
 }
 
-// ─── Shared fixtures ──────────────────────────────────────────────────────────
-
-const { store, provisioner } = createTSKServer();
-
-// Provision a real client
-const provResult = await provisioner.provision({ keyLength: 52, minTumblers: 2, maxTumblers: 4 });
-if (!provResult.ok || !provResult.tumblerMap) {
-  console.error('FATAL: provisioner failed:', provResult.error);
-  process.exit(1);
-}
-const map = provResult.tumblerMap;
-const clientId = map.clientId;
-const pairId = 'bpc_pair_test_001';
-
-// Identity map: pairId → clientId
-const identityMap = new Map<string, string>([[pairId, clientId]]);
-const identityBinding = {
-  resolve: async (pid: string) => identityMap.get(pid) ?? null,
-};
-
-// Build valid TSK headers from the authoritative counter state. Validation
-// advances HOTP counters, so reusing the originally provisioned map would
-// create a stale key and prevent later cases from reaching the branch they
-// actually assert.
-async function currentMap(): Promise<TumblerMap> {
-  const stored = await store.get(clientId);
-  if (!stored) throw new Error('shared TSK fixture disappeared');
-  return stored;
+function expect(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(message);
 }
 
-async function tskHeaders(nowMs = Date.now()): Promise<Record<string, string>> {
-  const key = generateKeyFromMap(await currentMap(), nowMs);
-  return {
-    'x-tsk-client-id': clientId,
-    'x-tsk-key': key,
-    'x-tsk-version': '1',
-  };
+function snapshot(
+  pairId: string,
+  scope: BPCAuthSnapshot['scope'] = 'read-write',
+): BPCAuthSnapshot {
+  return Object.freeze({
+    pairId,
+    scope,
+    mode: 'production' as const,
+    kind: 'legitimate' as const,
+    verifiedAt: Date.now(),
+  });
 }
 
-// Build a request object with both BPC and TSK headers (BPC headers are fake — verified by mock)
-async function makeReq(
-  extraHeaders: Record<string, string> = {},
-  nowMs = Date.now(),
-): Promise<TSKRequestData> {
-  return {
-    headers: {
-      'x-bpc-pair-id': pairId,
-      'x-bpc-signature': 'fake_sig',
-      'x-bpc-signed-data': 'fake_data',
-      ...await tskHeaders(nowMs),
-      ...extraHeaders,
-    },
-  };
+function bpcPass(pairId: string, scope: BPCAuthSnapshot['scope'] = 'read-write') {
+  return async (): Promise<BPCLikeResult> => ({
+    ok: true,
+    pairId,
+    snapshot: snapshot(pairId, scope),
+  });
 }
 
-// BPC mock stubs
-function bpcPass(pid = pairId): () => Promise<BPCLikeResult> {
-  return async () => ({ ok: true, pairId: pid });
-}
-function bpcFail(error = 'INVALID_SIGNATURE'): () => Promise<BPCLikeResult> {
-  return async () => ({ ok: false, error });
-}
-function bpcPassNoPairId(): () => Promise<BPCLikeResult> {
-  return async () => ({ ok: true }); // pairId absent
+interface Fixture {
+  pairId: string;
+  clientId: string;
+  key: string;
+  request: TSKRequestData;
+  store: MemoryTumblerStore;
+  identityBinding: UltraVerifyOptions['identityBinding'];
 }
 
-// ─── Test groups ──────────────────────────────────────────────────────────────
-
-const NOW = Date.now();
-
-// ── Group 1: Happy path ────────────────────────────────────────────────────────
-console.log('\n[1] Happy Path — BPC pass + TSK pass + identity match');
-{
-  const req = await makeReq({}, NOW);
-  const r = await verifyUltraRequest(req, bpcPass(), { tskStore: store, identityBinding });
-
-  assert('result.ok is true', r.ok, `Got ok=${r.ok}, error=${r.error}`);
-  assert('pairId returned', r.pairId === pairId, `Got: ${r.pairId}`);
-  assert('clientId returned', r.clientId === clientId, `Got: ${r.clientId}`);
-  assert("layers includes 'bpc' and 'tsk'",
-    r.layers.includes('bpc') && r.layers.includes('tsk'),
-    `Got: ${JSON.stringify(r.layers)}`);
-  assert('no error field on success', r.error === undefined, `Got error: ${r.error}`);
-}
-
-// ── Group 2: BPC layer failure ────────────────────────────────────────────────
-console.log('\n[2] BPC Layer Failure — TSK never called');
-{
-  const req = await makeReq();
-  const r = await verifyUltraRequest(req, bpcFail('SIGNATURE_INVALID'), { tskStore: store, identityBinding });
-
-  assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error starts with 'BPC:'", r.error?.startsWith('BPC:') ?? false, `Got: ${r.error}`);
-  assert("error includes the BPC error code", r.error?.includes('SIGNATURE_INVALID') ?? false, `Got: ${r.error}`);
-  assert("layers is empty (TSK not reached)", r.layers.length === 0, `Got: ${JSON.stringify(r.layers)}`);
-  assert('pairId absent when BPC fails', r.pairId === undefined, `Got: ${r.pairId}`);
-}
-
-// ── Group 3: TSK failure after BPC passes ────────────────────────────────────
-console.log('\n[3] TSK Layer Failure — BPC passes, TSK key is expired');
-{
-  // Build a deterministic, structurally valid map with known TOTP segments and
-  // one required HOTP segment. The stale key fails on time state, not randomness.
-  const expiredStore = new MemoryTumblerStore();
-  const expiredMap: TumblerMap = {
-    clientId: generateClientId(),
-    sharedSecret: generateSharedSecret(),
+async function fixture(): Promise<Fixture> {
+  const server = createTSKServer();
+  const provisioned = await server.provisioner.provision({
     keyLength: 64,
-    segments: [
-      { segmentId: generateSegmentId('id'),  position: [0, 12],  type: 'static' },
-      { segmentId: generateSegmentId('seg'), position: [12, 24], type: 'totp', windowSec: 30 },
-      { segmentId: generateSegmentId('seg'), position: [24, 36], type: 'totp', windowSec: 60 },
-      { segmentId: generateSegmentId('seg'), position: [36, 44], type: 'hotp', counter: 0 },
-      { segmentId: generateSegmentId('seg'), position: [44, 52], type: 'totp', windowSec: 30 },
-    ],
-    checksum: { position: [52, 64] },
-    createdAt: Date.now(),
-    version: '1',
-  };
-  await expiredStore.set(expiredMap.clientId, expiredMap);
-
-  // Generate a key 15 minutes in the past (900s >> ±1 window tolerance for 30s or 60s windows)
-  const staleKey = generateKeyFromMap(expiredMap, NOW - 15 * 60_000);
-  const req: TSKRequestData = {
-    headers: {
-      'x-tsk-client-id': expiredMap.clientId,
-      'x-tsk-key': staleKey,
-      'x-tsk-version': '1',
+    minTumblers: 2,
+    maxTumblers: 2,
+  });
+  if (!provisioned.ok || !provisioned.tumblerMap) throw new Error('TSK provisioning failed');
+  const map = provisioned.tumblerMap;
+  const pairId = `bpc_pair_${map.clientId}`;
+  const key = generateKeyFromMap(map);
+  return {
+    pairId,
+    clientId: map.clientId,
+    key,
+    request: {
+      headers: {
+        'x-tsk-client-id': map.clientId,
+        'x-tsk-key': key,
+        'x-tsk-version': '1',
+      },
+    },
+    store: server.store,
+    identityBinding: {
+      resolve: async candidate => candidate === pairId ? map.clientId : null,
     },
   };
-  const r = await verifyUltraRequest(req, bpcPass(), { tskStore: expiredStore, identityBinding });
-
-  assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error starts with 'TSK:'", r.error?.startsWith('TSK:') ?? false, `Got: ${r.error}`);
-  assert("pairId preserved from BPC", r.pairId === pairId, `Got: ${r.pairId}`);
-  assert("layers is ['bpc'] — BPC layer reached but TSK did not",
-    r.layers.length === 1 && r.layers[0] === 'bpc',
-    `Got: ${JSON.stringify(r.layers)}`);
 }
 
-// ── Group 4: TSK failure — missing TSK headers entirely ──────────────────────
-console.log('\n[4] TSK Headers Missing — request has BPC headers but no TSK layer');
-{
-  const req: TSKRequestData = {
-    headers: {
-      'x-bpc-pair-id': pairId,
-      'x-bpc-signature': 'fake',
-      // No TSK headers
+async function retrySameKey(f: Fixture): Promise<void> {
+  const retry = await verifyUltraRequest(
+    f.request,
+    bpcPass(f.pairId),
+    { tskStore: f.store, identityBinding: f.identityBinding },
+  );
+  expect(retry.ok, `same TSK key was not reusable: ${retry.error}`);
+}
+
+async function expectPreflightDenial(
+  expectedError: string,
+  bpc: (f: Fixture) => (req: TSKRequestData) => Promise<unknown>,
+  mutate?: (f: Fixture) => void,
+  options?: (f: Fixture) => Partial<UltraVerifyOptions>,
+): Promise<void> {
+  const f = await fixture();
+  mutate?.(f);
+  const override = options?.(f);
+  const denied = await verifyUltraRequest(
+    f.request,
+    bpc(f) as (req: TSKRequestData) => Promise<BPCLikeResult>,
+    {
+      tskStore: override?.tskStore ?? f.store,
+      tskConfig: override?.tskConfig,
+      bpcSnapshotMaxAgeMs: override?.bpcSnapshotMaxAgeMs,
+      identityBinding: override?.identityBinding ?? f.identityBinding,
     },
-  };
-  const r = await verifyUltraRequest(req, bpcPass(), { tskStore: store, identityBinding });
+  );
+  expect(!denied.ok, 'preflight unexpectedly succeeded');
+  expect(denied.error === expectedError, `expected ${expectedError}, got ${denied.error}`);
 
-  assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error starts with 'TSK:'", r.error?.startsWith('TSK:') ?? false, `Got: ${r.error}`);
-  assert("error includes HEADERS_MISSING",
-    r.error?.includes('HEADERS_MISSING') ?? false, `Got: ${r.error}`);
-  assert("layers is ['bpc']",
-    r.layers.length === 1 && r.layers[0] === 'bpc',
-    `Got: ${JSON.stringify(r.layers)}`);
+  // Restore the valid claimed identity without changing the TSK key.
+  f.request.headers['x-tsk-client-id'] = f.clientId;
+  await retrySameKey(f);
 }
 
-// ── Group 5: Identity binding mismatch ───────────────────────────────────────
-console.log('\n[5] Identity Binding Mismatch — BPC pairId maps to different clientId');
-{
-  // Provision a second client
-  const prov2 = await provisioner.provision();
-  const map2 = prov2.tumblerMap!;
-  const key2 = generateKeyFromMap(map2, NOW);
+test('accepts a frozen, closed-scope BPC AuthSnapshot and matching TSK identity', async () => {
+  const f = await fixture();
+  const result = await verifyUltraRequest(
+    f.request,
+    bpcPass(f.pairId, 'admin'),
+    { tskStore: f.store, identityBinding: f.identityBinding },
+  );
+  expect(result.ok, `composed verification failed: ${result.error}`);
+  expect(result.pairId === f.pairId, 'pair identity was not preserved');
+  expect(result.clientId === f.clientId, 'TSK identity was not preserved');
+  expect(result.scope === 'admin', 'closed BPC scope was not preserved');
+  expect(result.layers.join(',') === 'bpc,tsk', 'both layers were not recorded');
+});
 
-  // Request uses pairId→clientId1 binding, but TSK key is for clientId2
-  const req: TSKRequestData = {
-    headers: {
-      'x-tsk-client-id': map2.clientId, // legitimate key for client2
-      'x-tsk-key': key2,
-      'x-tsk-version': '1',
-    },
-  };
-  // BPC says pairId→clientId (client1), but TSK clientId is client2
-  const r = await verifyUltraRequest(req, bpcPass(pairId), { tskStore: store, identityBinding });
+test('rejects a null BPC result before TSK state consumption', async () => {
+  await expectPreflightDenial('BPC: VERIFICATION_FAILED', () => async () => null);
+});
 
-  assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error is IDENTITY_BINDING_MISMATCH",
-    r.error === 'IDENTITY_BINDING_MISMATCH', `Got: ${r.error}`);
-  assert("layers includes both bpc and tsk (both passed individually)",
-    r.layers.includes('bpc') && r.layers.includes('tsk'),
-    `Got: ${JSON.stringify(r.layers)}`);
+test('requires the BPC ok field to be boolean true', async () => {
+  await expectPreflightDenial(
+    'BPC: VERIFICATION_FAILED',
+    f => async () => ({ ok: 'true', pairId: f.pairId, snapshot: snapshot(f.pairId) }),
+  );
+});
+
+test('catches BPC verifier exceptions without reaching TSK', async () => {
+  await expectPreflightDenial('BPC: CALLBACK_EXCEPTION', () => async () => {
+    throw new Error('untrusted verifier failure');
+  });
+});
+
+test('preserves a bounded BPC denial code', async () => {
+  await expectPreflightDenial(
+    'BPC: signature_invalid',
+    () => async () => ({ ok: false, error: 'signature_invalid' }),
+  );
+});
+
+test('does not reflect an unbounded BPC error into the bridge result', async () => {
+  await expectPreflightDenial(
+    'BPC: VERIFICATION_FAILED',
+    () => async () => ({ ok: false, error: 'invalid\r\nforged-log-entry' }),
+  );
+});
+
+test('converts hostile BPC proxy inspection into a denial', async () => {
+  await expectPreflightDenial(
+    'BPC: INVALID_RESULT_OBJECT',
+    () => async () => new Proxy({ ok: true }, {
+      getOwnPropertyDescriptor: () => { throw new Error('hostile proxy'); },
+    }),
+  );
+});
+
+test('rejects a missing BPC pair ID before TSK', async () => {
+  await expectPreflightDenial(
+    'BPC: MISSING_OR_INVALID_PAIR_ID',
+    () => async () => ({ ok: true, snapshot: snapshot('unbound') }),
+  );
+});
+
+test('rejects malformed BPC pair identifiers', async () => {
+  await expectPreflightDenial(
+    'BPC: MISSING_OR_INVALID_PAIR_ID',
+    () => async () => ({ ok: true, pairId: '../other', snapshot: snapshot('../other') }),
+  );
+});
+
+test('requires the immutable AuthSnapshot', async () => {
+  await expectPreflightDenial(
+    'BPC: INVALID_AUTH_SNAPSHOT',
+    f => async () => ({ ok: true, pairId: f.pairId }),
+  );
+});
+
+test('rejects a mutable AuthSnapshot', async () => {
+  await expectPreflightDenial(
+    'BPC: INVALID_AUTH_SNAPSHOT',
+    f => async () => ({
+      ok: true,
+      pairId: f.pairId,
+      snapshot: {
+        pairId: f.pairId,
+        scope: 'read',
+        mode: 'production',
+        kind: 'legitimate',
+        verifiedAt: Date.now(),
+      },
+    }),
+  );
+});
+
+test('rejects disagreement between result and snapshot pair IDs', async () => {
+  await expectPreflightDenial(
+    'BPC: INVALID_AUTH_SNAPSHOT',
+    f => async () => ({ ok: true, pairId: f.pairId, snapshot: snapshot('other_pair') }),
+  );
+});
+
+test('rejects stale authorization snapshots before TSK', async () => {
+  await expectPreflightDenial(
+    'BPC: INVALID_AUTH_SNAPSHOT',
+    f => async () => ({
+      ok: true,
+      pairId: f.pairId,
+      snapshot: Object.freeze({
+        pairId: f.pairId,
+        scope: 'read',
+        mode: 'production',
+        kind: 'legitimate',
+        verifiedAt: Date.now() - 60_001,
+      }),
+    }),
+  );
+});
+
+test('rejects future-dated authorization snapshots before TSK', async () => {
+  await expectPreflightDenial(
+    'BPC: INVALID_AUTH_SNAPSHOT',
+    f => async () => ({
+      ok: true,
+      pairId: f.pairId,
+      snapshot: Object.freeze({
+        pairId: f.pairId,
+        scope: 'read',
+        mode: 'production',
+        kind: 'legitimate',
+        verifiedAt: Date.now() + 60_001,
+      }),
+    }),
+  );
+});
+
+test('rejects an unsafe snapshot-age configuration', async () => {
+  await expectPreflightDenial(
+    'BPC: INVALID_SNAPSHOT_MAX_AGE',
+    f => bpcPass(f.pairId),
+    undefined,
+    () => ({ bpcSnapshotMaxAgeMs: Number.POSITIVE_INFINITY }),
+  );
+});
+
+for (const scope of ['read:*', 'read:quotes', '*', 'owner']) {
+  test(`rejects non-closed BPC scope ${scope}`, async () => {
+    await expectPreflightDenial(
+      'BPC: INVALID_AUTH_SNAPSHOT',
+      f => async () => ({
+        ok: true,
+        pairId: f.pairId,
+        snapshot: Object.freeze({
+          pairId: f.pairId,
+          scope,
+          mode: 'production',
+          kind: 'legitimate',
+          verifiedAt: Date.now(),
+        }),
+      }),
+    );
+  });
 }
 
-// ── Group 6: Identity binding — pairId resolves to null (unknown pair) ───────
-console.log('\n[6] Identity Binding — pairId unknown (resolves to null)');
-{
-  const req = await makeReq({}, NOW);
-  const unknownPairId = 'bpc_pair_unknown_9999';
-  const r = await verifyUltraRequest(req, bpcPass(unknownPairId), { tskStore: store, identityBinding });
+test('rejects an unknown BPC mode', async () => {
+  await expectPreflightDenial(
+    'BPC: INVALID_AUTH_SNAPSHOT',
+    f => async () => ({
+      ok: true,
+      pairId: f.pairId,
+      snapshot: Object.freeze({
+        pairId: f.pairId,
+        scope: 'read',
+        mode: 'staging',
+        kind: 'legitimate',
+        verifiedAt: Date.now(),
+      }),
+    }),
+  );
+});
 
-  assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error is IDENTITY_BINDING_MISMATCH (null !== clientId)",
-    r.error === 'IDENTITY_BINDING_MISMATCH', `Got: ${r.error}`);
-}
+test('rejects ghost authorization evidence', async () => {
+  await expectPreflightDenial(
+    'BPC: INVALID_AUTH_SNAPSHOT',
+    f => async () => ({
+      ok: true,
+      pairId: f.pairId,
+      snapshot: Object.freeze({
+        pairId: f.pairId,
+        scope: 'read',
+        mode: 'production',
+        kind: 'ghost',
+        canaryClass: 'docs',
+        verifiedAt: Date.now(),
+      }),
+    }),
+  );
+});
 
-// ── Group 7: Identity binding unavailable — BPC returns no pairId ─────────────
-console.log('\n[7] Identity Binding Unavailable — BPC result missing pairId');
-{
-  const req = await makeReq({}, NOW);
-  const r = await verifyUltraRequest(req, bpcPassNoPairId(), { tskStore: store, identityBinding });
+test('hard-denies shadow verdicts', async () => {
+  await expectPreflightDenial(
+    'BPC: SHADOW_DENIED',
+    f => async () => ({
+      ok: true,
+      pairId: f.pairId,
+      snapshot: snapshot(f.pairId),
+      shadow: true,
+    }),
+  );
+});
 
-  assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error is IDENTITY_BINDING_UNAVAILABLE",
-    r.error === 'IDENTITY_BINDING_UNAVAILABLE', `Got: ${r.error}`);
-  assert("layers includes both (both layers validated individually)",
-    r.layers.includes('bpc') && r.layers.includes('tsk'),
-    `Got: ${JSON.stringify(r.layers)}`);
-}
+test('rejects legacy mutable pair objects even with a valid snapshot', async () => {
+  await expectPreflightDenial(
+    'BPC: LEGACY_MUTABLE_RESULT',
+    f => async () => ({
+      ok: true,
+      pairId: f.pairId,
+      snapshot: snapshot(f.pairId),
+      pair: { id: f.pairId, scope: 'admin' },
+    }),
+  );
+});
 
-// ── Group 8: Tampered TSK key — single character mutation ────────────────────
-console.log('\n[8] Tampered TSK Key — 1-char mutation at position 10');
-{
-  const validKey = generateKeyFromMap(await currentMap(), NOW);
-  const tampered = validKey.slice(0, 10) + (validKey[10] === 'A' ? 'Z' : 'A') + validKey.slice(11);
-  const req: TSKRequestData = {
-    headers: {
-      'x-tsk-client-id': clientId,
-      'x-tsk-key': tampered,
-      'x-tsk-version': '1',
-    },
-  };
-  const r = await verifyUltraRequest(req, bpcPass(), { tskStore: store, identityBinding });
+test('rejects legacy direct scope even with a valid snapshot', async () => {
+  await expectPreflightDenial(
+    'BPC: LEGACY_MUTABLE_RESULT',
+    f => async () => ({
+      ok: true,
+      pairId: f.pairId,
+      snapshot: snapshot(f.pairId),
+      scope: 'admin',
+    }),
+  );
+});
 
-  assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error starts with 'TSK:'", r.error?.startsWith('TSK:') ?? false, `Got: ${r.error}`);
-  assert("layers is ['bpc'] — TSK rejected",
-    r.layers.length === 1 && r.layers[0] === 'bpc',
-    `Got: ${JSON.stringify(r.layers)}`);
-}
+test('catches identity resolver exceptions before TSK', async () => {
+  await expectPreflightDenial(
+    'IDENTITY_BINDING_RESOLVER_EXCEPTION',
+    f => bpcPass(f.pairId),
+    undefined,
+    () => ({ identityBinding: { resolve: async () => { throw new Error('binding unavailable'); } } }),
+  );
+});
 
-// ── Group 9: Wrong TSK client ID — valid key for different client ─────────────
-console.log('\n[9] Wrong TSK Client ID — valid key but wrong clientId header');
-{
-  const req: TSKRequestData = {
-    headers: {
-      'x-tsk-client-id': 'tsk_nonexistent_client',
-      'x-tsk-key': generateKeyFromMap(await currentMap(), NOW),
-      'x-tsk-version': '1',
-    },
-  };
-  const r = await verifyUltraRequest(req, bpcPass(), { tskStore: store, identityBinding });
+test('rejects a missing identity binding before TSK', async () => {
+  await expectPreflightDenial(
+    'IDENTITY_BINDING_NOT_FOUND',
+    f => bpcPass(f.pairId),
+    undefined,
+    () => ({ identityBinding: { resolve: async () => null } }),
+  );
+});
 
-  assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error starts with 'TSK:'", r.error?.startsWith('TSK:') ?? false, `Got: ${r.error}`);
-  assert("error includes CLIENT_NOT_FOUND",
-    r.error?.includes('CLIENT_NOT_FOUND') ?? false, `Got: ${r.error}`);
-}
+test('rejects a claimed TSK client mismatch before store lookup', async () => {
+  await expectPreflightDenial(
+    'IDENTITY_BINDING_MISMATCH',
+    f => bpcPass(f.pairId),
+    f => { f.request.headers['x-tsk-client-id'] = 'tsk_other_client'; },
+  );
+});
 
-// ── Group 10: ULTRA_SECURITY_LAYERS contract ─────────────────────────────────
-console.log('\n[10] ULTRA_SECURITY_LAYERS Contract');
-{
-  assert('7 layers defined', ULTRA_SECURITY_LAYERS.length === 7,
-    `Got: ${ULTRA_SECURITY_LAYERS.length}`);
-  assert('layers 1-5 are BPC',
-    ULTRA_SECURITY_LAYERS.slice(0, 5).every(l => l.source === 'BPC'),
-    `Got sources: ${ULTRA_SECURITY_LAYERS.slice(0, 5).map(l => l.source)}`);
-  assert('layers 6-7 are TSK',
-    ULTRA_SECURITY_LAYERS.slice(5).every(l => l.source === 'TSK'),
-    `Got sources: ${ULTRA_SECURITY_LAYERS.slice(5).map(l => l.source)}`);
-  assert('layer IDs are 1-7 in order',
-    ULTRA_SECURITY_LAYERS.every((l, i) => l.id === i + 1),
-    `Got IDs: ${ULTRA_SECURITY_LAYERS.map(l => l.id)}`);
-  assert('Layer 7 describes atomic lifecycle enforcement',
-    ULTRA_SECURITY_LAYERS[6].property.toLowerCase().includes('atomic'),
-    `Got: ${ULTRA_SECURITY_LAYERS[6].property}`);
-}
+test('rejects duplicate TSK client headers before TSK', async () => {
+  await expectPreflightDenial(
+    'TSK: CLIENT_ID_MISSING_OR_AMBIGUOUS',
+    f => bpcPass(f.pairId),
+    f => { f.request.headers['x-tsk-client-id'] = [f.clientId, f.clientId]; },
+  );
+});
 
+test('rejects a missing TSK client header before TSK', async () => {
+  await expectPreflightDenial(
+    'TSK: CLIENT_ID_MISSING_OR_AMBIGUOUS',
+    f => bpcPass(f.pairId),
+    f => { delete f.request.headers['x-tsk-client-id']; },
+  );
+});
 
-// ── Group 11: HIGH-03 — BPC scope propagated to UltraVerifyResult ─────────────
-console.log('\n[11] BPC Scope Propagation (HIGH-03)');
-{
-  // Test 1: scope field set directly on BPCLikeResult
-  const bpcWithScope = async () => ({ ok: true, pairId, scope: 'read' });
-  const req11a: TSKRequestData = {
-    headers: {
-      'x-tsk-client-id': clientId,
-      'x-tsk-key': generateKeyFromMap(await currentMap(), NOW),
-      'x-tsk-version': '1',
-    },
-  };
-  const r11a = await verifyUltraRequest(req11a, bpcWithScope, { tskStore: store, identityBinding });
-  assert('scope=read propagated from bpcResult.scope', r11a.scope === 'read', `Got: ${r11a.scope}`);
+test('rejects duplicate TSK key headers without consuming state', async () => {
+  const f = await fixture();
+  f.request.headers['x-tsk-key'] = [f.key, f.key];
+  const denied = await verifyUltraRequest(
+    f.request,
+    bpcPass(f.pairId),
+    { tskStore: f.store, identityBinding: f.identityBinding },
+  );
+  expect(!denied.ok && denied.error === 'TSK: TSK_HEADERS_MISSING', `unexpected error: ${denied.error}`);
+  f.request.headers['x-tsk-key'] = f.key;
+  await retrySameKey(f);
+});
 
-  // Test 2: scope extracted from bpcResult.pair.scope
-  const bpcWithPair = async () => ({ ok: true, pairId, pair: { scope: 'read-write', id: pairId } });
-  const req11b: TSKRequestData = {
-    headers: {
-      'x-tsk-client-id': clientId,
-      'x-tsk-key': generateKeyFromMap(await currentMap(), NOW),
-      'x-tsk-version': '1',
-    },
-  };
-  const r11b = await verifyUltraRequest(req11b, bpcWithPair, { tskStore: store, identityBinding });
-  assert('scope=read-write extracted from bpcResult.pair.scope', r11b.scope === 'read-write', `Got: ${r11b.scope}`);
+test('rejects duplicate TSK version headers without consuming state', async () => {
+  const f = await fixture();
+  f.request.headers['x-tsk-version'] = ['1', '1'];
+  const denied = await verifyUltraRequest(
+    f.request,
+    bpcPass(f.pairId),
+    { tskStore: f.store, identityBinding: f.identityBinding },
+  );
+  expect(!denied.ok && denied.error === 'TSK: TSK_VERSION_MISSING', `unexpected error: ${denied.error}`);
+  f.request.headers['x-tsk-version'] = '1';
+  await retrySameKey(f);
+});
 
-  // Test 3: no scope — result.scope is undefined (not a failure, just not set)
-  const req11c: TSKRequestData = {
-    headers: {
-      'x-tsk-client-id': clientId,
-      'x-tsk-key': generateKeyFromMap(await currentMap(), NOW),
-      'x-tsk-version': '1',
-    },
-  };
-  const r11c = await verifyUltraRequest(req11c, bpcPass(), { tskStore: store, identityBinding });
-  assert('scope=undefined when BPC does not return scope', r11c.scope === undefined, `Got: ${r11c.scope}`);
+test('TSK key failure records only the completed BPC layer', async () => {
+  const f = await fixture();
+  f.request.headers['x-tsk-key'] = `${f.key.slice(0, -1)}${f.key.endsWith('A') ? 'B' : 'A'}`;
+  const result = await verifyUltraRequest(
+    f.request,
+    bpcPass(f.pairId),
+    { tskStore: f.store, identityBinding: f.identityBinding },
+  );
+  expect(!result.ok, 'tampered TSK key unexpectedly succeeded');
+  expect(result.error?.startsWith('TSK: ') === true, `unexpected error: ${result.error}`);
+  expect(result.layers.join(',') === 'bpc', 'TSK was incorrectly recorded as successful');
+});
 
-  // Test 4: scope field takes priority over pair.scope
-  const bpcBoth = async () => ({ ok: true, pairId, scope: 'admin', pair: { scope: 'read', id: pairId } });
-  const req11d: TSKRequestData = {
-    headers: {
-      'x-tsk-client-id': clientId,
-      'x-tsk-key': generateKeyFromMap(await currentMap(), NOW),
-      'x-tsk-version': '1',
-    },
-  };
-  const r11d = await verifyUltraRequest(req11d, bpcBoth, { tskStore: store, identityBinding });
-  assert('scope field takes priority over pair.scope', r11d.scope === 'admin', `Got: ${r11d.scope}`);
-}
-// ─── Results ──────────────────────────────────────────────────────────────────
+test('TSK store exceptions fail closed at the bridge boundary', async () => {
+  const f = await fixture();
+  const throwingStore = {
+    ...f.store,
+    get: async () => { throw new Error('authority unavailable'); },
+  } as unknown as MemoryTumblerStore;
+  const result = await verifyUltraRequest(
+    f.request,
+    bpcPass(f.pairId),
+    { tskStore: throwingStore, identityBinding: f.identityBinding },
+  );
+  expect(!result.ok && result.error === 'TSK: VERIFIER_EXCEPTION', `unexpected error: ${result.error}`);
+  await retrySameKey(f);
+});
 
-const passed = results.filter(r => r.passed).length;
-const total = results.length;
-const failed = results.filter(r => !r.passed);
+test('post-verification identity mismatch is a hard denial', async () => {
+  const base = await fixture();
+  const stored = await base.store.get(base.clientId);
+  if (!stored) throw new Error('fixture map missing');
 
-console.log('\n' + '─'.repeat(68));
-console.log(`Ultra Bridge Test Suite: ${passed}/${total} passed`);
+  const mismatchedMap: TumblerMap = { ...stored, clientId: 'tsk_authenticated_other' };
+  const mismatchStore = new MemoryTumblerStore();
+  await mismatchStore.set(base.clientId, mismatchedMap);
+  base.request.headers['x-tsk-key'] = generateKeyFromMap(mismatchedMap);
 
-if (failed.length > 0) {
-  console.log('\nFailed tests:');
-  for (const f of failed) {
-    console.log(`  ✗ ${f.name}`);
-    if (f.detail) console.log(`      ${f.detail}`);
+  const result = await verifyUltraRequest(
+    base.request,
+    bpcPass(base.pairId),
+    { tskStore: mismatchStore, identityBinding: base.identityBinding },
+  );
+  expect(!result.ok, 'postcheck mismatch unexpectedly succeeded');
+  expect(result.error === 'IDENTITY_BINDING_POSTCHECK_MISMATCH', `unexpected error: ${result.error}`);
+  expect(result.layers.join(',') === 'bpc,tsk', 'completed layers were not reported accurately');
+});
+
+test('security layer metadata remains bounded to seven stated properties', async () => {
+  expect(ULTRA_SECURITY_LAYERS.length === 7, 'security layer count changed');
+  expect(ULTRA_SECURITY_LAYERS.slice(0, 5).every(layer => layer.source === 'BPC'), 'BPC layer metadata changed');
+  expect(ULTRA_SECURITY_LAYERS.slice(5).every(layer => layer.source === 'TSK'), 'TSK layer metadata changed');
+  expect(
+    ULTRA_SECURITY_LAYERS.every((layer, index) => layer.id === index + 1),
+    'security layer IDs are not ordered',
+  );
+});
+
+let passed = 0;
+for (const candidate of tests) {
+  try {
+    await candidate.run();
+    passed++;
+    console.log(`  PASS ${candidate.name}`);
+  } catch (error) {
+    console.error(`  FAIL ${candidate.name}`);
+    console.error(error);
   }
-  process.exit(1);
-} else {
-  console.log('Named Ultra Bridge cases passed');
 }
+
+console.log(`Ultra bridge strict composition suite: ${passed}/${tests.length} passed`);
+if (passed !== tests.length) process.exit(1);

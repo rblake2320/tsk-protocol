@@ -15,12 +15,17 @@ The server retains authoritative counter and lifecycle state.
 - Wire v1 bounds every HOTP counter to `0..2,147,483,647`. The maximum is an
   exhausted persisted sentinel, lookahead never crosses it, and the segment
   closest to exhaustion drives a separate rotation warning.
+- Authentication headers must be single-valued; duplicate client, key, or
+  version headers are denied rather than resolved by adapter ordering.
 - Replacement requires a deployment-supplied authorizer and atomically creates
   the new credential while revoking the old one.
 - File-backed client storage persists counters across restarts with atomic file
   replacement.
-- The BPC bridge denies when independently verified BPC and TSK identities do
-  not resolve to the same principal.
+- The BPC bridge accepts only a fresh, runtime-frozen BPC 0.2 `AuthSnapshot`
+  with a closed scope (`read`, `read-write`, or `admin`). It resolves the BPC
+  pair before TSK verification, compares the claimed TSK identity before any
+  TSK counter or lifecycle commit, and confirms the authenticated TSK identity
+  again after verification.
 - HA envelopes are signed, hash-linked, ordered, and checked for freshness.
 - `FencedTumblerStore` makes shared writer leases mandatory at the store
   mutation boundary; `RedisFencingStore` provides an atomic cross-process
@@ -81,8 +86,14 @@ npm test
 npm run test:ha
 npm run test:redis
 npm run test:pack
+npm run test:bpc-compat
 npm audit
 ```
+
+`test:bpc-compat` rebuilds TSK and runs against a built BPC checkout at
+`../bpc-protocol` by default. Set `BPC_PROTOCOL_PATH` to test a different
+checkout. CI checks out the reviewed BPC commit recorded in the workflow rather
+than a floating branch.
 
 Current package version: `0.1.0` (beta reference implementation). Wire protocol
 version: `1`.
