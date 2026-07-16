@@ -6,7 +6,8 @@
   numeric HOTP boundary fix, preserving that counter hardening.
 - Replaced mutable BPC `pair` and direct-scope fallbacks with the runtime-frozen
   BPC 0.2 `AuthSnapshot` contract pinned at BPC commit
-  `005c461dbacfc079f3a559110e6fb5486fcfd200`.
+  `ad6516698f3bb85a3517577f647cf46901205fd1`. That merged master commit also
+  contains BPC's merged standalone Redis fail-closed replay store.
 - Added fail-closed runtime checks for hostile result objects, stale or
   future-dated snapshots, malformed pair/client IDs, unknown modes,
   ghost/shadow evidence, wildcard/namespaced scopes, resolver failures, and

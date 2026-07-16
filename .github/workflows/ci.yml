@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: rblake2320/bpc-protocol
-          ref: 005c461dbacfc079f3a559110e6fb5486fcfd200
+          ref: ad6516698f3bb85a3517577f647cf46901205fd1
           path: .compat/bpc-protocol
       - run: npm ci --prefix .compat/bpc-protocol
       - run: npm run build --prefix .compat/bpc-protocol
