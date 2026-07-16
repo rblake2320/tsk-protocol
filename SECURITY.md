@@ -21,6 +21,7 @@ not a public issue.
 | HA replication | `npm run test:ha` | Signed ordered streams fail closed on gaps; metadata-only replicas and volatile checkpoints cannot qualify for promotion. |
 | Writer fencing | `failover-promotion-suite.mts`, `redis-fencing-integration.mts` | Every authority must use `FencedTumblerStore`; Redis durability/topology remains deployment-specific. |
 | Cross-protocol identity and scope | `ultra-bridge-test.mts`, `bpc-compatibility-suite.mts` | Requires a fresh, frozen BPC 0.2 `AuthSnapshot`; rejects legacy mutable results, ghost/shadow evidence, non-closed scopes, malformed identifiers, resolver failures, and claimed-identity mismatches before TSK state consumption. Application authorization remains separate. CI tests the exact BPC commit pinned in the workflow. |
+| Bridge dependency failure | `ultra-bridge-test.mts` | BPC callback, identity resolver, and TSK verifier/store exceptions return explicit denials; durable store recovery and availability remain deployment responsibilities. |
 | Package entry integrity | `package-boundary-suite.mts`, `npm run test:pack` | Verifies declared local entry points and dry-run tarball contents; it does not establish registry provenance or consumer deployment policy. |
 
 Passing finite tests establishes only the named propositions and inputs. It does

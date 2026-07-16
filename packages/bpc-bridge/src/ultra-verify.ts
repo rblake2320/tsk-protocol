@@ -220,7 +220,17 @@ export async function verifyUltraRequest(
     };
   }
 
-  const tskResult: TSKVerifyResult = await verifyTSKRequest(req, options.tskStore, options.tskConfig);
+  let tskResult: TSKVerifyResult;
+  try {
+    tskResult = await verifyTSKRequest(req, options.tskStore, options.tskConfig);
+  } catch {
+    return {
+      ok: false,
+      pairId,
+      error: 'TSK: VERIFIER_EXCEPTION',
+      layers: ['bpc'],
+    };
+  }
   if (!tskResult.ok) {
     return {
       ok: false,

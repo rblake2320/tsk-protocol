@@ -14,6 +14,8 @@
 - Closed an adjacent header-ambiguity path: duplicate TSK key and version
   values are now denied instead of accepting the first adapter-provided value,
   with same-key retry evidence that denial does not consume state.
+- Converted TSK store/verifier exceptions to an explicit composed denial and
+  proved the original key remains valid after a pre-read store failure.
 - Moved identity resolution and the claimed-client comparison before TSK
   verification. Every preflight denial test retries the same TSK key and must
   succeed, proving HOTP and lifecycle state were not consumed.
@@ -21,7 +23,7 @@
   the real frozen BPC snapshot, verifies success/replay audit event semantics,
   and verifies the BPC audit hash chain. BPC audit is documented as BPC-stage
   evidence only, not proof of a final Ultra or application decision.
-- Verification: build and typecheck passed; 180/180 maintained protocol,
+- Verification: build and typecheck passed; 181/181 maintained protocol,
   lifecycle, client, store, anomaly, adversarial, bridge, and runtime assertions
   passed; 26/26 HA assertions passed; 22/22 real BPC/TSK compatibility
   assertions passed; 6/6 digest-pinned live Redis fencing assertions passed;

@@ -23,6 +23,8 @@
   same-key reuse after every preflight denial.
 - Rejected duplicate TSK client, key, and version headers instead of accepting
   the first adapter-provided value; duplicate rejection does not consume state.
+- Converted TSK store/verifier exceptions into an explicit bridge denial rather
+  than leaving fail-closed behavior to an HTTP adapter.
 - Added a cross-repository compatibility gate that builds a commit-pinned BPC
   checkout and exercises real BPC signing, verification, replay rejection,
   frozen-snapshot propagation, TSK identity binding, and stage-correct BPC audit

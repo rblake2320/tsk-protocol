@@ -438,6 +438,21 @@ test('TSK key failure records only the completed BPC layer', async () => {
   expect(result.layers.join(',') === 'bpc', 'TSK was incorrectly recorded as successful');
 });
 
+test('TSK store exceptions fail closed at the bridge boundary', async () => {
+  const f = await fixture();
+  const throwingStore = {
+    ...f.store,
+    get: async () => { throw new Error('authority unavailable'); },
+  } as unknown as MemoryTumblerStore;
+  const result = await verifyUltraRequest(
+    f.request,
+    bpcPass(f.pairId),
+    { tskStore: throwingStore, identityBinding: f.identityBinding },
+  );
+  expect(!result.ok && result.error === 'TSK: VERIFIER_EXCEPTION', `unexpected error: ${result.error}`);
+  await retrySameKey(f);
+});
+
 test('post-verification identity mismatch is a hard denial', async () => {
   const base = await fixture();
   const stored = await base.store.get(base.clientId);
