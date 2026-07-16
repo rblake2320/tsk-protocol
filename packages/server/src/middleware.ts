@@ -174,6 +174,8 @@ export async function verifyTSKRequest(
 
 function getHeader(req: TSKRequestData, name: string): string | undefined {
   const val = req.headers[name];
-  if (Array.isArray(val)) return val[0];
-  return val;
+  if (typeof val === 'string') return val;
+  if (Array.isArray(val) && val.length === 1 && typeof val[0] === 'string') return val[0];
+  // Multiple wire values are ambiguous across HTTP adapters and proxies.
+  return undefined;
 }

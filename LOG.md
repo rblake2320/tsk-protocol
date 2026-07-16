@@ -1,5 +1,35 @@
 # Change Log
 
+## 2026-07-15 - Strict BPC/TSK composition closure
+
+- Rebased the coordinated BPC/TSK bridge work onto TSK `master` after the
+  numeric HOTP boundary fix, preserving that counter hardening.
+- Replaced mutable BPC `pair` and direct-scope fallbacks with the runtime-frozen
+  BPC 0.2 `AuthSnapshot` contract pinned at BPC commit
+  `005c461dbacfc079f3a559110e6fb5486fcfd200`.
+- Added fail-closed runtime checks for hostile result objects, stale or
+  future-dated snapshots, malformed pair/client IDs, unknown modes,
+  ghost/shadow evidence, wildcard/namespaced scopes, resolver failures, and
+  duplicate or mismatched TSK client headers.
+- Closed an adjacent header-ambiguity path: duplicate TSK key and version
+  values are now denied instead of accepting the first adapter-provided value,
+  with same-key retry evidence that denial does not consume state.
+- Moved identity resolution and the claimed-client comparison before TSK
+  verification. Every preflight denial test retries the same TSK key and must
+  succeed, proving HOTP and lifecycle state were not consumed.
+- The cross-repository suite now imports built TSK package entry points, checks
+  the real frozen BPC snapshot, verifies success/replay audit event semantics,
+  and verifies the BPC audit hash chain. BPC audit is documented as BPC-stage
+  evidence only, not proof of a final Ultra or application decision.
+- Verification: build and typecheck passed; 180/180 maintained protocol,
+  lifecycle, client, store, anomaly, adversarial, bridge, and runtime assertions
+  passed; 26/26 HA assertions passed; 22/22 real BPC/TSK compatibility
+  assertions passed; 6/6 digest-pinned live Redis fencing assertions passed;
+  4/4 package boundaries and workspace dry runs passed; `npm audit` reported
+  zero known vulnerabilities.
+- Rollback: revert the dedicated strict-composition commit. Do not restore
+  mutable BPC result fallbacks or move identity resolution after TSK validation.
+
 ## 2026-07-15 - Numeric HOTP boundary hardening
 
 - Re-audited closed issue #1 and confirmed its stated `maxRequests` lifecycle
@@ -18,6 +48,28 @@
   only client or server enforcement because their counter contracts must match.
 
 ## 2026-07-15
+
+- Re-audited closed BPC issue #1 rather than assuming its earlier closure meant
+  every shipped surface enforced the decision. BPC TypeScript rejected
+  wildcard scopes, but BPC Python accepted arbitrary scope strings at intake.
+  The companion BPC correction was independently tested and merged as BPC PR
+  #5 at `d306aadeb33141fffffafacf28781a41c1e92664`.
+- Found that the generic TSK BPC bridge also trusted any scope supplied by an
+  `ok: true` BPC-like verifier. The bridge now accepts only `read`,
+  `read-write`, or `admin`, rejects missing or contradictory scope evidence,
+  and fails before TSK validation so malformed BPC results cannot consume TSK
+  counter state.
+- Added a real package compatibility suite and a CI checkout pinned to the BPC
+  merge commit. The suite builds BPC and checks version alignment, wildcard
+  rejection, BPC signing and verification, replay ordering, closed-scope
+  propagation, TSK identity binding, and TSK state preservation after a BPC
+  denial.
+- Verification after the companion changes: build and typecheck passed;
+  176/176 maintained protocol, lifecycle, client, store, anomaly, adversarial,
+  bridge, and runtime assertions passed; 25/25 HA assertions passed; 10/10 real
+  BPC/TSK package compatibility assertions passed; 6/6 live Redis fencing
+  assertions passed; 4/4 package boundaries passed; 33/33 live browser/backend
+  assertions passed; `npm audit` reported zero known vulnerabilities.
 
 - Post-merge review confirmed PR #2 was already merged at `0d22a93` with both
   hosted checks green; the earlier draft/open status was stale.

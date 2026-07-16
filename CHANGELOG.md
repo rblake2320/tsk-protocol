@@ -14,6 +14,19 @@
 - Replaced wildcard internal package dependencies with the tested `0.1.x`
   range, aligned the BPC bridge peer with BPC `0.2.x`, and declared Node 24 on
   every publishable workspace.
+- Enforced the immutable BPC 0.2 `AuthSnapshot` contract at the BPC/TSK
+  composition boundary. Mutable legacy results, stale snapshots, malformed
+  identities, ghost/shadow evidence, resolver failures, and non-closed scopes
+  are denied before TSK can consume counter or lifecycle state.
+- Moved BPC-to-TSK identity resolution and claimed-header comparison ahead of
+  TSK verification, retained an authenticated-identity postcheck, and proved
+  same-key reuse after every preflight denial.
+- Rejected duplicate TSK client, key, and version headers instead of accepting
+  the first adapter-provided value; duplicate rejection does not consume state.
+- Added a cross-repository compatibility gate that builds a commit-pinned BPC
+  checkout and exercises real BPC signing, verification, replay rejection,
+  frozen-snapshot propagation, TSK identity binding, and stage-correct BPC audit
+  events through built package entry points.
 - Made client lifecycle evidence counts deterministic while still asserting
   every generated counter-based segment.
 
