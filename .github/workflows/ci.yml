@@ -31,6 +31,7 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       # HA outbox contract vitest (declared local dependency, not an npx fetch).
+      - run: npm run typecheck:contract -w packages/server
       - run: npm run test:ha-contract -w packages/server
       - run: npm run test:ha
       - run: npm run test:redis
