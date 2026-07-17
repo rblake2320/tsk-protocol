@@ -8,6 +8,7 @@ export * from './replicating-tumbler-store.js';
 export * from './replica-receiver.js';
 export * from './promotion.js';
 export * from './redis-fencing-store.js';
+export * from './ha-outbox-contract.js';
 
 import { MemoryTumblerStore } from './store.js';
 import { TSKProvisioner } from './provisioner.js';
