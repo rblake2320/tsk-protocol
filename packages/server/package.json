@@ -19,7 +19,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepack": "npm run build --prefix ../.."
+    "prepack": "npm run build --prefix ../..",
+    "test:ha-contract": "vitest run tests/ha-outbox-contract.test.ts"
   },
   "dependencies": {
     "@tsk/core": "^0.1.0",
@@ -27,6 +28,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.10"
   }
 }
