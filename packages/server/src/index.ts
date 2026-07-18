@@ -88,12 +88,17 @@ export {
   verifyLeaseGrant,
   readSourceLease,
   assertSourceLeaseWritable,
+  computeSourceStateDigest,
+  signSourceFrozenReceipt,
+  verifySourceFrozenReceipt,
+  emitSourceFrozenReceipt,
   SourceFenceQuarantineError,
 } from './tsk-source-fence.js';
 export type {
   LeaseGrant,
   BareLeaseGrant,
   LeaseState as SourceLeaseState,
+  SourceFrozenReceipt,
 } from './tsk-source-fence.js';
 export type {
   GuardKeyResolver,

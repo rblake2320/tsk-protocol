@@ -270,3 +270,73 @@ export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: Guar
   if (nowMs >= st.leaseExpiresAtMs - skew) throw new SourceFenceQuarantineError('source lease deadline elapsed on A clock (+skew) — fail closed');
   return st;
 }
+
+// ── SourceFrozenReceipt (§1) — attest the frozen N after the revoke commits ──
+
+/** Source-signed attestation of the frozen source authority at the fence. `N` is provable ONLY
+ *  after the A-PG revoke commits (this reads a REVOKED lease + the committed source head). */
+export interface SourceFrozenReceipt {
+  streamId: string; commandId: string; epoch: number; n: number;
+  signedHeadDigestAtN: string; sourceStateDigestAtN: string; sourceNodeId: string;
+  receiptDigest: string; sourceKeyId: string; sourceSignature: string;
+}
+type BareFrozenReceipt = Omit<SourceFrozenReceipt, 'receiptDigest' | 'sourceKeyId' | 'sourceSignature'>;
+function frozenReceiptMsg(b: BareFrozenReceipt, digest: string): Buffer {
+  return frame('tsk_source_frozen/v1', b.streamId, b.commandId, b.epoch, b.n, b.signedHeadDigestAtN, b.sourceStateDigestAtN, b.sourceNodeId, digest);
+}
+
+/** Canonical digest of the state-at-`N`: the sorted (tumblerId → latest HOTP counter at seq ≤ N)
+ *  map from the committed source ledger. Deterministic + independently recomputable by B via replay. */
+export async function computeSourceStateDigest(exec: PgExecutor, streamId: string, n: number): Promise<string> {
+  const s = vId(streamId, STREAM_ID_RE, 'streamId');
+  const N = vInt(n, 'n', 0, MAX_SEQ);
+  const rows = (await exec.query('SELECT DISTINCT ON (tumbler_id) tumbler_id, hotp_counter FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence <= $2 ORDER BY tumbler_id, sequence DESC', [s, N])).rows;
+  const parts: (string | number)[] = ['tsk_source_state/v1', s, N, rows.length];
+  for (const r of rows) parts.push(String(r.tumbler_id), vInt(r.hotp_counter, 'hotp_counter', 1, 2 ** 31 - 1));
+  return sha256hex(frame(...parts));
+}
+
+/** CONTROL/SOURCE issuer: sign a frozen receipt over the exact canonical tuple (source custody). */
+export function signSourceFrozenReceipt(sourceKeyId: string, sourceSecret: Buffer | string, b: BareFrozenReceipt): SourceFrozenReceipt {
+  if (!KEY_ID_RE.test(sourceKeyId)) throw new ContractValidationError('invalid source keyId');
+  vId(b.streamId, STREAM_ID_RE, 'streamId'); vId(b.commandId, ID_RE, 'commandId'); vId(b.sourceNodeId, ID_RE, 'sourceNodeId');
+  vInt(b.epoch, 'epoch', 0, MAX_EPOCH); vInt(b.n, 'n', 0, MAX_SEQ);
+  if (!DIGEST_RE.test(b.signedHeadDigestAtN)) throw new ContractValidationError('invalid signedHeadDigestAtN');
+  if (!DIGEST_RE.test(b.sourceStateDigestAtN)) throw new ContractValidationError('invalid sourceStateDigestAtN');
+  const receiptDigest = sha256hex(frozenReceiptMsg(b, ''));
+  const sourceSignature = createHmac('sha256', toSecret(sourceSecret)).update(withKey(sourceKeyId, frozenReceiptMsg(b, receiptDigest))).digest().toString('base64url');
+  return { ...b, receiptDigest, sourceKeyId, sourceSignature };
+}
+
+/** Verify a frozen receipt's digest + source signature (the resolver holds the source key). */
+export function verifySourceFrozenReceipt(resolver: GuardKeyResolver, r: SourceFrozenReceipt): void {
+  const bare: BareFrozenReceipt = { streamId: r.streamId, commandId: r.commandId, epoch: r.epoch, n: r.n, signedHeadDigestAtN: r.signedHeadDigestAtN, sourceStateDigestAtN: r.sourceStateDigestAtN, sourceNodeId: r.sourceNodeId };
+  if (sha256hex(frozenReceiptMsg(bare, '')) !== r.receiptDigest) throw new ContractValidationError('frozen receipt digest mismatch');
+  verifyGuard(resolver, r.sourceKeyId, frozenReceiptMsg(bare, r.receiptDigest), r.sourceSignature);
+}
+
+/**
+ * Emit a SourceFrozenReceipt AFTER the A-PG revoke has committed. Asserts the lease is REVOKED at
+ * `epoch` (the freeze is proven, not merely control-clock expiry), reads the committed final source
+ * head `N` + `signedHeadDigest@N` from the source checkpoint, computes `sourceStateDigest@N`, and
+ * source-signs the receipt. Fails closed if the lease is not revoked at `epoch`.
+ */
+export async function emitSourceFrozenReceipt(exec: PgExecutor, resolver: GuardKeyResolver, sourceKeyId: string, sourceSecret: Buffer | string, input: { streamId: string; commandId: string; epoch: number; sourceNodeId: string }): Promise<SourceFrozenReceipt> {
+  const s = vId(input.streamId, STREAM_ID_RE, 'streamId');
+  const commandId = vId(input.commandId, ID_RE, 'commandId');
+  const epoch = vInt(input.epoch, 'epoch', 0, MAX_EPOCH);
+  const sourceNodeId = vId(input.sourceNodeId, ID_RE, 'sourceNodeId');
+  const lease = await readSourceLease(exec, resolver, s);
+  if (!lease) throw new SourceFenceQuarantineError('cannot freeze: no source lease');
+  if (lease.leaseEpoch !== epoch) throw new SourceFenceQuarantineError(`cannot freeze: lease epoch ${lease.leaseEpoch} != ${epoch}`);
+  if (lease.leaseStatus !== 'revoked') throw new SourceFenceQuarantineError('cannot freeze: lease is not revoked — N is not provably frozen');
+  const cp = (await exec.query('SELECT sequence, head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
+  if (!cp) throw new SourceFenceQuarantineError('cannot freeze: no source checkpoint');
+  const n = vInt(cp.sequence, 'source sequence', 0, MAX_SEQ);
+  const headDigest = String(cp.head_digest || '') || GENESIS_HEAD_ZERO;
+  if (!DIGEST_RE.test(headDigest)) throw new ContractValidationError('invalid source head_digest at freeze');
+  const sourceStateDigestAtN = await computeSourceStateDigest(exec, s, n);
+  return signSourceFrozenReceipt(sourceKeyId, sourceSecret, { streamId: s, commandId, epoch, n, signedHeadDigestAtN: headDigest, sourceStateDigestAtN, sourceNodeId });
+}
+
+const GENESIS_HEAD_ZERO = '0'.repeat(64);

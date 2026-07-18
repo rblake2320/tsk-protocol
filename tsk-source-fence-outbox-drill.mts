@@ -16,6 +16,7 @@ import {
   TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, provisionSchemaVersion,
   PgTskDurableOutbox, NodePostgresTransactor, ContractValidationError,
   signLeaseGrant, installLeaseGrant, SourceFenceQuarantineError,
+  emitSourceFrozenReceipt, verifySourceFrozenReceipt, computeSourceStateDigest,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation,
   type TskHotpMutation, type GuardKeyResolver, type BareLeaseGrant,
 } from './packages/server/dist/index.js';
@@ -25,7 +26,9 @@ if (!URL) throw new Error('TSK_TEST_SOURCE_PG_URL (source PG16) is required');
 const SCHEMA = 'public';
 const GUARD_KEY = 'guard-1';
 const guardSecret = Buffer.alloc(32, 0x2b);
-const resolver: GuardKeyResolver = { resolve: (kid) => (kid === GUARD_KEY ? guardSecret : null) };
+const SOURCE_KEY = 'source-1'; // independent custody from the guard
+const sourceSecret = Buffer.alloc(32, 0x5c);
+const resolver: GuardKeyResolver = { resolve: (kid) => (kid === GUARD_KEY ? guardSecret : kid === SOURCE_KEY ? sourceSecret : null) };
 const HOUR = 3_600_000;
 
 const { privateKey } = generateKeyPairSync('ed25519');
@@ -94,6 +97,27 @@ async function main() {
     const ob = mkOutbox(sid, 150); // signer stalls 150ms > 40ms deadline
     await assert.rejects(() => append(ob, sid, 0n, 1), /deadline elapsed/);
     assert.equal(await seqOf(sid), 0, 'the stalled append was rolled back by the pre-commit re-check');
+  });
+
+  await check('SourceFrozenReceipt: emit after revoke binds N + head + state digest; verify; rejects if not revoked / wrong epoch', async () => {
+    const sid = 'tsk:ob:frozen/v1'; await provision(sid); const g = await lease(sid, {});
+    const ob = mkOutbox(sid);
+    await append(ob, sid, 0n, 5); await append(ob, sid, 0n, 6); await append(ob, sid, 0n, 7); // N=3
+    // not-revoked → cannot freeze
+    await assert.rejects(() => serial.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 0, sourceNodeId: 'A' })), /not revoked/);
+    // revoke, then freeze
+    const rev = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'revoked', holderNodeId: 'A', leaseId: 'l1', commandId: cid('revoke', sid), leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 2, prevGrantDigest: g.grantDigest });
+    await serial.transaction((exec) => installLeaseGrant(exec, resolver, rev));
+    const receipt = await serial.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 0, sourceNodeId: 'A' }));
+    assert.equal(receipt.n, 3);
+    const cpHead = String((await pool.query('SELECT head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1', [sid])).rows[0].head_digest);
+    assert.equal(receipt.signedHeadDigestAtN, cpHead, 'receipt binds the committed head@N');
+    const stateAtN = await serial.transaction((exec) => computeSourceStateDigest(exec, sid, 3));
+    assert.equal(receipt.sourceStateDigestAtN, stateAtN, 'receipt binds the sorted state@N');
+    verifySourceFrozenReceipt(resolver, receipt); // source signature verifies
+    assert.throws(() => verifySourceFrozenReceipt(resolver, { ...receipt, n: 2 }), /digest mismatch/); // tampered N
+    // wrong epoch → cannot freeze
+    await assert.rejects(() => serial.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 1, sourceNodeId: 'A' })), /lease epoch/);
   });
 
   console.log(`\n# ${passed} PR2b-0 non-bypassable source-gate outbox checks passed`);
