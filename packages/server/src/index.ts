@@ -63,6 +63,19 @@ export {
   TSK_TRANSPORT_NONCE_SCHEMA,
   createHttpOutboxReceiver,
 } from './http-outbox-transport.js';
+export {
+  HA_CONTROL_PG_SCHEMA,
+  HA_CONTROL_TABLES,
+  HaControlFencing,
+  GuardSigner,
+  verifyGuard,
+} from './ha-control-fencing.js';
+export type {
+  GuardKeyResolver,
+  ProvisioningState,
+  LeaseState,
+  WitnessState,
+} from './ha-control-fencing.js';
 export type {
   ReplayNonceStore,
   FetchLike,

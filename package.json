@@ -16,6 +16,7 @@
     "test:redis": "npx tsx redis-fencing-integration.mts",
     "test:postgres:ha": "npm run build -w packages/server && npx tsx tsk-hotp-outbox-integration.mts",
     "test:pg-partition": "npm run build -w packages/server && npx tsx tsk-pg-partition-drill.mts",
+    "test:ha-fencing": "npm run build -w packages/server && npx tsx tsk-ha-fencing-drill.mts",
     "test:two-node": "npm run build -w packages/server && npx tsx tsk-two-node-drill.mts",
     "test:pack": "npm run build && npx tsx package-boundary-suite.mts && npm pack --dry-run --workspaces",
     "test:bpc-compat": "npm run build && npx tsx bpc-compatibility-suite.mts",
