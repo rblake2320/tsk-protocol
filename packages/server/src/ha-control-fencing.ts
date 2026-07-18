@@ -313,13 +313,31 @@ async function assertSerializable(exec: PgExecutor): Promise<void> {
 }
 async function pinSchema(exec: PgExecutor, schema: string): Promise<void> {
   if (!SCHEMA_RE.test(schema)) throw new ContractValidationError(`invalid schema identifier: ${schema}`);
-  await exec.query('SELECT set_config($1, $2, true)', ['search_path', schema]);
+  // (R9-HIGH1) list pg_temp EXPLICITLY LAST so a temp table cannot shadow the unqualified authority
+  // tables (PG otherwise searches pg_temp FIRST for relations). pg_catalog is pinned before the
+  // schema so catalog functions cannot be shadowed either.
+  await exec.query('SELECT set_config($1, $2, true)', ['search_path', `${schema}, pg_catalog, pg_temp`]);
   const cur = (await exec.query('SELECT current_schema() AS s')).rows[0]?.s;
   if (cur !== schema) throw new ContractValidationError(`schema context mismatch: current_schema=${String(cur)} pinned=${schema}`);
+}
+/** (R9-HIGH1) Assert every governed table resolves (UNQUALIFIED, as the authority SQL sees it) to
+ *  a relation in the configured schema — never a pg_temp shadow. */
+async function assertNoShadow(exec: PgExecutor, schema: string): Promise<void> {
+  const rows = (await exec.query(
+    `SELECT t.name, n.nspname
+     FROM unnest($1::text[]) AS t(name)
+     LEFT JOIN pg_class c ON c.oid = to_regclass(t.name)
+     LEFT JOIN pg_namespace n ON n.oid = c.relnamespace`, [[...HA_CONTROL_TABLES]])).rows;
+  for (const r of rows) {
+    if (r.nspname !== schema) {
+      throw new ContractValidationError(`governed table ${String(r.name)} resolves to '${String(r.nspname)}' not '${schema}' — possible pg_temp shadow; quarantine`);
+    }
+  }
 }
 async function enterCriticalTx(exec: PgExecutor, schema: string): Promise<void> {
   await assertSerializable(exec);
   await pinSchema(exec, schema);
+  await assertNoShadow(exec, schema);
 }
 
 // ── schema attestation + unforgeable readiness capability (H3) ───────────────
@@ -548,8 +566,10 @@ export class HaControlFencing {
         // concurrent ALTER/DROP (ACCESS EXCLUSIVE) until commit, closing the attest→mutate TOCTOU.
         await exec.query(`LOCK TABLE ${GOVERNED_LOCK_LIST} IN ACCESS SHARE MODE`);
         await attestControlSchema(exec);    // live catalog === compiled pinned digest (now frozen)
-        await revalidateAuthorityRow(exec); // singleton version + catalog_manifest authority stamp
       }
+      // (R9-HIGH2) the singleton authority-stamp check runs on EVERY op — the attestEveryTx opt-out
+      // only assumes no DDL, but a DML mutation of version/catalog_manifest must still fail closed.
+      await revalidateAuthorityRow(exec);
       await exec.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [sid]);
       return fn(exec);
     });

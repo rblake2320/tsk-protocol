@@ -152,21 +152,48 @@ async function main() {
     await pool.query('ALTER TABLE tsk_ha_provisioning DROP COLUMN drift2');
     assert.equal((await ctl.provision('tsk:drift/v1', 'g-drift')).state, 'provisioned'); // clean again -> succeeds
   });
-  await check('R8-HIGH: governed-table ACCESS SHARE blocks a concurrent ALTER (attest->use is atomic, no intra-tx DDL TOCTOU)', async () => {
-    const holder = await pool.connect();
-    await holder.query('BEGIN');
-    await holder.query('SELECT set_config($1,$2,true)', ['search_path', 'public']);
-    await holder.query(`LOCK TABLE ${HA_CONTROL_TABLES.join(', ')} IN ACCESS SHARE MODE`); // same lock criticalTx takes
-    const altering = pool.query('ALTER TABLE tsk_ha_lease_head ADD COLUMN r8drift int').catch(() => {}); // will block on ACCESS EXCLUSIVE
-    let blocked = false;
-    for (let i = 0; i < 100 && !blocked; i++) {
-      blocked = Number((await pool.query("SELECT count(*)::int AS n FROM pg_locks WHERE mode='AccessExclusiveLock' AND NOT granted AND relation IS NOT NULL")).rows[0].n) >= 1;
-      if (!blocked) await new Promise((r) => setTimeout(r, 20));
+  await check('R9-HIGH1: pg_temp cannot shadow governed tables (pg_temp-last search_path keeps resolution in schema)', async () => {
+    const c = new pg.Client({ connectionString: PG_URL });
+    await c.connect();
+    const nsp = async () => (await c.query("SELECT n.nspname FROM pg_class cl JOIN pg_namespace n ON n.oid=cl.relnamespace WHERE cl.oid=to_regclass('tsk_ha_lease_head')")).rows[0].nspname as string;
+    try {
+      await c.query('CREATE TEMP TABLE tsk_ha_lease_head (x int)'); // attacker temp shadow of an authority table
+      assert.ok((await nsp()).startsWith('pg_temp'), 'baseline: the default search_path (pg_temp implicit first) resolves the temp shadow');
+      // the FIX, exactly as pinSchema applies it: set_config LOCAL to pg_temp-last INSIDE a tx
+      await c.query('BEGIN');
+      await c.query("SELECT set_config('search_path','public, pg_catalog, pg_temp', true)");
+      const fixed = await nsp();
+      await c.query('COMMIT');
+      assert.equal(fixed, 'public', 'fixed: pg_temp-last search_path resolves the real public authority table');
+    } finally { await c.end(); } // ends the session -> the temp shadow is gone, pool untouched
+  });
+  await check('R9-MED: the REAL criticalTx holds ACCESS SHARE — a concurrent ALTER on a governed table is blocked by its backend (exact relation + pg_blocking_pids)', async () => {
+    const S = 'tsk:r9lock/v1';
+    await ctl.provision(S, 'g-r9lock');
+    const gate = await pool.connect();
+    await gate.query('BEGIN');
+    await gate.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [S]); // hold the per-stream lock criticalTx takes LAST
+    const op = ctl.lease(S); // enters the real criticalTx: ACCESS SHARE + attest, then BLOCKS on the advisory lock (holding ACCESS SHARE)
+    // deterministic ordering: wait until the real criticalTx is BLOCKED on the advisory lock — by
+    // then it has ALREADY acquired ACCESS SHARE on the governed tables (earlier in criticalTx).
+    let ctlBlocked = false;
+    for (let i = 0; i < 200 && !ctlBlocked; i++) {
+      ctlBlocked = Number((await pool.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype='advisory' AND NOT granted")).rows[0].n) >= 1;
+      if (!ctlBlocked) await new Promise((r) => setTimeout(r, 20));
     }
-    assert.ok(blocked, 'a concurrent ALTER is an ungranted AccessExclusiveLock while ACCESS SHARE is held');
-    await holder.query('COMMIT'); holder.release(); // release ACCESS SHARE -> ALTER proceeds
+    assert.ok(ctlBlocked, 'the real criticalTx is blocked on the advisory lock (so ACCESS SHARE is already held)');
+    const altering = pool.query('ALTER TABLE tsk_ha_lease_head ADD COLUMN r9b int').catch(() => {}); // now must block on ctl ACCESS SHARE
+    let proven = false;
+    for (let i = 0; i < 200 && !proven; i++) {
+      const rows = (await pool.query("SELECT pg_blocking_pids(w.pid) AS blockers FROM pg_locks w WHERE w.mode='AccessExclusiveLock' AND NOT w.granted AND w.relation='public.tsk_ha_lease_head'::regclass")).rows;
+      proven = rows.length > 0 && Array.isArray(rows[0].blockers) && rows[0].blockers.length > 0;
+      if (!proven) await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(proven, 'the concurrent ALTER on tsk_ha_lease_head is blocked by the criticalTx backend holding ACCESS SHARE');
+    await gate.query('COMMIT'); gate.release(); // release the advisory lock -> the real criticalTx proceeds + commits
+    await op; // ctl.lease returns once its tx commits (ACCESS SHARE released)
     await altering;
-    await pool.query('ALTER TABLE tsk_ha_lease_head DROP COLUMN IF EXISTS r8drift'); // cleanup
+    await pool.query('ALTER TABLE tsk_ha_lease_head DROP COLUMN IF EXISTS r9b'); // cleanup
   });
   await check('R8: per-op revalidation of the tsk_ha_schema authority stamp (post-mint mutation fails closed)', async () => {
     await pool.query("UPDATE tsk_ha_schema SET catalog_manifest='tampered-stamp' WHERE id=1");
