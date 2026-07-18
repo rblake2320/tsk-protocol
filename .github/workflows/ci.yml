@@ -33,6 +33,21 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      # node B: a GENUINELY INDEPENDENT PostgreSQL 16 (separate service, no shared
+      # state) for the two-node #10 drill.
+      postgres_b:
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_DB: tsk_test
+          POSTGRES_USER: tsk_test
+          POSTGRES_PASSWORD: tsk-test-only-password
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U tsk_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -50,6 +65,8 @@ jobs:
       - run: npm run test:hotp-outbox -w packages/server
       # production NodePostgresTransactor (#10): hermetic driver-fake unit suite.
       - run: npm run test:pg-transactor -w packages/server
+      # two-node authenticated transport (#10 PR1): hermetic loopback unit suite.
+      - run: npm run test:http-outbox -w packages/server
       - run: npm run test:ha
       - run: npm run test:redis
         env:
@@ -65,6 +82,13 @@ jobs:
       - run: npm run test:pg-partition
         env:
           TSK_TEST_POSTGRES_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+      # two-node A->B drill (#10 PR1): two INDEPENDENT PG16 (5432 + 5433), authenticated
+      # decision-bound transport, happy / lost-ACK partition / PG-B-down, measured RPO/RTO.
+      # THROWS if either URL is unset (no silent skip). Does NOT close #10.
+      - run: npm run test:two-node
+        env:
+          TSK_TEST_POSTGRES_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+          TSK_TEST_POSTGRES_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5433/tsk_test
       - run: npm run test:pack
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
