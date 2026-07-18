@@ -48,6 +48,8 @@ import {
   type TskHotpMutation,
   type TskReceiverCheckpoint,
 } from './ha-outbox-contract.js';
+import { assertSourceLeaseWritable } from './tsk-source-fence.js';
+import type { GuardKeyResolver } from './ha-control-fencing.js';
 
 /** Contract HOTP counter bound (mirrors the TSK segment counter ceiling). */
 export const TSK_HOTP_MAX_COUNTER = 2_147_483_647;
@@ -595,6 +597,12 @@ export interface PgTskOutboxOptions {
   maxPendingRows: number;
   backpressure: PublisherBackpressure;
   scopeDeadlineMs?: number;
+  /** (PR2b-0) Non-bypassable source lease gate. When set, EVERY append additionally asserts a
+   *  control-issued, guard-signed lease (active + exact fence epoch + signed deadline vs A's own
+   *  clock + bounded skew) in the SAME tx, holding the lease row FOR SHARE to commit — so a revoke
+   *  UPDATE cannot commit until in-flight appends finish, then new appends fail closed. A fencible
+   *  source MUST configure this. */
+  sourceLeaseGate?: { resolver: GuardKeyResolver; controlToASkewBoundMs: number };
 }
 
 // ── Source-side durable outbox (append builds + signs the head chain) ────────
@@ -630,6 +638,13 @@ export class PgTskDurableOutbox {
     if (!fenceRows.length) throw new ContractValidationError('no authoritative fence row — stream not provisioned (fail closed)');
     const persistedFence = BigInt(String(fenceRows[0].fence_token));
     if (input.fenceToken !== persistedFence) throw new StaleFenceError(input.fenceToken, persistedFence);
+
+    // (PR2b-0) non-bypassable source lease gate: in the SAME append tx, assert the control-issued
+    // guard-signed lease is active at THIS fence epoch and not past its signed deadline (A's own
+    // clock + bounded skew); FOR SHARE is held to commit so a revoke UPDATE freezes new appends.
+    if (this.opts.sourceLeaseGate) {
+      await assertSourceLeaseWritable(exec, this.opts.sourceLeaseGate.resolver, streamId, Number(persistedFence), this.opts.sourceLeaseGate.controlToASkewBoundMs);
+    }
 
     const pending = safeSeq((await exec.query('SELECT count(*)::bigint AS n FROM tsk_outbox_rows WHERE stream_id = $1 AND acked_at IS NULL AND quarantined_at IS NULL', [streamId])).rows[0].n, 'pending-count');
     if (pending >= this.opts.maxPendingRows) throw new OutboxBackpressureError(this.opts.backpressure);
