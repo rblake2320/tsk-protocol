@@ -19,7 +19,7 @@ mesh design packets. Incorporates Codex's review blockers (1)–(6) and precisio
 | Role | Component | Responsibility |
 |---|---|---|
 | Promotion **claim coordinator** | Redis (`RedisFencingStore`) | fast cross-node serialization of *who may promote*; NOT the write authority |
-| **Control DB (third domain)** — durable intent + epoch witness | a **dedicated third PG** (`tsk_ha_epoch_witness`, `tsk_ha_cutover`), **not node A or B** | write-ahead promotion intent (§3.3 H1) + the monotonic epoch floor + provisioned genesis |
+| **Control DB (third domain)** — durable intent + epoch witness | a **dedicated third PG** (`tsk_ha_epoch_witness`, `tsk_ha_cutover_head`/`_history`, `tsk_ha_lease_head`/`_history`, `tsk_ha_provisioning`), **not node A or B** | write-ahead promotion intent (§3.3 H1) + the monotonic epoch floor + provisioned genesis |
 | Source **write authority** | per-node **PG** `tsk_outbox_fence` row **+ a DB-clock-bounded expiring write lease** | the fence token **and unexpired lease** checked **inside every SERIALIZABLE authority mutation** |
 
 **Q1 (answered):** the witness/control DB is a **fixed third failure domain**, never node A
@@ -100,32 +100,42 @@ CREATE TABLE tsk_ha_epoch_witness (
 -- MONOTONIC + forward-CAS (grant_seq + prev_grant_digest) so an OLD signed grant cannot be
 -- replayed on A: A's grant applier accepts a grant only if its grant_seq > A's current lease
 -- grant_seq (checked in-tx), and rejects a lower/equal one even if the signature is valid.
-CREATE TABLE tsk_ha_lease (
+-- (fix 2) a lease grant AND its revocation are the SAME kind of object: a signed, monotonic
+-- grant-STATE transition. `status` is inside the signed fields, so revocation is authenticated
+-- (never a mutate-in-place of an unsigned `revoked` bool). Head row = current; history = audit.
+CREATE TABLE tsk_ha_lease_head (
   stream_id          text PRIMARY KEY,
   lease_id           text        NOT NULL,     -- opaque, rotated per grant
-  holder_node_id     text        NOT NULL,     -- the current source authority (A)
+  holder_node_id     text        NOT NULL,     -- the source authority (A)
   epoch              bigint      NOT NULL,
   grant_seq          bigint      NOT NULL,     -- monotonic per stream (anti-replay)
-  prev_grant_digest  text,                     -- forward CAS
+  status             text        NOT NULL CHECK (status IN ('active','revoked')),
   granted_max_expiry timestamptz NOT NULL,     -- CONTROL-DB clock; A dead after this (+skew+tx window)
-  revoked            boolean     NOT NULL DEFAULT false,
-  grant_digest       text        NOT NULL,     -- canonical digest of THIS grant
-  guard_key_id       text        NOT NULL,     -- rotation: registry of valid keyIds; revocation rejects a revoked keyId
-  guard_signature    text        NOT NULL,     -- signs (stream_id,lease_id,holder,epoch,grant_seq,prev_grant_digest,granted_max_expiry)
-  updated_at         timestamptz NOT NULL DEFAULT now()
+  prev_grant_digest  text,                     -- forward CAS
+  grant_digest       text        NOT NULL,     -- canonical digest of THIS grant state (binds ALL fields incl status)
+  guard_key_id       text        NOT NULL,     -- rotation via a signed key registry; a revoked keyId is rejected
+  guard_signature    text        NOT NULL      -- signs (stream_id,lease_id,holder,epoch,grant_seq,status,granted_max_expiry,prev_grant_digest,grant_digest)
 );
--- A-PG grant applier + runtime roles: the runtime (write) role CANNOT install a lease; only a
--- separate grant-applier role installs a grant, and only strictly-increasing grant_seq — so a
--- replayed older still-valid signed grant is rejected in-tx.
+CREATE TABLE tsk_ha_lease_history (LIKE tsk_ha_lease_head INCLUDING ALL, created_at timestamptz NOT NULL DEFAULT now());
+-- every grant/revoke: append the signed history row, then UPDATE tsk_ha_lease_head
+--   WHERE stream_id=$1 AND grant_digest=$prev (affected-row=1 forward CAS, strictly-increasing grant_seq).
 ```
+The A-PG grant applier is a **separate role** from the runtime (write) role; it installs a grant
+only with strictly-increasing `lease_grant_seq` — a replayed older still-valid signed grant
+affects 0 rows and is rejected in-tx.
 
 On **each source PG** (A / a promoted B), the existing `tsk_outbox_fence(stream_id, fence_token)`
 gains lease columns; the write token AND an unexpired, non-revoked lease are checked in-tx:
 ```sql
 ALTER TABLE tsk_outbox_fence
-  ADD COLUMN lease_id     text,
-  ADD COLUMN lease_epoch  bigint,
-  ADD COLUMN lease_until  timestamptz;   -- mirror of the control grant, checked in the pre-COMMIT hook
+  ADD COLUMN lease_id         text,
+  ADD COLUMN lease_epoch      bigint,
+  ADD COLUMN lease_until      timestamptz,   -- mirror of the control grant, checked in the pre-COMMIT hook
+  ADD COLUMN lease_grant_seq  bigint,        -- (fix 1) monotonic; the applier rejects a lower/equal grant
+  ADD COLUMN lease_grant_digest text,        -- binds the installed grant (anti-replay)
+  ADD COLUMN lease_grant_key_id text;        -- the verified guard keyId that signed the grant
+-- grant applier: UPDATE ... WHERE stream_id=$1 AND (lease_grant_seq IS NULL OR lease_grant_seq < $newSeq)
+--   (affected-row=1, strictly-increasing) — a replayed older still-valid signed grant affects 0 rows.
 ```
 `fence_token` is the canonical decimal of `epoch`, so a promotion advances the authoritative
 write token in the SAME PG tx as the fence/lease update. Redis keeps the existing
@@ -170,8 +180,9 @@ step is idempotent, keyed by `(streamId, E', commandId)`.
    this authenticated intent. Without a committed intent, no fence/claim happens.
 1. **Allocate/verify `E'`** against the witness (`W`), require provisioned + Redis-not-lost (§3.4).
 2. **Fence OLD A + PROVE it — on the CONTROL clock, not A's PG (blocker 3/4).**
-   - **Revoke the control lease grant** (`tsk_ha_lease.revoked = true`) — always reachable, does
-     not depend on A. From now A gets no renewal.
+   - **Revoke the control lease grant** — a NEW signed grant-state transition to
+     `status='revoked'` (`tsk_ha_lease_head` forward-CAS, next `grant_seq`), always reachable and
+     not dependent on A. From now A gets no renewal (a partitioned A's mirrored grant expires).
    - **Prove A dead without A-PG access**: wait `granted_max_expiry + clock_skew + max_tx/commit_window`
      on the **control-DB clock**. (`granted_max_expiry` is the control-recorded max; A mirrors
      `lease_until ≤ granted_max_expiry` and its non-bypassable pre-commit hook fails once passed.)
@@ -288,21 +299,22 @@ frozen final head **N**:
 - `schemaVersion`, `contractVersion`
 - `streamId`, `epoch` (the fence epoch of the frozen source), `sourceNodeId`
 - **final source head N**: the signed `SignedStreamHead` at `sequence = N`
-- `sourceCheckpoint` (final applied source `sequence = N`)
+- `sourceCheckpoint` = the **final committed SOURCE sequence `N`** (from the source ledger — not
+  any receiver-applied state; see H8/§4.3)
 - **head-chain integrity — REQUIRED MMR with an explicit CROSS-DB boundary (Decision 3, correction 3).**
   Two distinct mechanisms, not one atomic step across DBs:
   - **A-PG (local, atomic):** an incremental **MMR** root advances **in the same SERIALIZABLE
     append tx** as each append (leaf = `H(leafVersion ‖ domainTag ‖ headDigest)`, domain-separated
     and versioned; **HOTP lineage and head lineage use separate domain-tagged MMRs** with a
     defined ordering).
-  - **Control DB (external anchors):** the source periodically writes **signed anchor
-    checkpoints** (`{streamId, mmrSize, mmrRoot, guard+source sig}`) — a **separate** cross-DB
-    action, not part of the append tx.
+  - **Control DB (external anchor CHAIN):** the anchor chain **begins at a provisioned genesis
+    anchor**; each later signed anchor (`{streamId, mmrSize, mmrRoot, prevAnchorDigest, guard+source
+    sig}`) **proves consistency from its immediately prior anchored size/root**. The chain of
+    per-anchor consistency proofs makes **`genesis → N` exact** — not merely latest-anchor→N.
   - **At promotion:** after fencing freezes `N`, the promoter **synchronously anchors the frozen
-    `N`** in the control DB and proves **MMR consistency from the last prior external anchor → N**
-    (a bounded consistency proof) plus inclusion of `N`. The **unanchored suffix** (appends after
-    the last periodic anchor up to `N`) is assured precisely by this synchronous
-    promotion-time anchor + consistency proof — nothing in the suffix is trusted un-anchored.
+    `N`** and proves consistency **from the latest prior anchor → N** plus inclusion of `N`; the
+    prior chain (genesis → latest anchor) is already proven. The **unanchored suffix** is assured
+    by this synchronous promotion-time anchor — nothing is trusted un-anchored.
   - The manifest carries the anchored `N` root + the bounded consistency/inclusion proof so B
     **independently verifies** `genesis→N`; dual signatures authenticate the manifest, the MMR
     is the verifiable proof; full lineage retained for audit.
@@ -461,7 +473,8 @@ terminal-quarantine + halt the new-epoch stream**.
 
 Redis claim is non-idempotent and the readiness token is process-local, so recovery **must
 not issue a new claim or bump the epoch**. On restart:
-1. read the durable signed `tsk_ha_cutover` state (verify its signature);
+1. read the authoritative `tsk_ha_cutover_head` row **and verify the matching signed
+   `tsk_ha_cutover_history` row** (`state_digest` + guard signature) — not any obsolete table;
 2. **rehydrate the exact current epoch** — validate the Redis record, PG fence, witness, and
    (if past IMPORTING) the manifest against `(E', command_id)`; do **not** claim;
 3. resume the remaining forward transitions idempotently;
