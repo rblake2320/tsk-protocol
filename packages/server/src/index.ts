@@ -28,6 +28,18 @@ export {
   provisionSchemaVersion,
   adoptCurrentSchemaVersion,
 } from './tsk-hotp-outbox-pg.js';
+export {
+  NodePostgresTransactor,
+  AmbiguousCommitError,
+  PostCommitReleaseError,
+  ConnectionDisposalError,
+} from './pg-transactor.js';
+export type {
+  NodePostgresPool,
+  NodePostgresClient,
+  NodePostgresResult,
+  NodePostgresTransactorOptions,
+} from './pg-transactor.js';
 export type {
   TskPgBackend,
   PgTx,
