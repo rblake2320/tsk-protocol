@@ -20,6 +20,7 @@ export {
   GENESIS_HEAD,
   StreamHeadVerificationUnavailableError,
   PgTskDurableOutbox,
+  UnfencedSingleNodeTskDurableOutbox,
   PgTskPublisher,
   PgTskReceiverCheckpoint,
   schemaManifest,
@@ -52,7 +53,7 @@ export type {
   TskOutboxTransport,
   HotpApplier,
   PgTskOutboxOptions,
-  SourceGateConfig,
+  SourceFenceGate,
   PgTskPublisherOptions,
   TskDrainResult,
 } from './tsk-hotp-outbox-pg.js';
@@ -98,8 +99,6 @@ export {
   readSourceWitness,
   assertSourceWitnessConsistent,
   advanceSourceWitness,
-  advanceSourceWitnessInTx,
-  signSourceCheckpointReceipt,
   verifySourceCheckpointReceipt,
   issueSourceCheckpointReceipt,
   SourceFenceQuarantineError,
@@ -120,6 +119,7 @@ export type {
   LeaseState as SourceLeaseState,
   SourceFrozenReceipt,
   SourceCheckpointReceipt,
+  CheckpointIssueOptions,
   SourceLiveState,
   WitnessState as SourceWitnessState,
 } from './tsk-source-fence.js';

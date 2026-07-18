@@ -17,9 +17,12 @@ import {
   TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_WITNESS_SCHEMA, TSK_SOURCE_WITNESS_TABLES,
   provisionSchemaVersion, PgTskDurableOutbox, NodePostgresTransactor, RedisFencingStore, ContractValidationError,
   signLeaseGrant, installLeaseGrant, readSourceLease, emitSourceFrozenReceipt, verifySourceFrozenReceipt,
-  advanceSourceWitness, advanceSourceWitnessInTx, assertSourceWitnessReady, readSourceWitness, signSourceCheckpointReceipt, SourceFenceQuarantineError, assertSourceFenceReady,
+  advanceSourceWitness, assertSourceWitnessReady, readSourceWitness, SourceFenceQuarantineError, assertSourceFenceReady,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation, type TskHotpMutation, type SourceVerifyKeyResolver, type LeaseGrant,
 } from './packages/server/dist/index.js';
+// (H3) internal-only primitives (not on the public package API): the in-tx witness advance for crash
+// injection + the low-level checkpoint signer for a synthetic witness-crash receipt.
+import { advanceSourceWitnessInTx, signSourceCheckpointReceipt } from './packages/server/dist/tsk-source-fence.js';
 
 const A_URL = process.env['TSK_TEST_SOURCE_PG_URL_A'] ?? process.env['TSK_TEST_POSTGRES_URL'];
 const C_URL = process.env['TSK_TEST_CONTROL_PG_URL'];
@@ -64,7 +67,7 @@ async function main() {
   // tables attested on A, where the gate reads them in the append tx).
   const mkOutbox = async (sid: string, g: LeaseGrant) => {
     const ready = await assertSourceFenceReady(aTx, 'public', { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest });
-    return new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { mode: 'fenced', resolver, controlToASkewBoundMs: 0, ready } });
+    return new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready });
   };
   async function provision(sid: string) { await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [sid]); await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [sid, 'e1']); }
 

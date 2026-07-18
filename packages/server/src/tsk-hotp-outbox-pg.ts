@@ -597,50 +597,38 @@ export interface PgTskOutboxOptions {
   maxPendingRows: number;
   backpressure: PublisherBackpressure;
   scopeDeadlineMs?: number;
-  /** (H1) Source gate — a MANDATORY, EXPLICIT choice (no optional bypass). A fencible source declares
-   *  `{ mode: 'fenced', ... }`: EVERY append then asserts a control-issued, guard-signed lease (active +
-   *  exact fence epoch + signed deadline vs A's own clock + bounded skew) in the SAME tx, holding the
-   *  lease row FOR SHARE to commit — a revoke UPDATE cannot commit until in-flight appends finish, then
-   *  new appends fail closed. `ready` is an unforgeable capability (minted only by
-   *  `assertSourceFenceReady` after a real full-catalog attestation) binding the AUTHORIZED writer
-   *  identity (holder + leaseId + grant digest). A non-HA single-node deployment must DELIBERATELY opt
-   *  out with `{ mode: 'unfenced-single-node' }` — bypass cannot happen by omission. */
-  sourceLeaseGate: SourceGateConfig;
 }
 
-/** (H1) Explicit source-gate discriminant — a fencible outbox cannot be constructed without choosing. */
-export type SourceGateConfig =
-  | { mode: 'fenced'; resolver: SourceVerifyKeyResolver; controlToASkewBoundMs: number; ready: SourceFenceReadyToken }
-  | { mode: 'unfenced-single-node' };
+/** (H1) The FENCED source gate — the ONLY configuration accepted by the authoritative
+ *  `PgTskDurableOutbox`. EVERY append asserts a control-issued, guard-signed lease (active + exact
+ *  fence epoch + signed deadline vs A's own clock + bounded skew) in the SAME tx, holding the lease row
+ *  FOR SHARE to commit — a revoke UPDATE cannot commit until in-flight appends finish, then new appends
+ *  fail closed. `ready` is an unforgeable capability (minted only by `assertSourceFenceReady` after a
+ *  real full-catalog attestation) binding the AUTHORIZED writer identity (holder + leaseId + grant). */
+export interface SourceFenceGate { resolver: SourceVerifyKeyResolver; controlToASkewBoundMs: number; ready: SourceFenceReadyToken }
+
+/** Internal resolved gate — the fenced identity lifted from the readiness capability, or null (unfenced). */
+type ResolvedGate = { resolver: SourceVerifyKeyResolver; controlToASkewBoundMs: number; bound: { holderNodeId: string; leaseId: string; grantDigest: string } };
 
 // ── Source-side durable outbox (append builds + signs the head chain) ────────
 
-export class PgTskDurableOutbox {
+/** Shared append/withOutboxTx implementation. NOT exported: a caller must pick a concrete class — the
+ *  fenced `PgTskDurableOutbox` (source authority; the gate cannot be omitted) or the explicitly-named
+ *  `UnfencedSingleNodeTskDurableOutbox` (non-HA single-node; no gate). (H1: unfenced is a DISTINCT
+ *  type, not a selectable mode on the authoritative constructor.) */
+abstract class AbstractTskDurableOutbox {
   readonly sanitizer: HotpMutationSanitizer;
-  private readonly schema: string;
+  protected readonly schema: string;
   private readonly scopeDeadlineMs: number;
-  /** (C2/H1) authorized writer identity bound out of the source-fence readiness capability; passed to
-   *  the gate so the live lease must be the SAME holder+leaseId+grant this writer was authorized for. */
-  private readonly sourceBound?: { holderNodeId: string; leaseId: string; grantDigest: string };
-  constructor(private readonly db: PgTransactor, ready: SchemaReadyToken, private readonly opts: PgTskOutboxOptions) {
+  protected constructor(protected readonly db: PgTransactor, ready: SchemaReadyToken, protected readonly opts: PgTskOutboxOptions, protected readonly gate: ResolvedGate | null) {
     if (!Number.isSafeInteger(opts.maxPendingRows) || opts.maxPendingRows <= 0) throw new ContractValidationError('maxPendingRows must be a positive safe integer');
     this.scopeDeadlineMs = validateDeadlineMs(opts.scopeDeadlineMs ?? DEFAULT_SCOPE_DEADLINE_MS, 'scopeDeadlineMs');
     this.schema = requireReady(ready, db);
-    const gate = opts.sourceLeaseGate;
-    if (!gate || (gate.mode !== 'fenced' && gate.mode !== 'unfenced-single-node')) {
-      throw new ContractValidationError('sourceLeaseGate is required — choose { mode: "fenced", ... } or { mode: "unfenced-single-node" } (no implicit bypass)');
-    }
-    if (gate.mode === 'fenced') {
-      // Validate the capability is real + bound to THIS transactor/schema/stream, and lift the
-      // authorized identity. A forged/foreign token or a schema/stream mismatch fails construction.
-      const b = requireSourceFenceReady(gate.ready, { db, schema: this.schema, streamId: opts.streamId });
-      this.sourceBound = { holderNodeId: b.holderNodeId, leaseId: b.leaseId, grantDigest: b.grantDigest };
-    }
     this.sanitizer = opts.sanitizer;
   }
 
   async withOutboxTx<T>(fn: (tx: PgTx, exec: PgExecutor) => Promise<T>): Promise<T> {
-    const gate = this.opts.sourceLeaseGate;
+    const gate = this.gate;
     return runScoped(this.scopeDeadlineMs, (signal) => this.db.transaction(async (exec) => {
       await enterCriticalTx(exec, this.schema);
       return withBoundTx(exec, this.db, this.schema, (tx, scoped) => fn(tx, scoped));
@@ -651,10 +639,10 @@ export class PgTskDurableOutbox {
       // catching a tx that passed the per-append gate then stalled past expiry. FOR SHARE is already
       // held from the append; this re-affirms it. NOTE (per design §A.2): this does NOT guarantee the
       // COMMIT lands before the deadline — the lock-based revoke is the freeze authority.
-      onBeforeCommit: gate.mode === 'fenced' ? async (exec) => {
+      onBeforeCommit: gate ? async (exec) => {
         const fenceRows = (await exec.query('SELECT fence_token FROM tsk_outbox_fence WHERE stream_id = $1 FOR SHARE', [this.opts.streamId])).rows;
         if (!fenceRows.length) throw new ContractValidationError('no authoritative fence row at pre-commit re-check');
-        await assertSourceLeaseWritable(exec, gate.resolver, this.opts.streamId, Number(BigInt(String(fenceRows[0].fence_token))), gate.controlToASkewBoundMs, this.sourceBound!);
+        await assertSourceLeaseWritable(exec, gate.resolver, this.opts.streamId, Number(BigInt(String(fenceRows[0].fence_token))), gate.controlToASkewBoundMs, gate.bound);
       } : undefined,
     }));
   }
@@ -676,9 +664,9 @@ export class PgTskDurableOutbox {
     // (PR2b-0) non-bypassable source lease gate: in the SAME append tx, assert the control-issued
     // guard-signed lease is active at THIS fence epoch and not past its signed deadline (A's own
     // clock + bounded skew); FOR SHARE is held to commit so a revoke UPDATE freezes new appends.
-    const gate = this.opts.sourceLeaseGate;
-    if (gate.mode === 'fenced') {
-      await assertSourceLeaseWritable(exec, gate.resolver, streamId, Number(persistedFence), gate.controlToASkewBoundMs, this.sourceBound!);
+    const gate = this.gate;
+    if (gate) {
+      await assertSourceLeaseWritable(exec, gate.resolver, streamId, Number(persistedFence), gate.controlToASkewBoundMs, gate.bound);
     }
 
     const pending = safeSeq((await exec.query('SELECT count(*)::bigint AS n FROM tsk_outbox_rows WHERE stream_id = $1 AND acked_at IS NULL AND quarantined_at IS NULL', [streamId])).rows[0].n, 'pending-count');
@@ -719,6 +707,28 @@ export class PgTskDurableOutbox {
     ), 'outbox row insert');
     affectedOne(await exec.query('UPDATE tsk_outbox_source_checkpoint SET sequence = $2, head_digest = $3 WHERE stream_id = $1', [streamId, nextSeq, headDigest]), 'source checkpoint advance');
     return { header, head };
+  }
+}
+
+/** (H1) The AUTHORITATIVE source outbox. Constructing one REQUIRES a fenced source gate — there is no
+ *  unfenced mode on this constructor, so a source-authority code path cannot bypass the gate. */
+export class PgTskDurableOutbox extends AbstractTskDurableOutbox {
+  constructor(db: PgTransactor, ready: SchemaReadyToken, opts: PgTskOutboxOptions, fence: SourceFenceGate) {
+    if (!fence || typeof fence !== 'object' || !fence.ready || !fence.resolver) {
+      throw new ContractValidationError('PgTskDurableOutbox requires a fenced source gate { resolver, controlToASkewBoundMs, ready } — for a non-HA single-node outbox use UnfencedSingleNodeTskDurableOutbox');
+    }
+    const schema = requireReady(ready, db); // validate token + resolve schema BEFORE super() (no `this` use)
+    const b = requireSourceFenceReady(fence.ready, { db, schema, streamId: opts.streamId });
+    super(db, ready, opts, { resolver: fence.resolver, controlToASkewBoundMs: fence.controlToASkewBoundMs, bound: { holderNodeId: b.holderNodeId, leaseId: b.leaseId, grantDigest: b.grantDigest } });
+  }
+}
+
+/** (H1) A DISTINCT, explicitly-named single-node outbox with NO source gate. Choosing this type is the
+ *  deliberate, auditable, greppable opt-out from source fencing — it is NOT selectable on the
+ *  authoritative `PgTskDurableOutbox` constructor. Non-HA / single-node use only. */
+export class UnfencedSingleNodeTskDurableOutbox extends AbstractTskDurableOutbox {
+  constructor(db: PgTransactor, ready: SchemaReadyToken, opts: PgTskOutboxOptions) {
+    super(db, ready, opts, null);
   }
 }
 

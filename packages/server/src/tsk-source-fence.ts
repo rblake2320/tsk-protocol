@@ -209,9 +209,9 @@ export async function installLeaseGrant(exec: PgExecutor, resolver: SourceVerify
   verifyLeaseGrant(resolver, g);
   // (H2) serialize installs per stream so concurrent grants/revokes cannot interleave.
   await exec.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))', [g.streamId]);
-  // (H4) the head must be the EXACT latest row of a contiguous signed chain from genesis (no replay of
-  // an older validly-signed head, no same-seq fork/relabel).
-  const cur = await assertLeaseChained(exec, resolver, g.streamId);
+  // (H4) readSourceLease verifies the head IS the exact latest row of a contiguous signed chain from
+  // genesis (no replay of an older validly-signed head, no same-seq fork/relabel, no deleted intermediate).
+  const cur = await readSourceLease(exec, resolver, g.streamId);
   // idempotent: this exact grant already installed (by grant_seq + digest) → no-op
   if (cur && cur.leaseGrantSeq === g.leaseGrantSeq && cur.grantDigest === g.grantDigest) return cur;
   // command idempotency: same command already installed with the SAME tuple → return it; different → reject
@@ -261,38 +261,15 @@ function rowToLease(streamId: string, r: Record<string, unknown>): { state: Leas
   return { state: { ...bare, grantDigest: digest }, digMsg: leaseGrantMsg(bare, ''), sigMsg: leaseGrantMsg(bare, digest), sig: String(r.guard_signature), keyId: String(r.guard_key_id), digest };
 }
 
-/** Read + verify the current signed lease head (tamper-evident). Returns null if unleased. */
-export async function readSourceLease(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<LeaseState | null> {
-  const s = vId(streamId, STREAM_ID_RE, 'streamId');
-  const r = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease WHERE stream_id=$1', [s])).rows[0];
-  if (!r) return null;
-  const m = rowToLease(s, r);
-  if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease head digest mismatch');
-  verifySig(resolver, m.keyId, m.sigMsg, m.sig);
-  return m.state;
-}
-
-async function readSourceLeaseAtSeq(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string, seq: number): Promise<LeaseState | null> {
-  const r = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease_history WHERE stream_id=$1 AND lease_grant_seq=$2', [streamId, seq])).rows[0];
-  if (!r) return null;
-  const m = rowToLease(streamId, r);
-  if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease history digest mismatch');
-  verifySig(resolver, m.keyId, m.sigMsg, m.sig);
-  return m.state;
-}
-
-/** (H4) Verify the FULL lease chain under the per-stream lock: every history row is signed + digest-
- *  valid, the seq is contiguous 1..N from genesis, each `prev_grant_digest` chains the prior row, and
- *  the head is EXACTLY the latest history row (same seq AND digest). A same-seq fork, a relabelled
- *  head, a broken chain, or a head that is not the latest history row → quarantine. Returns the
- *  verified head (or null if there is provably no lease). Call only inside the advisory-locked tx. */
-async function assertLeaseChained(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<LeaseState | null> {
-  const s = vId(streamId, STREAM_ID_RE, 'streamId');
-  const head = await readSourceLease(exec, resolver, s); // verifies head signature + digest
+/** (H2/H4) Verify the FULL signed lease chain given an already-read+verified head: every history row
+ *  is signed + digest-valid, the seq is contiguous 1..N from genesis, each `prev_grant_digest` chains
+ *  the prior row, and the head is EXACTLY the latest history row (same seq AND digest). A same-seq
+ *  fork, a relabelled head, a deleted intermediate row, or a head that is not the latest → quarantine. */
+async function verifyLeaseHistoryChain(exec: PgExecutor, resolver: SourceVerifyKeyResolver, s: string, head: LeaseState | null): Promise<void> {
   const rows = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease_history WHERE stream_id=$1 ORDER BY lease_grant_seq ASC', [s])).rows;
   if (rows.length === 0) {
     if (head !== null) throw new SourceFenceQuarantineError('lease head present with no history — fork/relabel; quarantine');
-    return null;
+    return;
   }
   let prev: string | null = null;
   let last: LeaseState | null = null;
@@ -308,7 +285,32 @@ async function assertLeaseChained(exec: PgExecutor, resolver: SourceVerifyKeyRes
   if (head === null || last === null || head.leaseGrantSeq !== last.leaseGrantSeq || head.grantDigest !== last.grantDigest) {
     throw new SourceFenceQuarantineError('lease head is not the exact latest history row (fork/relabel/rollback) — quarantine');
   }
+}
+
+/** Read + verify the current signed lease head AND its full contiguous signed chain from genesis
+ *  (H2 — a decision-grade read is never head-only). Returns null if unleased. */
+export async function readSourceLease(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<LeaseState | null> {
+  const s = vId(streamId, STREAM_ID_RE, 'streamId');
+  const r = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease WHERE stream_id=$1', [s])).rows[0];
+  const head = r ? verifiedLeaseHead(s, r as Record<string, unknown>, resolver) : null;
+  await verifyLeaseHistoryChain(exec, resolver, s, head);
   return head;
+}
+
+function verifiedLeaseHead(s: string, r: Record<string, unknown>, resolver: SourceVerifyKeyResolver): LeaseState {
+  const m = rowToLease(s, r);
+  if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease head digest mismatch');
+  verifySig(resolver, m.keyId, m.sigMsg, m.sig);
+  return m.state;
+}
+
+async function readSourceLeaseAtSeq(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string, seq: number): Promise<LeaseState | null> {
+  const r = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease_history WHERE stream_id=$1 AND lease_grant_seq=$2', [streamId, seq])).rows[0];
+  if (!r) return null;
+  const m = rowToLease(streamId, r);
+  if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease history digest mismatch');
+  verifySig(resolver, m.keyId, m.sigMsg, m.sig);
+  return m.state;
 }
 
 /**
@@ -328,16 +330,10 @@ export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: Sour
   if (!DIGEST_RE.test(bound.grantDigest)) throw new ContractValidationError('invalid bound.grantDigest');
   const r = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
   if (!r) throw new SourceFenceQuarantineError('no source lease — writer is not leased; fail closed');
-  const m = rowToLease(s, r);
-  if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease head digest mismatch');
-  verifySig(resolver, m.keyId, m.sigMsg, m.sig);
-  const st = m.state;
-  // (H4) the head (locked FOR SHARE) must be the EXACT latest history row — a same-seq fork or a
-  // relabelled head fails closed even though the head signature alone verifies.
-  const latest = (await exec.query('SELECT lease_grant_seq, grant_digest FROM tsk_source_lease_history WHERE stream_id=$1 ORDER BY lease_grant_seq DESC LIMIT 1', [s])).rows[0];
-  if (!latest || vInt(latest.lease_grant_seq, 'latest lease_grant_seq', 1, MAX_SEQ) !== st.leaseGrantSeq || String(latest.grant_digest) !== st.grantDigest) {
-    throw new SourceFenceQuarantineError('source lease head is not the latest history row (fork/relabel/rollback) — fail closed');
-  }
+  const st = verifiedLeaseHead(s, r as Record<string, unknown>, resolver);
+  // (H2/H4) the head (locked FOR SHARE) must be the EXACT latest row of a FULL contiguous signed chain
+  // from genesis — a same-seq fork, a relabelled head, OR a deleted intermediate history row fails closed.
+  await verifyLeaseHistoryChain(exec, resolver, s, st);
   if (st.leaseStatus !== 'active') throw new SourceFenceQuarantineError(`source lease is ${st.leaseStatus} — fenced; fail closed`);
   if (st.leaseEpoch !== epoch) throw new SourceFenceQuarantineError(`source lease epoch ${st.leaseEpoch} != expected ${epoch} — stale writer; fail closed`);
   // A's own clock; the signed deadline is on the control clock, bounded by the measured skew.
@@ -513,11 +509,7 @@ function vHeadDigest(v: unknown, label: string): string {
   return d;
 }
 
-/** Read + verify the current signed witness head (tamper-evident). Null if none. */
-export async function readSourceWitness(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<WitnessState | null> {
-  const s = vId(streamId, STREAM_ID_RE, 'streamId');
-  const r = (await exec.query('SELECT source_system_id, max_grant_seq, max_source_seq, source_head_digest, witness_seq, prev_witness_digest, witness_digest, guard_key_id, guard_signature FROM tsk_source_witness WHERE stream_id=$1', [s])).rows[0];
-  if (!r) return null;
+function verifiedWitnessHead(s: string, r: Record<string, unknown>, resolver: SourceVerifyKeyResolver): WitnessState {
   const sysId = String(r.source_system_id), gs = vInt(r.max_grant_seq, 'max_grant_seq', 0, MAX_SEQ), ss = vInt(r.max_source_seq, 'max_source_seq', 0, MAX_SEQ);
   const head = vHeadDigest(r.source_head_digest, 'source_head_digest'), wseq = vInt(r.witness_seq, 'witness_seq', 1, MAX_SEQ);
   const prev = vNullableDigest(r.prev_witness_digest, 'prev_witness_digest'), digest = vHeadDigest(r.witness_digest, 'witness_digest');
@@ -526,17 +518,14 @@ export async function readSourceWitness(exec: PgExecutor, resolver: SourceVerify
   return { streamId: s, sourceSystemId: sysId, maxGrantSeq: gs, maxSourceSeq: ss, headDigest: head, witnessSeq: wseq, witnessDigest: digest };
 }
 
-/** (H4) Verify the FULL witness chain under the per-stream lock: every witness_history row is signed +
- *  digest-valid, `witness_seq` is contiguous 1..N from genesis, each `prev_witness_digest` chains the
- *  prior row, and the head is EXACTLY the latest history row. A same-seq witness fork, a relabelled
- *  head, or a broken chain → quarantine. Returns the verified head (or null if none). */
-async function assertWitnessChained(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<WitnessState | null> {
-  const s = vId(streamId, STREAM_ID_RE, 'streamId');
-  const head = await readSourceWitness(exec, resolver, s); // verifies head signature + digest
+/** (H2/H4) Verify the FULL signed witness chain given an already-read+verified head: every
+ *  witness_history row is signed + digest-valid, `witness_seq` is contiguous 1..N, each
+ *  `prev_witness_digest` chains the prior row, and the head is EXACTLY the latest history row. */
+async function verifyWitnessHistoryChain(exec: PgExecutor, resolver: SourceVerifyKeyResolver, s: string, head: WitnessState | null): Promise<void> {
   const rows = (await exec.query('SELECT source_system_id, max_grant_seq, max_source_seq, source_head_digest, witness_seq, prev_witness_digest, witness_digest, guard_key_id, guard_signature FROM tsk_source_witness_history WHERE stream_id=$1 ORDER BY witness_seq ASC', [s])).rows;
   if (rows.length === 0) {
     if (head !== null) throw new SourceFenceQuarantineError('witness head present with no history — fork/relabel; quarantine');
-    return null;
+    return;
   }
   let prev: string | null = null;
   let lastSeq = 0, lastDigest = '';
@@ -554,6 +543,15 @@ async function assertWitnessChained(exec: PgExecutor, resolver: SourceVerifyKeyR
   if (head === null || head.witnessSeq !== lastSeq || head.witnessDigest !== lastDigest) {
     throw new SourceFenceQuarantineError('witness head is not the exact latest history row (fork/relabel/rollback) — quarantine');
   }
+}
+
+/** Read + verify the current signed witness head AND its full contiguous signed chain from genesis
+ *  (H2 — a decision-grade read is never head-only). Null if none. */
+export async function readSourceWitness(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<WitnessState | null> {
+  const s = vId(streamId, STREAM_ID_RE, 'streamId');
+  const r = (await exec.query('SELECT source_system_id, max_grant_seq, max_source_seq, source_head_digest, witness_seq, prev_witness_digest, witness_digest, guard_key_id, guard_signature FROM tsk_source_witness WHERE stream_id=$1', [s])).rows[0];
+  const head = r ? verifiedWitnessHead(s, r as Record<string, unknown>, resolver) : null;
+  await verifyWitnessHistoryChain(exec, resolver, s, head);
   return head;
 }
 
@@ -583,7 +581,7 @@ export async function advanceSourceWitnessInTx(exec: PgExecutor, resolver: Sourc
   const sysId = receipt.sourceSystemId, gs = receipt.grantSeq, ss = receipt.sourceSeq, head = receipt.sourceHeadDigest;
   await exec.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))', [s]);
   await attestSourceWitness(exec); // (H3) the witness catalog must match its compiled pin before we mutate it
-  const cur = await assertWitnessChained(exec, resolver, s); // (H4) head == latest of a contiguous signed chain
+  const cur = await readSourceWitness(exec, resolver, s); // (H2/H4) chain-verified head (full contiguous signed chain)
   // idempotent re-advance (crash-resume): an identical high-water is a no-op, not a new witness seq.
   if (cur && cur.sourceSystemId === sysId && cur.maxGrantSeq === gs && cur.maxSourceSeq === ss && cur.headDigest === head) return cur;
   if (cur) {
@@ -763,25 +761,75 @@ export async function advanceSourceWitness(db: PgTransactor, ready: SourceWitnes
  *  checkpoint FOR SHARE, DERIVES the committed (system_identifier, grantSeq, head@N, head@N-1)
  *  straight from the ledger, then source-signs. The low-level `signSourceCheckpointReceipt` accepts
  *  arbitrary caller state and MUST NOT attest live source state on the runtime path — use this. */
-export async function issueSourceCheckpointReceipt(db: PgTransactor, schema: string, streamId: string, sourceKeyId: string, sourcePrivateKey: KeyObject | string): Promise<SourceCheckpointReceipt> {
+const OUTBOX_GENESIS_HEAD = '0'.repeat(64);
+
+/** Verify + return the SIGNED committed outbox head at `seq` (over the stored head_digest, which itself
+ *  commits to sequence + prevHeadDigest). Never trusts a head digest without its signature. */
+function verifyOutboxHead(headResolver: SourceVerifyKeyResolver, seq: number, row: Record<string, unknown>): { headDigest: string; headPrev: string } {
+  if (vInt(row.sequence, 'outbox row sequence', 1, MAX_SEQ) !== seq) throw new SourceFenceQuarantineError('outbox row sequence mismatch — ledger tamper; quarantine');
+  const headDigest = vHeadDigest(row.head_digest, `outbox head@${seq}`);
+  const headPrev = vHeadDigest(row.head_prev, `outbox head_prev@${seq}`);
+  const keyId = String(row.head_key_id), alg = String(row.head_alg), sig = String(row.head_sig);
+  if (alg !== 'ed25519') throw new ContractValidationError(`unsupported outbox head alg '${alg}' for checkpoint issuance`);
+  if (!KEY_ID_RE.test(keyId)) throw new ContractValidationError('invalid outbox head keyId');
+  if (!B64U_CANON.test(sig)) throw new ContractValidationError('invalid outbox head signature encoding');
+  const pub = headResolver.resolve(keyId);
+  if (pub === null) throw new ContractValidationError('unknown or revoked outbox head keyId');
+  if (!edVerify(null, Buffer.from(headDigest, 'utf8'), toPublicKey(pub), Buffer.from(sig, 'base64url'))) {
+    throw new SourceFenceQuarantineError(`outbox head signature invalid at seq ${seq} — ledger tamper; quarantine`);
+  }
+  return { headDigest, headPrev };
+}
+
+/** Options for the atomic checkpoint issuer. `leaseResolver` holds the guard PUBLIC key (verify the
+ *  lease chain); `headResolver` holds the outbox head-signer PUBLIC key (verify the signed ledger
+ *  heads); `priorWitnessSeq` is the CURRENT witnessed height W (0 = genesis) — the issuer anchors the
+ *  receipt's continuity proof at W and derives head@W from the committed ledger, so a witness that lags
+ *  the source by more than 1 (W=3, N=10) can still advance in one proven step. */
+export interface CheckpointIssueOptions {
+  sourceKeyId: string; sourcePrivateKey: KeyObject | string;
+  leaseResolver: SourceVerifyKeyResolver; headResolver: SourceVerifyKeyResolver; priorWitnessSeq: number;
+}
+export async function issueSourceCheckpointReceipt(db: PgTransactor, schema: string, streamId: string, opts: CheckpointIssueOptions): Promise<SourceCheckpointReceipt> {
   const s = vId(streamId, STREAM_ID_RE, 'streamId');
+  const priorW = vInt(opts.priorWitnessSeq, 'priorWitnessSeq', 0, MAX_SEQ);
   return db.transaction(async (exec) => {
     await enterSourceTx(exec, schema);
     await attestSourceLease(exec);
     const sysId = String((await exec.query('SELECT system_identifier::text AS s FROM pg_catalog.pg_control_system()')).rows[0]?.s);
-    // lock the lease head + source checkpoint FOR SHARE so no concurrent revoke/append moves them under us
-    const lease = (await exec.query('SELECT lease_grant_seq FROM tsk_source_lease WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
-    if (!lease) throw new SourceFenceQuarantineError('no source lease — cannot issue a checkpoint for an unleased stream');
-    const grantSeq = vInt(lease.lease_grant_seq, 'lease_grant_seq', 1, MAX_SEQ);
+    // (H4) full-chain verify the EXACT live lease under FOR SHARE (never trust the mutable head row alone)
+    await exec.query('SELECT 1 FROM tsk_source_lease WHERE stream_id=$1 FOR SHARE', [s]);
+    const lease = await readSourceLease(exec, opts.leaseResolver, s); // chain-verified head
+    if (!lease) throw new SourceFenceQuarantineError('no source lease — cannot issue for an unleased stream');
+    // (H4) derive N from the SIGNED append-only ledger (tsk_outbox_rows), verify the signed head, and
+    // assert the MUTABLE checkpoint pointer agrees — never trust the mutable checkpoint row alone.
+    const topRow = (await exec.query('SELECT sequence, head_digest, head_prev, head_key_id, head_alg, head_sig FROM tsk_outbox_rows WHERE stream_id=$1 ORDER BY sequence DESC LIMIT 1 FOR SHARE', [s])).rows[0];
+    if (!topRow) throw new SourceFenceQuarantineError('no committed source rows — nothing to witness');
+    const n = vInt(topRow.sequence, 'source N', 1, MAX_SEQ);
+    const { headDigest: headN, headPrev: headNPrev } = verifyOutboxHead(opts.headResolver, n, topRow as Record<string, unknown>);
     const cp = (await exec.query('SELECT sequence, head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
     if (!cp) throw new SourceFenceQuarantineError('no source checkpoint — stream not provisioned');
-    const n = vInt(cp.sequence, 'source sequence', 0, MAX_SEQ);
-    if (n < 1) throw new SourceFenceQuarantineError('source checkpoint at genesis (N=0) — nothing to witness');
-    const headN = vHeadDigest(cp.head_digest, 'source head@N');
-    const priorSeq = n - 1;
-    const priorHeadDigest = priorSeq === 0
-      ? '0'.repeat(64)
-      : vHeadDigest((await exec.query('SELECT head_digest FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=$2', [s, priorSeq])).rows[0]?.head_digest, 'source head@N-1');
-    return signSourceCheckpointReceipt(sourceKeyId, sourcePrivateKey, { streamId: s, sourceSystemId: sysId, sourceSeq: n, sourceHeadDigest: headN, grantSeq, priorSeq, priorHeadDigest });
+    if (vInt(cp.sequence, 'cp sequence', 0, MAX_SEQ) !== n || vHeadDigest(cp.head_digest, 'cp head') !== headN) {
+      throw new SourceFenceQuarantineError('checkpoint pointer diverges from the committed signed row at N — quarantine');
+    }
+    // (H4) local ledger continuity at the tip: row N.head_prev must chain the SIGNED row N-1 (or genesis)
+    if (n > 1) {
+      const prevRow = (await exec.query('SELECT sequence, head_digest, head_prev, head_key_id, head_alg, head_sig FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=$2', [s, n - 1])).rows[0];
+      if (!prevRow) throw new SourceFenceQuarantineError('missing committed row at N-1 — ledger gap; quarantine');
+      const { headDigest: headNm1 } = verifyOutboxHead(opts.headResolver, n - 1, prevRow as Record<string, unknown>);
+      if (headNPrev !== headNm1) throw new SourceFenceQuarantineError('row N head_prev does not chain row N-1 — ledger fork; quarantine');
+    } else if (headNPrev !== OUTBOX_GENESIS_HEAD) {
+      throw new SourceFenceQuarantineError('row 1 head_prev is not genesis — ledger fork; quarantine');
+    }
+    // (H5) anchor continuity at the caller's CURRENT witnessed height W, deriving head@W from the signed
+    // ledger — supports a witness that lags the source by more than 1.
+    if (priorW > n) throw new SourceFenceQuarantineError(`witnessed height ${priorW} exceeds source N ${n} — restore/rollback; quarantine`);
+    let priorHeadDigest = OUTBOX_GENESIS_HEAD;
+    if (priorW >= 1) {
+      const wRow = (await exec.query('SELECT sequence, head_digest, head_prev, head_key_id, head_alg, head_sig FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=$2', [s, priorW])).rows[0];
+      if (!wRow) throw new SourceFenceQuarantineError(`missing committed row at the witnessed height ${priorW} — quarantine`);
+      priorHeadDigest = verifyOutboxHead(opts.headResolver, priorW, wRow as Record<string, unknown>).headDigest;
+    }
+    return signSourceCheckpointReceipt(opts.sourceKeyId, opts.sourcePrivateKey, { streamId: s, sourceSystemId: sysId, sourceSeq: n, sourceHeadDigest: headN, grantSeq: lease.leaseGrantSeq, priorSeq: priorW, priorHeadDigest });
   });
 }

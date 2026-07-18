@@ -14,7 +14,7 @@ import { generateKeyPairSync, sign as edSign } from 'node:crypto';
 import pg from 'pg';
 import {
   TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_WITNESS_SCHEMA, provisionSchemaVersion,
-  PgTskDurableOutbox, NodePostgresTransactor, ContractValidationError,
+  PgTskDurableOutbox, UnfencedSingleNodeTskDurableOutbox, NodePostgresTransactor, ContractValidationError,
   signLeaseGrant, installLeaseGrant, SourceFenceQuarantineError, assertSourceFenceReady,
   emitSourceFrozenReceipt, verifySourceFrozenReceipt, computeSourceStateDigest,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation,
@@ -65,7 +65,7 @@ async function main() {
   // full-catalog attestation) bound to THIS stream's authorized holder+leaseId+grant.
   const mkOutbox = async (sid: string, g: LeaseGrant, delayMs = 0) => {
     const ready = await assertSourceFenceReady(serial, SCHEMA, { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest });
-    return new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(delayMs), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { mode: 'fenced', resolver, controlToASkewBoundMs: 0, ready } });
+    return new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(delayMs), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready });
   };
   const append = (ob: PgTskDurableOutbox, sid: string, fence: bigint, counter: number) => ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter }, fenceToken: fence }));
 
@@ -133,7 +133,7 @@ async function main() {
     // (a) a capability that asserts a DIFFERENT holder than the live lease fails closed — even though the
     // lease is active at the right epoch (this is the "another legitimately-leased writer at same epoch" case).
     const wrongHolder = await assertSourceFenceReady(serial, SCHEMA, { streamId: sid, holderNodeId: 'B', leaseId: 'l1', grantDigest: g.grantDigest });
-    const obB = new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { mode: 'fenced', resolver, controlToASkewBoundMs: 0, ready: wrongHolder } });
+    const obB = new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready: wrongHolder });
     await assert.rejects(() => append(obB, sid, 0n, 1), /holder .* != authorized/);
     assert.equal(await seqOf(sid), 0, 'nothing committed for the wrong-holder writer');
     // (b) a capability bound to grant seq1 cannot ride a RENEWED grant (seq2, same holder/leaseId/epoch,
@@ -151,20 +151,20 @@ async function main() {
   await check('(C2/H1) a forged/foreign readiness token cannot construct a fencible outbox', async () => {
     const sid = 'tsk:ob:forge/v1'; await provision(sid); const g = await lease(sid, {});
     const forged = Object.freeze({}) as never; // not minted by assertSourceFenceReady
-    assert.throws(() => new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { mode: 'fenced', resolver, controlToASkewBoundMs: 0, ready: forged } }), /invalid source-fence capability/);
+    assert.throws(() => new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready: forged }), /invalid source-fence capability/);
     // a real token minted for a DIFFERENT stream is rejected too (bound to schema/stream)
     const otherSid = 'tsk:ob:ok/v1';
     const foreign = await assertSourceFenceReady(serial, SCHEMA, { streamId: otherSid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest });
-    assert.throws(() => new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { mode: 'fenced', resolver, controlToASkewBoundMs: 0, ready: foreign } }), /different schema\/stream/);
+    assert.throws(() => new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready: foreign }), /different schema\/stream/);
   });
 
-  await check('(H1) the gate is MANDATORY: omitting it throws; unfenced is a DELIBERATE, explicit opt-out', async () => {
+  await check('(H1) the AUTHORITATIVE outbox requires a fenced gate (no unfenced mode); unfenced is a DISTINCT type', async () => {
     const sid = 'tsk:ob:mandatory/v1'; await provision(sid);
-    // omitting sourceLeaseGate entirely → construction fails closed (no implicit bypass)
-    assert.throws(() => new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' } as never), /sourceLeaseGate is required/);
-    // an explicit single-node opt-out constructs + appends with NO lease (deliberate, auditable choice)
-    const ob = new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { mode: 'unfenced-single-node' } });
-    await append(ob, sid, 0n, 1); await append(ob, sid, 0n, 2);
+    // the authoritative constructor with NO fenced gate → fails closed (unfenced is not selectable here)
+    assert.throws(() => new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, undefined as never), /requires a fenced source gate/);
+    // the single-node path is a DISTINCT, explicitly-named class with no gate (deliberate, greppable choice)
+    const ob = new UnfencedSingleNodeTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' });
+    await append(ob as never, sid, 0n, 1); await append(ob as never, sid, 0n, 2);
     assert.equal(await seqOf(sid), 2, 'unfenced single-node append works without a lease');
   });
 

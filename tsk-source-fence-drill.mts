@@ -15,9 +15,11 @@ import {
   TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_LEASE_TABLES, NodePostgresTransactor,
   signLeaseGrant, installLeaseGrant, assertSourceLeaseWritable, readSourceLease, SourceFenceQuarantineError, assertSourceFenceReady,
   TSK_SOURCE_WITNESS_SCHEMA, TSK_SOURCE_WITNESS_TABLES, advanceSourceWitness, assertSourceWitnessReady, readSourceWitness, assertSourceWitnessConsistent,
-  signSourceCheckpointReceipt,
   type SourceVerifyKeyResolver, type BareLeaseGrant, type LeaseGrant, type SourceLiveState, type SourceCheckpointReceipt,
 } from './packages/server/dist/index.js';
+// (H3) the low-level signer + in-tx witness primitive are NOT on the public package API — internal
+// module-path import for protocol/continuity/crash tests only (production uses the owned issuer/advance).
+import { signSourceCheckpointReceipt } from './packages/server/dist/tsk-source-fence.js';
 
 const URL = process.env['TSK_TEST_SOURCE_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
 if (!URL) throw new Error('TSK_TEST_SOURCE_PG_URL (source PG16) is required');
@@ -176,10 +178,26 @@ async function main() {
     await tx.transaction(async (exec) => { await assertSourceLeaseWritable(exec, resolver, SID4, 0, 0, bound); }); // ok: head@2 == latest history
     // delete the latest history row so the (still valid, signed) head no longer matches the latest history
     await pool.query('DELETE FROM tsk_source_lease_history WHERE stream_id=$1 AND lease_grant_seq=2', [SID4]);
-    await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, SID4, 0, 0, bound)), /not the latest history row/);
+    await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, SID4, 0, 0, bound)), /latest history row/);
     // and a further install fails the full-chain check too
     const g3 = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: SID4, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'h4-g3', leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 3, prevGrantDigest: g2.grantDigest });
     await assert.rejects(() => tx.transaction((exec) => installLeaseGrant(exec, resolver, g3)), /not the exact latest history row|not contiguous/);
+  });
+
+  await check('(H2) the APPEND gate verifies the FULL chain — deleting an INTERMEDIATE history row fails closed', async () => {
+    const SID5 = 'tsk:pair:h2gate/v1';
+    const now = await nowMs();
+    let prev: string | null = null;
+    for (let seq = 1; seq <= 3; seq++) {
+      const g = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: SID5, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: `h2g-${seq}`, leaseExpiresAtMs: now + HOUR, leaseGrantSeq: seq, prevGrantDigest: prev });
+      await tx.transaction((exec) => installLeaseGrant(exec, resolver, g)); prev = g.grantDigest;
+    }
+    const head = (await readSourceLease(await poolExec(pool), resolver, SID5))!;
+    const bound = { holderNodeId: 'A', leaseId: 'l1', grantDigest: head.grantDigest };
+    await tx.transaction(async (exec) => { await assertSourceLeaseWritable(exec, resolver, SID5, 0, 0, bound); }); // ok: full chain 1..3
+    // delete an INTERMEDIATE row (seq2) — head==latest (seq3) still holds, but the chain is now broken
+    await pool.query('DELETE FROM tsk_source_lease_history WHERE stream_id=$1 AND lease_grant_seq=2', [SID5]);
+    await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, SID5, 0, 0, bound)), /not contiguous|chain broken/);
   });
 
   console.log(`\n# ${passed} PR2b-0 source fence-gate checks passed`);

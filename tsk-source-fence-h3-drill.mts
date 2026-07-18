@@ -23,7 +23,7 @@ import {
   signLeaseGrant, installLeaseGrant, assertSourceFenceReady, advanceSourceWitness, assertSourceWitnessReady,
   readSourceWitness, issueSourceCheckpointReceipt, SourceFenceQuarantineError,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation,
-  type TskHotpMutation, type SourceVerifyKeyResolver, type LeaseGrant, type SourceGateConfig,
+  type TskHotpMutation, type SourceVerifyKeyResolver, type LeaseGrant, type SourceFenceGate,
 } from './packages/server/dist/index.js';
 
 const A_URL = process.env['TSK_TEST_SOURCE_PG_URL_A'] ?? process.env['TSK_TEST_SOURCE_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -32,10 +32,11 @@ if (!A_URL || !C_URL) throw new Error('TSK_TEST_SOURCE_PG_URL_A + TSK_TEST_CONTR
 
 const GUARD_KEY = 'guard-1'; const guard = generateKeyPairSync('ed25519'); const guardSecret = guard.privateKey;
 const SOURCE_KEY = 'source-1'; const source = generateKeyPairSync('ed25519'); const sourceSecret = source.privateKey;
-const resolver: SourceVerifyKeyResolver = { resolve: (k) => (k === GUARD_KEY ? guard.publicKey : k === SOURCE_KEY ? source.publicKey : null) };
+const HEAD_KEY = 'k1'; const headKp = generateKeyPairSync('ed25519'); const privateKey = headKp.privateKey; // outbox head signer
+// one resolver holds the PUBLIC keys for the guard (lease), the source (checkpoint), and the outbox head signer.
+const resolver: SourceVerifyKeyResolver = { resolve: (k) => (k === GUARD_KEY ? guard.publicKey : k === SOURCE_KEY ? source.publicKey : k === HEAD_KEY ? headKp.publicKey : null) };
 const HOUR = 3_600_000; const GEN = '0'.repeat(64);
-const { privateKey } = generateKeyPairSync('ed25519');
-const plainSigner: StreamHeadSigner = { keyId: 'k1', alg: 'ed25519', async sign(d) { return edSign(null, Buffer.from(d, 'utf8'), privateKey).toString('base64url'); } };
+const plainSigner: StreamHeadSigner = { keyId: HEAD_KEY, alg: 'ed25519', async sign(d) { return edSign(null, Buffer.from(d, 'utf8'), privateKey).toString('base64url'); } };
 const sanitizer: HotpMutationSanitizer = {
   sanitize(raw) { if (typeof raw.tumblerId !== 'string' || !Number.isInteger(raw.counter)) throw new ContractValidationError('bad'); return { tumblerId: raw.tumblerId, counter: raw.counter } as SanitizedMutation<TskHotpMutation>; },
   assertSanitized(c): asserts c is SanitizedMutation<TskHotpMutation> { if (!c || typeof c !== 'object') throw new ContractValidationError('unsanitized'); },
@@ -68,13 +69,14 @@ async function main() {
   const aSysId = String((await aPool.query('SELECT system_identifier::text AS s FROM pg_control_system()')).rows[0].s);
   async function provision(sid: string) { await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [sid]); await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [sid, 'e1']); }
   const grant = async (sid: string, over: Record<string, unknown> = {}): Promise<LeaseGrant> => signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'g1', leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 1, prevGrantDigest: null, ...over } as never);
-  const mkGate = async (sid: string, g: LeaseGrant): Promise<SourceGateConfig> => ({ mode: 'fenced', resolver, controlToASkewBoundMs: 0, ready: await assertSourceFenceReady(aTx, 'public', { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest }) });
+  const mkGate = async (sid: string, g: LeaseGrant): Promise<SourceFenceGate> => ({ resolver, controlToASkewBoundMs: 0, ready: await assertSourceFenceReady(aTx, 'public', { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest }) });
   const append = (ob: PgTskDurableOutbox, sid: string, counter: number) => ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter }, fenceToken: 0n }));
   // real head at a given committed source height, straight from the row chain (for assertions only)
   const headAt = async (sid: string, seq: number): Promise<string> => seq <= 0 ? GEN : String((await aPool.query('SELECT head_digest FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=$2', [sid, seq])).rows[0].head_digest);
   // (H5) a checkpoint receipt DERIVED from the committed ledger at the CURRENT height by the atomic,
   // schema-pinned, FOR SHARE-locked issuer (not hand-built from unlocked queries).
-  const issue = (sid: string) => issueSourceCheckpointReceipt(aTx, 'public', sid, SOURCE_KEY, sourceSecret);
+  const issue = (sid: string, priorWitnessSeq: number) => issueSourceCheckpointReceipt(aTx, 'public', sid, { sourceKeyId: SOURCE_KEY, sourcePrivateKey: sourceSecret, leaseResolver: resolver, headResolver: resolver, priorWitnessSeq });
+  const witnessH = async (sid: string): Promise<number> => (await cTx.transaction((exec) => readSourceWitness(exec, resolver, sid)))?.maxSourceSeq ?? 0;
 
   await check('REAL barrier: while an append holds the lease FOR SHARE, a revoke UPDATE blocks (pg_locks), commits only after the append, then new appends fail closed', async () => {
     const sid = 'tsk:h3:barrier/v1'; await provision(sid); const g = await grant(sid);
@@ -82,7 +84,7 @@ async function main() {
     // a signer that pauses the FIRST append mid-tx (FOR SHARE on the lease is held at this point)
     let release: (() => void) | null = null; let armed = true;
     const barrierSigner: StreamHeadSigner = { keyId: 'k1', alg: 'ed25519', async sign(d) { if (armed) { armed = false; await new Promise<void>((r) => { release = r; }); } return edSign(null, Buffer.from(d, 'utf8'), privateKey).toString('base64url'); } };
-    const ob = new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer: barrierSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: await mkGate(sid, g) });
+    const ob = new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer: barrierSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, await mkGate(sid, g));
     const appendP = append(ob, sid, 1); // starts, then blocks in the signer while holding FOR SHARE
     await waitUntil(() => release !== null); // append is now paused mid-tx with the lease locked
     // a conflicting revoke on an INDEPENDENT connection — it must WAIT on the lease row lock
@@ -99,7 +101,7 @@ async function main() {
     await revokeP; // only now does the revoke proceed
     assert.equal(revokeDone, true, 'the revoke committed after the append released the lock');
     // and the freeze is now authoritative — new appends fail closed
-    const ob2 = new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer: plainSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: await mkGate(sid, g) });
+    const ob2 = new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer: plainSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, await mkGate(sid, g));
     const at = await seqOf(sid);
     await assert.rejects(() => append(ob2, sid, 2), SourceFenceQuarantineError);
     assert.equal(await seqOf(sid), at, 'nothing committed after the authoritative freeze');
@@ -109,16 +111,16 @@ async function main() {
     const sid = 'tsk:h3:fork/v1'; await provision(sid); const g = await grant(sid);
     await aTx.transaction((exec) => installLeaseGrant(exec, resolver, g));
     const wReady = await assertSourceWitnessReady(cTx, 'public'); // (H3) db/schema-bound witness capability
-    const ob = new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer: plainSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: await mkGate(sid, g) });
+    const ob = new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer: plainSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, await mkGate(sid, g));
     // grow to height 2, SNAPSHOT the real committed source tables, then ISSUE + WITNESS the ledger-derived receipt@2
     await append(ob, sid, 10); await append(ob, sid, 20);
     await aPool.query('CREATE TABLE snap_rows AS SELECT * FROM tsk_outbox_rows WHERE stream_id=$1', [sid]);
     await aPool.query('CREATE TABLE snap_cp AS SELECT * FROM tsk_outbox_source_checkpoint WHERE stream_id=$1', [sid]);
-    await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, await issue(sid)); // witness@2 (issuer derives height 2)
+    await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, await issue(sid, await witnessH(sid))); // witness@2 (prior=genesis 0)
     // grow to height 3 (ORIGINAL timeline) and WITNESS the real ledger-derived head@3
     await append(ob, sid, 30);
     const headAt3orig = await headAt(sid, 3);
-    await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, await issue(sid)); // witness@3 (issuer derives height 3)
+    await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, await issue(sid, await witnessH(sid))); // witness@3 (prior=2)
     const wBefore = await cTx.transaction((exec) => readSourceWitness(exec, resolver, sid));
     assert.equal(wBefore?.maxSourceSeq, 3); assert.equal(wBefore?.headDigest, headAt3orig, 'witness pinned the real head@3');
     // LOGICAL ROLLBACK to the height-2 snapshot (real DELETE + reinsert of the committed rows — a logical
@@ -132,7 +134,7 @@ async function main() {
     assert.notEqual(headAt3fork, headAt3orig, 'the fork produced a genuinely different head@3');
     // the witness is at height 3 (Horig3); the issuer-derived receipt from the forked height-4 state carries
     // priorHead@3 = Hfork3 (real, != Horig3), so C5 continuity at the witnessed height quarantines it.
-    const receiptFork = await issue(sid);
+    const receiptFork = await issue(sid, await witnessH(sid)); // prior=witnessed 3; derives fork head@3 (Hfork3)
     await assert.rejects(
       () => advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, receiptFork),
       /diverges from the witness|restore\/FORK/,
@@ -140,6 +142,23 @@ async function main() {
     // sanity: the witness state is unchanged (the fork was rejected, not absorbed)
     const wAfter = await cTx.transaction((exec) => readSourceWitness(exec, resolver, sid));
     assert.equal(wAfter?.headDigest, headAt3orig, 'the witness still pins the original head@3 — fork rejected');
+  });
+
+  await check('(H5) witness lag > 1: source at 10, witness at 3 → one issuer-derived proof advances 3→10', async () => {
+    const sid = 'tsk:h3:lag/v1'; await provision(sid); const g = await grant(sid);
+    await aTx.transaction((exec) => installLeaseGrant(exec, resolver, g));
+    const wReady = await assertSourceWitnessReady(cTx, 'public');
+    const ob = new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer: plainSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, await mkGate(sid, g));
+    for (let c = 1; c <= 3; c++) await append(ob, sid, c); // grow to 3
+    await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, await issue(sid, await witnessH(sid))); // witness@3
+    assert.equal((await witnessH(sid)), 3);
+    for (let c = 4; c <= 10; c++) await append(ob, sid, c); // source races ahead to 10 (witness still at 3)
+    const headAt10 = await headAt(sid, 10);
+    // ONE issuer-derived receipt anchored at the CURRENT witnessed height (3) advances the witness 3→10
+    const r = await issue(sid, await witnessH(sid)); // priorSeq=3, sourceSeq=10, priorHead@3 from the signed ledger
+    assert.equal(r.priorSeq, 3); assert.equal(r.sourceSeq, 10);
+    const w = await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, r);
+    assert.equal(w.maxSourceSeq, 10); assert.equal(w.headDigest, headAt10, 'witness caught up 3→10 in one proven step');
   });
 
   console.log(`\n# ${passed} PR2b-0 H3 real concurrency + restore/fork checks passed`);
