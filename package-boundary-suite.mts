@@ -55,8 +55,29 @@ for (const workspace of workspaces) {
 
   const exports = await import(pathToFileURL(mainPath).href);
   assert(Object.keys(exports).length > 0, `${manifest.name} runtime entry point has no exports`);
+
+  // (HIGH1) the shipped package MUST NOT expose any readiness-token mint helper:
+  // a deep import into dist/ could otherwise construct an unattested SchemaReadyToken.
+  // Guard both the public entry AND the shipped outbox module by source scan.
+  // Scoped to the readiness-token concept so unrelated names (e.g. secureRandomInt)
+  // do not false-trip.
+  const READINESS_MINT = /mintready|readymint|unsafe.*mint|mint.*readytoken|__internalunsafe/i;
+  assert(
+    !Object.keys(exports).some((k) => READINESS_MINT.test(k)),
+    `${manifest.name} public API exposes a readiness-token mint helper`,
+  );
+  if (manifest.name === '@tsk/server') {
+    const distDir = path.resolve(packageDir, 'dist');
+    const outbox = await readFile(path.join(distDir, 'tsk-hotp-outbox-pg.js'), 'utf8');
+    assert(
+      !/export\s+(?:async\s+)?(?:function|const|let|var)\s+\w*[Mm]intReady\w*/.test(outbox)
+        && !/export\s+(?:async\s+)?(?:function|const|let|var)\s+__internalUnsafe\w*/.test(outbox)
+        && !/export\s*\{[^}]*(?:[Mm]intReady|__internalUnsafe)[^}]*\}/.test(outbox),
+      '@tsk/server dist exports a readiness-token mint helper (deep-import bypass)',
+    );
+  }
   passed++;
-  console.log(`  PASS ${manifest.name} entry points exist and import`);
+  console.log(`  PASS ${manifest.name} entry points exist and import (no mint/unsafe export)`);
 }
 
 console.log(`TSK package boundary suite: ${passed}/${workspaces.length} passed`);
