@@ -92,6 +92,11 @@ export {
   signSourceFrozenReceipt,
   verifySourceFrozenReceipt,
   emitSourceFrozenReceipt,
+  TSK_SOURCE_WITNESS_SCHEMA,
+  TSK_SOURCE_WITNESS_TABLES,
+  readSourceWitness,
+  assertSourceWitnessConsistent,
+  advanceSourceWitness,
   SourceFenceQuarantineError,
 } from './tsk-source-fence.js';
 export type {
@@ -99,6 +104,8 @@ export type {
   BareLeaseGrant,
   LeaseState as SourceLeaseState,
   SourceFrozenReceipt,
+  SourceLiveState,
+  WitnessState as SourceWitnessState,
 } from './tsk-source-fence.js';
 export type {
   GuardKeyResolver,

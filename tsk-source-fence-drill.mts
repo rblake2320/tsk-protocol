@@ -13,7 +13,8 @@ import pg from 'pg';
 import {
   TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_LEASE_TABLES, NodePostgresTransactor,
   signLeaseGrant, installLeaseGrant, assertSourceLeaseWritable, readSourceLease, SourceFenceQuarantineError,
-  type GuardKeyResolver, type BareLeaseGrant, type LeaseGrant,
+  TSK_SOURCE_WITNESS_SCHEMA, TSK_SOURCE_WITNESS_TABLES, advanceSourceWitness, readSourceWitness, assertSourceWitnessConsistent,
+  type GuardKeyResolver, type BareLeaseGrant, type LeaseGrant, type SourceLiveState,
 } from './packages/server/dist/index.js';
 
 const URL = process.env['TSK_TEST_SOURCE_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -31,8 +32,9 @@ async function check(name: string, fn: () => Promise<void>) { await fn(); passed
 async function main() {
   console.log('# TSK PR2b-0 source fence/lease gate drill (real source PG16)');
   const pool = new pg.Pool({ connectionString: URL, max: 4 }); pool.on('error', () => {});
-  await pool.query(`DROP TABLE IF EXISTS ${TSK_SOURCE_LEASE_TABLES.join(', ')} CASCADE`);
+  await pool.query(`DROP TABLE IF EXISTS ${TSK_SOURCE_LEASE_TABLES.join(', ')}, ${TSK_SOURCE_WITNESS_TABLES.join(', ')} CASCADE`);
   for (const s of TSK_SOURCE_LEASE_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
+  for (const s of TSK_SOURCE_WITNESS_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
   const tx = new NodePostgresTransactor(pool as never);
   const nowMs = async () => Number((await pool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
   const grant = (over: Partial<BareLeaseGrant>): LeaseGrant => signLeaseGrant(GUARD_KEY, guardSecret, {
@@ -84,6 +86,32 @@ async function main() {
     const revoke = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: SID2, leaseEpoch: 0, leaseStatus: 'revoked', holderNodeId: 'A', leaseId: 'l1', commandId: 'r-revoke', leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 2, prevGrantDigest: head.grantDigest });
     await tx.transaction((exec) => installLeaseGrant(exec, resolver, revoke));
     await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, SID2, 0, 0)), SourceFenceQuarantineError);
+  });
+
+  // ── M4: external restore/fork witness ──
+  const H = (x: string) => x.repeat(64).slice(0, 64);
+  const WSID = 'tsk:pair:witness/v1';
+  await check('witness: advance genesis; assertConsistent ok for >= high-water; advance rejects regression', async () => {
+    await tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, { streamId: WSID, sourceSystemId: 'sysA', grantSeq: 2, sourceSeq: 5, headDigest: H('a') }));
+    const w = await tx.transaction((exec) => readSourceWitness(exec, resolver, WSID));
+    assert.equal(w?.maxSourceSeq, 5); assert.equal(w?.witnessSeq, 1);
+    assertSourceWitnessConsistent(w, { sourceSystemId: 'sysA', grantSeq: 2, sourceSeq: 5, headDigest: H('a') }); // exact high-water
+    assertSourceWitnessConsistent(w, { sourceSystemId: 'sysA', grantSeq: 3, sourceSeq: 7, headDigest: H('b') }); // advanced ok
+    // advance forward
+    await tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, { streamId: WSID, sourceSystemId: 'sysA', grantSeq: 3, sourceSeq: 7, headDigest: H('b') }));
+    // advancing with a regressed high-water is rejected
+    await assert.rejects(() => tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, { streamId: WSID, sourceSystemId: 'sysA', grantSeq: 3, sourceSeq: 4, headDigest: H('b') })), /restore\/rollback/);
+  });
+  await check('witness detects: restore (grant/seq regression), same-height FORK, system_identifier change, tamper', async () => {
+    const w = (await tx.transaction((exec) => readSourceWitness(exec, resolver, WSID)))!; // sysA, gs3, ss7, headB
+    const live = (over: Partial<SourceLiveState>): SourceLiveState => ({ sourceSystemId: 'sysA', grantSeq: 3, sourceSeq: 7, headDigest: H('b'), ...over });
+    assert.throws(() => assertSourceWitnessConsistent(w, live({ grantSeq: 2 })), /restore\/rollback/);       // grant_seq regressed
+    assert.throws(() => assertSourceWitnessConsistent(w, live({ sourceSeq: 6 })), /restore\/rollback/);      // source seq regressed
+    assert.throws(() => assertSourceWitnessConsistent(w, live({ headDigest: H('c') })), /same-height FORK/); // divergent head @ ss7
+    assert.throws(() => assertSourceWitnessConsistent(w, live({ sourceSystemId: 'sysB' })), /system_identifier changed/);
+    assert.doesNotThrow(() => assertSourceWitnessConsistent(null, live({}))); // genesis ok
+    await pool.query("UPDATE tsk_source_witness SET guard_signature='AAAA' WHERE stream_id=$1", [WSID]);
+    await assert.rejects(() => tx.transaction((exec) => readSourceWitness(exec, resolver, WSID)), /guard signature/);
   });
 
   console.log(`\n# ${passed} PR2b-0 source fence-gate checks passed`);

@@ -340,3 +340,96 @@ export async function emitSourceFrozenReceipt(exec: PgExecutor, resolver: GuardK
 }
 
 const GENESIS_HEAD_ZERO = '0'.repeat(64);
+
+// ── external restore/fork witness (§A.3) — lives on the CONTROL DB ────────────
+
+/** An external, guard-signed, monotonic witness of the source's high-water state. It lives on the
+ *  CONTROL DB (the source cannot roll it back), so a source-PG RESTORE that rolls back grant_seq /
+ *  source seq / head is detected as a regression, and a divergent head at the same seq as a FORK. */
+export const TSK_SOURCE_WITNESS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS tsk_source_witness (
+  stream_id            text PRIMARY KEY,
+  source_system_id     text   NOT NULL,
+  max_grant_seq        bigint NOT NULL CHECK (max_grant_seq >= 0),
+  max_source_seq       bigint NOT NULL CHECK (max_source_seq >= 0),
+  source_head_digest   text   NOT NULL CHECK (source_head_digest ~ '^[0-9a-f]{64}$'),
+  witness_seq          bigint NOT NULL CHECK (witness_seq >= 1),
+  prev_witness_digest  text CHECK (prev_witness_digest IS NULL OR prev_witness_digest ~ '^[0-9a-f]{64}$'),
+  witness_digest       text   NOT NULL CHECK (witness_digest ~ '^[0-9a-f]{64}$'),
+  guard_key_id         text   NOT NULL,
+  guard_signature      text   NOT NULL,
+  updated_at           timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS tsk_source_witness_history (
+  stream_id text NOT NULL, source_system_id text NOT NULL, max_grant_seq bigint NOT NULL,
+  max_source_seq bigint NOT NULL, source_head_digest text NOT NULL, witness_seq bigint NOT NULL,
+  prev_witness_digest text, witness_digest text NOT NULL, guard_key_id text NOT NULL,
+  guard_signature text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (stream_id, witness_seq), UNIQUE (stream_id, witness_digest)
+)
+`.trim();
+
+export const TSK_SOURCE_WITNESS_TABLES = ['tsk_source_witness', 'tsk_source_witness_history'] as const;
+
+export interface SourceLiveState { sourceSystemId: string; grantSeq: number; sourceSeq: number; headDigest: string; }
+export interface WitnessState { streamId: string; sourceSystemId: string; maxGrantSeq: number; maxSourceSeq: number; headDigest: string; witnessSeq: number; witnessDigest: string; }
+
+const witnessMsg = (s: string, sysId: string, gs: number, ss: number, head: string, wseq: number, prev: string | null, digest: string): Buffer =>
+  frame('tsk_source_witness/v1', s, sysId, gs, ss, head, wseq, prev, digest);
+
+function vHeadDigest(v: unknown, label: string): string {
+  const d = String(v);
+  if (!DIGEST_RE.test(d)) throw new ContractValidationError(`invalid ${label}`);
+  return d;
+}
+
+/** Read + verify the current signed witness head (tamper-evident). Null if none. */
+export async function readSourceWitness(exec: PgExecutor, resolver: GuardKeyResolver, streamId: string): Promise<WitnessState | null> {
+  const s = vId(streamId, STREAM_ID_RE, 'streamId');
+  const r = (await exec.query('SELECT source_system_id, max_grant_seq, max_source_seq, source_head_digest, witness_seq, prev_witness_digest, witness_digest, guard_key_id, guard_signature FROM tsk_source_witness WHERE stream_id=$1', [s])).rows[0];
+  if (!r) return null;
+  const sysId = String(r.source_system_id), gs = vInt(r.max_grant_seq, 'max_grant_seq', 0, MAX_SEQ), ss = vInt(r.max_source_seq, 'max_source_seq', 0, MAX_SEQ);
+  const head = vHeadDigest(r.source_head_digest, 'source_head_digest'), wseq = vInt(r.witness_seq, 'witness_seq', 1, MAX_SEQ);
+  const prev = vNullableDigest(r.prev_witness_digest, 'prev_witness_digest'), digest = vHeadDigest(r.witness_digest, 'witness_digest');
+  if (sha256hex(witnessMsg(s, sysId, gs, ss, head, wseq, prev, '')) !== digest) throw new ContractValidationError('witness digest mismatch');
+  verifyGuard(resolver, String(r.guard_key_id), witnessMsg(s, sysId, gs, ss, head, wseq, prev, digest), String(r.guard_signature));
+  return { streamId: s, sourceSystemId: sysId, maxGrantSeq: gs, maxSourceSeq: ss, headDigest: head, witnessSeq: wseq, witnessDigest: digest };
+}
+
+/** (§A.3) Assert the live source high-water state is consistent with the external witness. A regression
+ *  (grant_seq / source seq below the witness = restore/rollback), a divergent head at the witness seq
+ *  (= same-height fork), or a changed system_identifier → QUARANTINE. No witness yet → genesis (ok). */
+export function assertSourceWitnessConsistent(witness: WitnessState | null, live: SourceLiveState): void {
+  if (witness === null) return; // genesis — the first advance stamps it
+  if (live.sourceSystemId !== witness.sourceSystemId) throw new SourceFenceQuarantineError(`source system_identifier changed (${live.sourceSystemId} != witnessed ${witness.sourceSystemId}) — restore/clone; quarantine`);
+  if (live.grantSeq < witness.maxGrantSeq) throw new SourceFenceQuarantineError(`live grant_seq ${live.grantSeq} < witnessed ${witness.maxGrantSeq} — restore/rollback; quarantine`);
+  if (live.sourceSeq < witness.maxSourceSeq) throw new SourceFenceQuarantineError(`live source seq ${live.sourceSeq} < witnessed ${witness.maxSourceSeq} — restore/rollback; quarantine`);
+  if (live.sourceSeq === witness.maxSourceSeq && vHeadDigest(live.headDigest, 'live.headDigest') !== witness.headDigest) {
+    throw new SourceFenceQuarantineError('live head digest diverges from the witness at the same source seq — same-height FORK; quarantine');
+  }
+}
+
+/** Monotonically advance the external witness (guard-signed forward-CAS). Rejects a regression/fork
+ *  (via assertSourceWitnessConsistent against the incoming high-water) before stamping. */
+export async function advanceSourceWitness(exec: PgExecutor, resolver: GuardKeyResolver, guardKeyId: string, guardSecret: Buffer | string, entry: SourceLiveState & { streamId: string }): Promise<WitnessState> {
+  const s = vId(entry.streamId, STREAM_ID_RE, 'streamId');
+  const sysId = vId(entry.sourceSystemId, ID_RE, 'sourceSystemId');
+  const gs = vInt(entry.grantSeq, 'grantSeq', 0, MAX_SEQ), ss = vInt(entry.sourceSeq, 'sourceSeq', 0, MAX_SEQ);
+  const head = vHeadDigest(entry.headDigest, 'headDigest');
+  if (!KEY_ID_RE.test(guardKeyId)) throw new ContractValidationError('invalid guard keyId');
+  const cur = await readSourceWitness(exec, resolver, s);
+  assertSourceWitnessConsistent(cur, { sourceSystemId: sysId, grantSeq: gs, sourceSeq: ss, headDigest: head });
+  const wseq = (cur?.witnessSeq ?? 0) + 1;
+  const prev = cur?.witnessDigest ?? null;
+  const digest = sha256hex(witnessMsg(s, sysId, gs, ss, head, wseq, prev, ''));
+  const sig = createHmac('sha256', toSecret(guardSecret)).update(withKey(guardKeyId, witnessMsg(s, sysId, gs, ss, head, wseq, prev, digest))).digest().toString('base64url');
+  const cols = 'stream_id, source_system_id, max_grant_seq, max_source_seq, source_head_digest, witness_seq, prev_witness_digest, witness_digest, guard_key_id, guard_signature';
+  const vals = [s, sysId, gs, ss, head, wseq, prev, digest, guardKeyId, sig];
+  await exec.query(`INSERT INTO tsk_source_witness_history (${cols}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, vals);
+  if (prev === null) {
+    await exec.query(`INSERT INTO tsk_source_witness (${cols}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, vals);
+  } else {
+    affectedOne(await exec.query('UPDATE tsk_source_witness SET source_system_id=$2, max_grant_seq=$3, max_source_seq=$4, source_head_digest=$5, witness_seq=$6, prev_witness_digest=$7, witness_digest=$8, guard_key_id=$9, guard_signature=$10, updated_at=now() WHERE stream_id=$1 AND witness_digest=$11', [...vals, prev]), 'witness forward-CAS');
+  }
+  return { streamId: s, sourceSystemId: sysId, maxGrantSeq: gs, maxSourceSeq: ss, headDigest: head, witnessSeq: wseq, witnessDigest: digest };
+}
