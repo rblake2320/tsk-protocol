@@ -64,19 +64,29 @@ Production profile may select STONITH instead of wait-for-expiry; the drill uses
 ### 3.1 Schemas (PR2a) — executable DDL sketches (control DB unless noted)
 
 ```sql
--- schema/version authority for all PR2 control tables
-CREATE TABLE tsk_ha_schema (version int PRIMARY KEY, manifest_digest text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now());
-
--- (H2) provisioning intent — written FIRST; explicit incomplete state
-CREATE TABLE tsk_ha_provisioning (
-  stream_id       text PRIMARY KEY,
-  genesis_marker  text        NOT NULL,
-  state           text        NOT NULL CHECK (state IN ('intent','incomplete','provisioned')),
-  guard_key_id    text        NOT NULL,
-  guard_signature text        NOT NULL,       -- signs (stream_id, genesis_marker)
-  created_at      timestamptz NOT NULL DEFAULT now(),
-  provisioned_at  timestamptz
+-- (correction 6) schema/version authority — SINGLETON + pinned full-catalog attestation
+CREATE TABLE tsk_ha_schema (
+  id               int PRIMARY KEY CHECK (id = 1),   -- exactly one authority row
+  version          int         NOT NULL,
+  catalog_manifest text        NOT NULL,             -- pinned digest over the full control catalog (cf. TSK_OUTBOX_SCHEMA_MANIFEST)
+  applied_at       timestamptz NOT NULL DEFAULT now()
 );
+
+-- (H2, correction 6) provisioning — state transitions are affected-row=1 forward CAS with a
+-- SIGNED state digest per transition (not an unsigned mutable state under an initial signature)
+CREATE TABLE tsk_ha_provisioning (
+  stream_id         text PRIMARY KEY,
+  genesis_marker    text        NOT NULL,
+  state             text        NOT NULL CHECK (state IN ('intent','incomplete','provisioned')),
+  state_seq         bigint      NOT NULL,             -- monotonic
+  prev_state_digest text,                             -- forward CAS
+  state_digest      text        NOT NULL,             -- canonical digest of THIS state
+  guard_key_id      text        NOT NULL,
+  guard_signature   text        NOT NULL,             -- signs (stream_id,genesis_marker,state,state_seq,prev_state_digest,state_digest)
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  provisioned_at    timestamptz
+);
+-- each provisioning transition: UPDATE ... WHERE stream_id=$1 AND state_digest=$prev (affect 1).
 
 -- external monotonic epoch witness (authoritative floor; distinct failure domain from Redis)
 CREATE TABLE tsk_ha_epoch_witness (
@@ -86,20 +96,27 @@ CREATE TABLE tsk_ha_epoch_witness (
   updated_at      timestamptz NOT NULL DEFAULT now()
 );
 
--- (H3) control-authority GRANTED write lease for the current source node. A cannot self-renew;
--- the control DB records the externally-observable max expiry + a revocation flag.
+-- (H3, correction 2) control-authority GRANTED write lease. A cannot self-renew. Grants are
+-- MONOTONIC + forward-CAS (grant_seq + prev_grant_digest) so an OLD signed grant cannot be
+-- replayed on A: A's grant applier accepts a grant only if its grant_seq > A's current lease
+-- grant_seq (checked in-tx), and rejects a lower/equal one even if the signature is valid.
 CREATE TABLE tsk_ha_lease (
   stream_id          text PRIMARY KEY,
   lease_id           text        NOT NULL,     -- opaque, rotated per grant
   holder_node_id     text        NOT NULL,     -- the current source authority (A)
-  epoch              bigint      NOT NULL,     -- the epoch this lease authorizes
-  granted_max_expiry timestamptz NOT NULL,     -- CONTROL-DB clock; A must be dead after this (+skew+tx window)
+  epoch              bigint      NOT NULL,
+  grant_seq          bigint      NOT NULL,     -- monotonic per stream (anti-replay)
+  prev_grant_digest  text,                     -- forward CAS
+  granted_max_expiry timestamptz NOT NULL,     -- CONTROL-DB clock; A dead after this (+skew+tx window)
   revoked            boolean     NOT NULL DEFAULT false,
-  grant_digest       text        NOT NULL,     -- canonical digest of the grant
-  guard_key_id       text        NOT NULL,
-  guard_signature    text        NOT NULL,     -- signs (stream_id, lease_id, holder, epoch, granted_max_expiry)
+  grant_digest       text        NOT NULL,     -- canonical digest of THIS grant
+  guard_key_id       text        NOT NULL,     -- rotation: registry of valid keyIds; revocation rejects a revoked keyId
+  guard_signature    text        NOT NULL,     -- signs (stream_id,lease_id,holder,epoch,grant_seq,prev_grant_digest,granted_max_expiry)
   updated_at         timestamptz NOT NULL DEFAULT now()
 );
+-- A-PG grant applier + runtime roles: the runtime (write) role CANNOT install a lease; only a
+-- separate grant-applier role installs a grant, and only strictly-increasing grant_seq — so a
+-- replayed older still-valid signed grant is rejected in-tx.
 ```
 
 On **each source PG** (A / a promoted B), the existing `tsk_outbox_fence(stream_id, fence_token)`
@@ -129,7 +146,9 @@ refuse until provisioning is idempotently completed or governed-reset. `never-pr
 (no intent) is distinct from `incomplete` (intent present, not `provisioned`) is distinct from
 `provisioned-then-Redis-lost` (provisioned + Redis absent/lower → §3.4 quarantine).
 
-### 3.3 Promotion saga (Redis + 3 PG are NOT atomic — write-ahead intent + resource-fencing order)
+### 3.3 Promotion saga (Redis + PGs are NOT atomic — write-ahead intent + resource-fencing order)
+
+(PR2a touches the source PG + control PG + Redis; the receiver-B PG enters in PR2b — §5.8.)
 
 Redis and the PGs cannot commit atomically, so the saga uses a **durable, guard-signed
 write-ahead INTENT** (H1) as the single authoritative record of an in-flight promotion, then
@@ -137,10 +156,12 @@ orders the effects so a partial failure leaves **no writer**. `E' = witness.epoc
 step is idempotent, keyed by `(streamId, E', commandId)`.
 
 0. **(H1) Durable signed intent BEFORE any effect — exactly ONE active intent per stream.**
-   Atomically insert a `PREPARING` reservation into the **control DB** keyed by `stream_id`
-   (a `UNIQUE (stream_id) WHERE phase NOT IN (terminal states)` partial constraint) with
-   `epoch = E'`, `commandId`, and a **guard signature**. Conflict resolution — **never
-   leapfrog an in-flight intent**:
+   Admission is the **`tsk_ha_cutover_head` CAS (§5.1)**, not a partial-unique index: a new
+   `PREPARING` intent is admitted only when the head row's `phase` is terminal
+   (`ACTIVE`/`ABORTED`) or the head is absent — the `UPDATE ... WHERE stream_id=$1 AND phase IN
+   ('ACTIVE','ABORTED')` (or an insert-if-absent) must affect exactly 1 row, and it writes the
+   signed `PREPARING` head + a signed history row with `epoch = E'`, `commandId`, and the guard
+   signature. Conflict resolution — **never leapfrog an in-flight intent**:
    - **same `commandId`** → **idempotent resume** of the existing intent;
    - **different `commandId`** while an intent is active → **deny / quarantine**; the new
      promotion is refused until the current intent reaches a **terminal governed state**
@@ -196,9 +217,14 @@ On any claim/promotion path, cross-check Redis `R` against the witness `W`:
 until reconciled:
 - **pre-effect abort** (intent still `PREPARING`, no fence/claim/witness effect) → the target
   `E'` **is reused** by the next promotion (nothing was consumed);
-- **post-effect abort** (any effect applied) → the epoch is **consumed**; the next promotion
-  uses `witness.epoch + 1` against the reconciled state. Epochs are **never gratuitously
-  skipped** and never reused after an effect.
+- **post-effect abort** (any effect applied) → **before** the head transitions to terminal
+  `ABORTED`, the abort saga (under the SAME signed intent) **reconciles/consumes `E'` fully
+  across witness + Redis + fences** — e.g. if Redis claimed `E'` but the witness had not
+  advanced, advance the witness to `E'` (§3.4 `R>W` reconciliation) so the epoch is consistently
+  consumed everywhere. **Only after that reconciliation** does the head reach `ABORTED`, and the
+  next intent uses `witness.epoch + 1 = E'+1`. This is what lets **"never reuse after an effect"
+  and "never skip"** both hold — `E'` is neither reused (it is consumed) nor skipped (the witness
+  is now exactly at `E'`, so `+1` is contiguous).
 
 **H4/H10 — Redis durability under Sentinel async failover (internet-verified against official
 Redis docs).** Redis OSS Sentinel **explicitly does NOT guarantee** that acknowledged writes
@@ -263,17 +289,23 @@ frozen final head **N**:
 - `streamId`, `epoch` (the fence epoch of the frozen source), `sourceNodeId`
 - **final source head N**: the signed `SignedStreamHead` at `sequence = N`
 - `sourceCheckpoint` (final applied source `sequence = N`)
-- **head-chain integrity — REQUIRED externally-anchored MMR (Decision 3, Q2).**
-  Dual-signature attestation alone is **insufficient** for our independently-verifiable
-  evidence target. The source maintains an **incremental Merkle Mountain Range (MMR)** over the
-  head chain, **updated atomically with every append** (the MMR root advances in the same
-  SERIALIZABLE append tx) and its roots **anchored in the control DB**. The manifest carries the
-  MMR root at `N` + a **bounded inclusion/consistency proof** so B **independently verifies**
-  `genesis→N` continuity — not merely trusts two signatures. Dual signatures still authenticate
-  the manifest; the MMR provides the verifiable proof. Full lineage is also retained for audit.
-- **HOTP authoritative state**: per-tumbler high-water counters + a consumed-lineage covered by
-  the same MMR/anchored-checkpoint mechanism (verifiable, not attestation-only); full lineage
-  retained for audit.
+- **head-chain integrity — REQUIRED MMR with an explicit CROSS-DB boundary (Decision 3, correction 3).**
+  Two distinct mechanisms, not one atomic step across DBs:
+  - **A-PG (local, atomic):** an incremental **MMR** root advances **in the same SERIALIZABLE
+    append tx** as each append (leaf = `H(leafVersion ‖ domainTag ‖ headDigest)`, domain-separated
+    and versioned; **HOTP lineage and head lineage use separate domain-tagged MMRs** with a
+    defined ordering).
+  - **Control DB (external anchors):** the source periodically writes **signed anchor
+    checkpoints** (`{streamId, mmrSize, mmrRoot, guard+source sig}`) — a **separate** cross-DB
+    action, not part of the append tx.
+  - **At promotion:** after fencing freezes `N`, the promoter **synchronously anchors the frozen
+    `N`** in the control DB and proves **MMR consistency from the last prior external anchor → N**
+    (a bounded consistency proof) plus inclusion of `N`. The **unanchored suffix** (appends after
+    the last periodic anchor up to `N`) is assured precisely by this synchronous
+    promotion-time anchor + consistency proof — nothing in the suffix is trusted un-anchored.
+  - The manifest carries the anchored `N` root + the bounded consistency/inclusion proof so B
+    **independently verifies** `genesis→N`; dual signatures authenticate the manifest, the MMR
+    is the verifiable proof; full lineage retained for audit.
 - `fenceToken` / `epoch`
 - `canonicalDigest` = sha256 over the canonicalized manifest
 - **signatures**: source signature **and** guard signature over `canonicalDigest`
@@ -288,18 +320,20 @@ frozen final head **N**:
 - **Schema attestation**: the manifest schema itself is versioned (`manifestSchemaVersion`)
   and its layout digest is pinned + attested (mismatch → reject), mirroring the #10
   `TSK_OUTBOX_SCHEMA_MANIFEST` pattern.
-- **Limits (cardinality + size)**: max manifest bytes, max tumblers, max tail length
-  (`N - C`), max per-tumbler lineage — all bounded and enforced before attest; an oversize or
-  over-cardinality manifest is rejected (terminal).
+- **Limits (SNAPSHOT only)**: max manifest bytes + max tumblers for the state-at-`N` snapshot,
+  enforced before attest. **The tail `C+1..N` is NOT size-limited** — it is resumable chunked
+  batches (§4.3), so a large valid backlog is never terminally rejected.
 
 ### 4.2 Import + attest (atomic, all-or-nothing)
 
 On B, in one SERIALIZABLE tx: verify contract/schema match; recompute + match
-`canonicalDigest`; verify source **and** guard signatures + keyIds (rotation overlap);
-verify head-chain continuity `genesis → N` via the accumulator + the signed head; verify
-HOTP monotonic lineage; verify `epoch`/`streamId`/`sourceNodeId` binding; enforce the size
-bound. **Only if all pass**, atomically persist B's imported source state and mark
-`import-complete`. Any failure rolls back entirely → no partial source authority.
+`canonicalDigest`; verify source **and** guard signatures + keyIds (rotation overlap, revoked
+keyId rejected); verify head-chain continuity `genesis → N` by an **MMR inclusion + consistency
+proof against the EXACT anchored `N` root** in the control DB (not a generic accumulator);
+verify HOTP monotonic lineage against its domain-tagged MMR; verify `epoch`/`streamId`/
+`sourceNodeId` binding; enforce the snapshot size bound. **Only if all pass**, atomically persist
+B's imported source state and mark `import-complete`. Any failure rolls back entirely → no
+partial source authority.
 
 ### 4.3 C, N, tail — distinct authorities (H8) + chunked tail (H9) + old-epoch handling
 
@@ -313,11 +347,13 @@ bound. **Only if all pass**, atomically persist B's imported source state and ma
   before the snapshot → the source ledger cannot grow past `N`).
 - **tail** = `C+1 .. N` (the source rows B has not yet applied).
 
-**H9 — the tail is CHUNKED, never terminally rejected for size.** The bounded-size limit
-applies to the **snapshot manifest** (state at `N`). A large backlog `C+1..N` is **transported
-in bounded BATCHES**, each with its own bounded MMR inclusion proof, applied idempotently in
-order until B reaches `N`. A valid backlog exceeding one manifest is **resynced in chunks**, not
-rejected.
+**H9 — the tail is a resumable CHUNKED stream, never terminally rejected for size.** A large
+backlog `C+1..N` is transported in **bounded BATCHES** with an explicit **batch cursor** —
+`(fromSeq, toSeq)` monotonically advancing from `C+1` toward `N` — each batch bounded by
+**`maxBatchBytes` and `maxBatchItems`**, carrying its own **bounded MMR inclusion proof against
+the anchored `N` root**, applied idempotently in order (resume from B's applied checkpoint on
+crash) until B reaches `N`. Batches never overlap the terminal size limit — only the snapshot
+manifest is size-capped.
 - A late **old-epoch** record is classified, **never silently dropped**:
   - `seq ≤ C` (already in applied history) → **duplicate-ok**;
   - `C < seq ≤ N` → **MUST apply/reconcile as tail** (it is real committed source data);
