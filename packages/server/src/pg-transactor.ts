@@ -422,14 +422,18 @@ export class NodePostgresTransactor implements PgTransactor {
       if (armed.command !== 'SELECT' || armed.rows[0]?.n !== nonce) {
         throw new ContractValidationError('failed to arm the transaction-continuity sentinel');
       }
-      // (durability precondition) verify fsync=on ON THIS EXACT connection before any
-      // work: synchronous_commit only guarantees durability if the server fsyncs WAL.
-      // fsync is a server-level (SIGHUP) setting; a mismatch is a misconfigured server,
-      // so fail closed BEFORE the callback runs rather than write against it.
-      const fsync = await query("SELECT pg_catalog.current_setting('fsync') AS f");
-      if (fsync.command !== 'SELECT' || fsync.rows[0]?.f !== 'on') {
-        throw new ContractValidationError(`refusing to run a durable transaction: PostgreSQL fsync is '${String(fsync.rows[0]?.f)}', not 'on'`);
-      }
+      // (durability precondition) verify the server durability settings ON THIS EXACT
+      // connection. `fsync` and `full_page_writes` are both server-level (SIGHUP)
+      // settings, so this is checked TWICE: once now (fail before doing any work) and
+      // again immediately before COMMIT (they can be reloaded mid-transaction — a TOCTOU
+      // that would otherwise leave the commit non-durable / unsafe on crash recovery).
+      const assertDurableSettings = async () => {
+        const r = await query("SELECT pg_catalog.current_setting('fsync') AS fsync, pg_catalog.current_setting('full_page_writes') AS fpw");
+        if (r.command !== 'SELECT') throw new ContractValidationError('durable server-settings check was not confirmed');
+        if (r.rows[0]?.fsync !== 'on') throw new ContractValidationError(`refusing a durable transaction: fsync is '${String(r.rows[0]?.fsync)}', not 'on'`);
+        if (r.rows[0]?.fpw !== 'on') throw new ContractValidationError(`refusing a durable transaction: full_page_writes is '${String(r.rows[0]?.fpw)}', not 'on'`);
+      };
+      await assertDurableSettings();
       const exec: PgExecutor = {
         query: async (sql, params) => {
           assertCallerQueryAllowed(sql); // (H1) capability limit: no transaction/session-control escape
@@ -455,6 +459,9 @@ export class NodePostgresTransactor implements PgTransactor {
       if (dur.command !== 'SELECT' || dur.rows[0]?.sc !== this.synchronousCommit) {
         throw new ContractValidationError(`failed to enforce synchronous_commit=${this.synchronousCommit} before COMMIT`);
       }
+      // TOCTOU re-check: fsync/full_page_writes could have been reloaded during the
+      // callback. The durability that matters is the one in effect AT COMMIT.
+      await assertDurableSettings();
       // from here the COMMIT is in flight; a lost response is AMBIGUOUS, not a failure.
       commitDispatched = true;
       const commit = await query('COMMIT');

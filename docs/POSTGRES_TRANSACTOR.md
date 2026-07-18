@@ -39,8 +39,10 @@ the transactor enforces per transaction:
 - `synchronousCommit` is forced tx-locally and read back before COMMIT. Accepted values
   are `on` (default), `local`, `remote_write`, `remote_apply`. **`off` is rejected** — it
   does not wait for the local WAL flush, so a confirmed COMMIT would not be durable.
-- `fsync = on` is verified on the exact transaction connection before any work; a server
-  with `fsync = off` is refused (fail closed) rather than written against.
+- `fsync = on` and `full_page_writes = on` are verified on the exact transaction
+  connection — both BEFORE any work and again immediately before COMMIT (both are
+  SIGHUP-reloadable, so a mid-transaction reload is a TOCTOU that would otherwise leave
+  the commit non-durable or unsafe on torn-page crash recovery). A mismatch fails closed.
 - `remote_write` / `remote_apply` do **not** by themselves establish standby durability:
   they only matter when `synchronous_standby_names` configures synchronous standbys.
   Absent that, they behave like `on` for local durability.

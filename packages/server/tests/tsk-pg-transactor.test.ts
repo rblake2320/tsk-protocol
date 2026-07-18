@@ -23,12 +23,15 @@ interface ClientScript {
   syncCommitBad?: boolean;                      // synchronous_commit enforcement readback != requested
   discardFails?: boolean;                       // post-commit DISCARD ALL throws
   fsyncOff?: boolean;                           // server fsync reads 'off' (misconfigured server)
+  fullPageWritesOff?: boolean;                  // full_page_writes reads 'off'
+  durableFlipAfterWork?: boolean;               // durable settings 'on' early, 'off' at the pre-COMMIT re-check
 }
 class FakeClient implements NodePostgresClient {
   queries: string[] = [];
   releaseCount = 0;
   releasedWith: boolean | Error | undefined = undefined;
   private nonce = '';
+  private durableChecks = 0;
   get destroyed(): boolean { return this.releasedWith === true || this.releasedWith instanceof Error; }
   constructor(private readonly script: ClientScript = {}) {}
   async query(sql: string, params?: unknown[]): Promise<NodePostgresResult> {
@@ -44,7 +47,11 @@ class FakeClient implements NodePostgresClient {
       if (typeof c === 'function') return c();
       return { rows: [], rowCount: null, command: c ?? 'COMMIT' };
     }
-    if (sql.includes("current_setting('fsync')")) { return { rows: [{ f: this.script.fsyncOff ? 'off' : 'on' }], rowCount: 1, command: 'SELECT' }; }
+    if (sql.includes("current_setting('fsync')")) {
+      this.durableChecks++;
+      const flipped = this.script.durableFlipAfterWork && this.durableChecks >= 2; // reloaded during work
+      return { rows: [{ fsync: this.script.fsyncOff || flipped ? 'off' : 'on', fpw: this.script.fullPageWritesOff ? 'off' : 'on' }], rowCount: 1, command: 'SELECT' };
+    }
     if (sql.includes("set_config('synchronous_commit'")) { return { rows: [{ sc: this.script.syncCommitBad ? 'off' : String(params?.[0] ?? 'on') }], rowCount: 1, command: 'SELECT' }; }
     if (sql === 'DISCARD ALL') { if (this.script.discardFails) throw new Error('discard failed'); return { rows: [], rowCount: null, command: 'DISCARD' }; }
     if (sql === 'ROLLBACK') { if (this.script.rollbackHangs) return new Promise<never>(() => {}); return { rows: [], rowCount: null, command: 'ROLLBACK' }; }
@@ -307,15 +314,29 @@ describe('NodePostgresTransactor', () => {
     }
   });
 
-  it('(durability precondition) refuses to run when the server fsync is off, before the callback', async () => {
-    let callbackInvoked = false;
-    const client = new FakeClient({ fsyncOff: true });
+  it('(durability precondition) refuses to run when fsync or full_page_writes is off, before the callback', async () => {
+    for (const script of [{ fsyncOff: true }, { fullPageWritesOff: true }]) {
+      let callbackInvoked = false;
+      const client = new FakeClient(script);
+      const tx = new NodePostgresTransactor(poolOf(client));
+      const err = await tx.transaction(async () => { callbackInvoked = true; }).catch((e) => e);
+      expect(err).toBeInstanceOf(ContractValidationError);
+      expect(String(err.message)).toMatch(/fsync|full_page_writes/);
+      expect(callbackInvoked).toBe(false); // rejected before any work
+      expect(client.queries).not.toContain('COMMIT');
+      expect(client.destroyed).toBe(true);
+    }
+  });
+
+  it('(durability TOCTOU) re-checks durable settings before COMMIT; a mid-work reload fails closed', async () => {
+    // fsync/full_page_writes are SIGHUP-reloadable: 'on' at the early check, 'off' by the
+    // pre-COMMIT re-check. The transactor must NOT commit.
+    const client = new FakeClient({ durableFlipAfterWork: true });
     const tx = new NodePostgresTransactor(poolOf(client));
-    const err = await tx.transaction(async () => { callbackInvoked = true; }).catch((e) => e);
+    const err = await tx.transaction(async (exec) => { await exec.query('INSERT INTO t VALUES (1)'); }).catch((e) => e);
     expect(err).toBeInstanceOf(ContractValidationError);
     expect(String(err.message)).toContain('fsync');
-    expect(callbackInvoked).toBe(false); // rejected before any work
-    expect(client.queries).not.toContain('COMMIT');
+    expect(client.queries).not.toContain('COMMIT'); // re-check runs before COMMIT
     expect(client.destroyed).toBe(true);
   });
 

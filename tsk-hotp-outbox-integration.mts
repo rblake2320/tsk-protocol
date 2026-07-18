@@ -203,9 +203,10 @@ async function main() {
     await pool.query('DROP TABLE tsk_durab_probe');
   });
 
-  await check('(#10 transactor) fsync is verified on the EXACT transaction session (durability precondition)', async () => {
-    const f = await serial.transaction(async (exec) => (await exec.query("SELECT current_setting('fsync') AS f")).rows[0].f);
-    assert.equal(f, 'on', 'the durable-outbox transaction session must run with fsync=on');
+  await check('(#10 transactor) fsync + full_page_writes verified on the EXACT transaction session (durability precondition)', async () => {
+    const s = await serial.transaction(async (exec) => (await exec.query("SELECT current_setting('fsync') AS fsync, current_setting('full_page_writes') AS fpw")).rows[0]);
+    assert.equal(s.fsync, 'on', 'the durable-outbox session must run with fsync=on');
+    assert.equal(s.fpw, 'on', 'the durable-outbox session must run with full_page_writes=on');
   });
 
   await check('(#10 transactor) DISCARD ALL scrubs session poison (advisory lock) before the pooled connection is reused', async () => {
