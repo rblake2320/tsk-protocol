@@ -38,7 +38,8 @@ const DEFAULT_FRESHNESS_MS = 30_000;
 const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
 const DEFAULT_BODY_READ_MS = 10_000;
 const DEFAULT_NONCE_RETENTION_MS = 120_000;
-const DEFAULT_MAX_CLOCK_SKEW_MS = 60_000;
+const DEFAULT_MAX_CLOCK_SKEW_MS = 5_000;
+const DEFAULT_NONCE_SAFETY_MS = 30_000;
 const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
 const KEY_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const RECEIPT_KEYS = ['streamId', 'sourceEpoch', 'sequence', 'opDigest', 'decision', 'receiverId', 'keyId', 'issuedAt', 'signature'] as const;
@@ -102,14 +103,18 @@ function isJsonMime(ct: string | null | undefined): boolean {
 // ── durable replay-nonce store ───────────────────────────────────────────────
 
 export interface ReplayNonceStore {
-  /** How long a nonce is retained; the receiver enforces this covers its acceptance
-   *  horizon (>= 2x freshness) so a nonce cannot be pruned while a replay is possible. */
+  /** Immutable assurances the receiver uses to prove the store retains a nonce across
+   *  the whole acceptance horizon EVEN under worst-case clock drift: a nonce's guaranteed
+   *  REAL retention is `retentionMs - 2*maxClockSkewMs` (the DB clock may read late at
+   *  insert and early at prune, each within the skew bound). */
   readonly retentionMs: number;
+  readonly maxClockSkewMs: number;
   checkAndStore(nonce: string): Promise<boolean>;
 }
 
 export class MemoryReplayNonceStore implements ReplayNonceStore {
   readonly retentionMs: number;
+  readonly maxClockSkewMs = 0; // single in-process clock, no DB/app skew
   private readonly seen = new Map<string, number>();
   constructor(retentionMs = DEFAULT_NONCE_RETENTION_MS, private readonly now: () => number = Date.now) {
     this.retentionMs = posInt(retentionMs, 'retentionMs');
@@ -143,7 +148,7 @@ export interface PgReplayNonceStoreOptions {
  *  timestamp), same-clock pruning, asserted DB/app skew (fail closed), atomic insert. */
 export class PgReplayNonceStore implements ReplayNonceStore {
   readonly retentionMs: number;
-  private readonly maxClockSkewMs: number;
+  readonly maxClockSkewMs: number;
   private readonly now: () => number;
   constructor(private readonly query: QueryFn, opts: PgReplayNonceStoreOptions = {}) {
     this.retentionMs = posInt(opts.retentionMs ?? DEFAULT_NONCE_RETENTION_MS, 'retentionMs');
@@ -169,10 +174,9 @@ export class PgReplayNonceStore implements ReplayNonceStore {
 export interface FetchResponseLike {
   status: number;
   headers: { get(name: string): string | null };
-  /** Preferred: a web ReadableStream read under a hard cap with cancel. */
-  body?: ReadableStream<Uint8Array> | null;
-  /** Fallback if `body` is absent (bounded by a post-read check). */
-  text?(): Promise<string>;
+  /** REQUIRED: a web ReadableStream read under a hard cap with cancel. A response with no
+   *  stream is refused — there is no unbounded text() fallback (that would buffer first). */
+  body: ReadableStream<Uint8Array> | null;
 }
 export type FetchLike = (
   url: string,
@@ -189,6 +193,12 @@ export class OutboxTransportError extends Error {
 }
 const terminal = (m: string, cause?: unknown): OutboxTransportError => new OutboxTransportError(m, { retriable: false, cause });
 const transient = (m: string, cause?: unknown): OutboxTransportError => new OutboxTransportError(m, { retriable: true, cause });
+/** Closed HTTP-status classification. Transient (retry): 5xx, 408 request-timeout,
+ *  429 too-many-requests. Terminal (do not retry): 3xx redirect, all other 4xx. */
+function classifyStatus(status: number): OutboxTransportError {
+  if (status >= 500 || status === 408 || status === 429) return transient(`transport received HTTP ${status}`);
+  return terminal(`transport received HTTP ${status}`);
+}
 
 export interface HttpOutboxTransportOptions {
   url: string;
@@ -271,9 +281,7 @@ export class HttpOutboxTransport implements TskOutboxTransport {
     } catch (err) {
       throw err instanceof OutboxTransportError ? err : transient('transport request failed', err);
     }
-    if (res.status >= 300 && res.status < 400) throw terminal(`transport received a redirect (${res.status})`);
-    if (res.status >= 500) throw transient(`transport received HTTP ${res.status}`);
-    if (res.status !== 200) throw terminal(`transport received HTTP ${res.status}`); // 4xx: auth/protocol -> terminal
+    if (res.status !== 200) throw classifyStatus(res.status);
     if (!isJsonMime(res.headers.get('content-type'))) throw terminal('transport reply is not application/json');
     const cl = Number(res.headers.get('content-length') ?? 'NaN');
     if (Number.isFinite(cl) && cl > this.maxResponseBytes) throw terminal('transport reply too large');
@@ -285,30 +293,23 @@ export class HttpOutboxTransport implements TskOutboxTransport {
    *  (Content-Length was only an optimization; a chunked reply has none). */
   private async readCapped(res: FetchResponseLike, signal: AbortSignal): Promise<string> {
     const stream = res.body;
-    if (stream && typeof stream.getReader === 'function') {
-      const reader = stream.getReader();
-      const chunks: Buffer[] = [];
-      let total = 0;
-      try {
-        for (;;) {
-          if (signal.aborted) throw transient('transport aborted');
-          const { done, value } = await reader.read();
-          if (done) break;
-          total += value.byteLength;
-          if (total > this.maxResponseBytes) { try { await reader.cancel(); } catch { /* noop */ } throw terminal('transport reply too large'); }
-          chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
-        }
-      } finally {
-        try { reader.releaseLock(); } catch { /* noop */ }
+    if (!stream || typeof stream.getReader !== 'function') throw terminal('transport response has no readable body stream');
+    const reader = stream.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        if (signal.aborted) throw transient('transport aborted');
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > this.maxResponseBytes) { try { await reader.cancel(); } catch { /* noop */ } throw terminal('transport reply too large'); }
+        chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
       }
-      return Buffer.concat(chunks).toString('utf8');
+    } finally {
+      try { reader.releaseLock(); } catch { /* noop */ }
     }
-    if (typeof res.text === 'function') {
-      const t = await res.text();
-      if (Buffer.byteLength(t, 'utf8') > this.maxResponseBytes) throw terminal('transport reply too large');
-      return t;
-    }
-    throw terminal('transport response exposes neither a body stream nor text()');
+    return Buffer.concat(chunks).toString('utf8');
   }
 
   private async verifyEnvelope(text: string, record: OutboxRecord<TskHotpMutation>, sentNonce: string, sentBodyDigest: string): Promise<TskAckReceipt> {
@@ -345,6 +346,8 @@ export interface HttpOutboxReceiverOptions {
   nonceStore: ReplayNonceStore;
   now?: () => number;
   freshnessMs?: number;
+  /** Explicit extra margin required on top of the acceptance horizon + skew. */
+  nonceSafetyMs?: number;
   maxBodyBytes?: number;
   bodyReadMs?: number;
 }
@@ -352,14 +355,20 @@ export interface HttpOutboxReceiverOptions {
 export function createHttpOutboxReceiver(opts: HttpOutboxReceiverOptions): (req: IncomingMessage, res: ServerResponse) => void {
   const now = opts.now ?? Date.now;
   const freshnessMs = posInt(opts.freshnessMs ?? DEFAULT_FRESHNESS_MS, 'freshnessMs');
+  const safetyMs = posInt(opts.nonceSafetyMs ?? DEFAULT_NONCE_SAFETY_MS, 'nonceSafetyMs');
   const maxBodyBytes = posInt(opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES, 'maxBodyBytes');
   const bodyReadMs = posInt(opts.bodyReadMs ?? DEFAULT_BODY_READ_MS, 'bodyReadMs');
   if (typeof opts.expectedPath !== 'string' || !opts.expectedPath.startsWith('/')) throw new ContractValidationError('expectedPath must be an absolute request path');
   if (!KEY_ID_RE.test(opts.responseKeyId)) throw new ContractValidationError('invalid responseKeyId');
   const respSecret = toSecret(opts.responseSecret, 'responseSecret');
-  // enforce the replay-store retains a nonce across the whole acceptance horizon (both
-  // freshness directions) plus margin — else a still-acceptable nonce could be pruned.
-  if (!(opts.nonceStore.retentionMs >= 2 * freshnessMs)) throw new ContractValidationError('nonceStore.retentionMs must be >= 2x freshnessMs (acceptance horizon + margin)');
+  // A nonce's GUARANTEED real retention under worst-case skew is retentionMs - 2*skew. It
+  // must cover the full acceptance horizon (a timestamp is acceptable across ±freshness =
+  // 2*freshness) plus an explicit safety margin — else a still-acceptable nonce could be
+  // pruned and replayed. i.e. retentionMs >= 2*freshness + 2*maxClockSkew + safety.
+  const guaranteed = opts.nonceStore.retentionMs - 2 * opts.nonceStore.maxClockSkewMs;
+  if (!(guaranteed >= 2 * freshnessMs + safetyMs)) {
+    throw new ContractValidationError(`nonce retention too small: guaranteed ${guaranteed}ms (retention ${opts.nonceStore.retentionMs} - 2*skew ${opts.nonceStore.maxClockSkewMs}) must be >= 2*freshness ${2 * freshnessMs} + safety ${safetyMs}`);
+  }
 
   const send = (res: ServerResponse, status: number, obj: unknown): void => {
     const payload = canonicalize(obj);

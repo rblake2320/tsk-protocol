@@ -49,6 +49,9 @@ const REQ_KEY = 'req-key-1';
 const reqSecret = Buffer.alloc(32, 9);
 const RESP_KEY = 'resp-key-1';
 const respSecret = Buffer.alloc(32, 5);
+const jsonHeaders = { get: (n: string) => (n === 'content-type' ? 'application/json' : null) };
+const streamOf = (s: string): ReadableStream<Uint8Array> => new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(s)); c.close(); } });
+const stubFetch = (status: number, bodyText: string | null): never => (async () => ({ status, headers: jsonHeaders, body: bodyText === null ? null : streamOf(bodyText) })) as never;
 
 // one server; each test installs a fresh handler (fresh nonce store) via `install`
 let server: Server;
@@ -143,16 +146,25 @@ describe('HttpOutboxTransport <-> createHttpOutboxReceiver (authenticated, decis
     await expect(wrong.deliverAndAwaitAck(record, head)).rejects.toBeInstanceOf(OutboxTransportError);
   });
 
-  it('bounds the response-body read by the deadline (no unbounded body hang)', async () => {
+  it('bounds the exchange by the deadline even if the body stream never ends (hostile body)', async () => {
     const { record, head } = mkRH(1, 5);
-    const hangingFetch: never = (async (_u: string, init: { signal?: AbortSignal }) => ({
-      status: 200,
-      headers: { get: (n: string) => (n === 'content-type' ? 'application/json' : null) },
-      text: () => new Promise<string>((_, reject) => { init.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true }); }),
-    })) as never;
+    const hangingFetch: never = (async () => ({ status: 200, headers: jsonHeaders, body: new ReadableStream<Uint8Array>({ pull() { return new Promise<void>(() => { /* never */ }); } }) })) as never;
     const c = new HttpOutboxTransport({ url: baseUrl, fetch: hangingFetch, requestKeyId: REQ_KEY, requestSecret: reqSecret, resolveResponseKey: (kid: string) => (kid === RESP_KEY ? respSecret : null), ackVerifier, timeoutMs: 200 });
     const err = await c.deliverAndAwaitAck(record, head).catch((e) => e);
     expect(err).toBeInstanceOf(OutboxTransportError);
+  });
+
+  it('refuses a response with no readable body stream (no unbounded text fallback)', async () => {
+    const { record, head } = mkRH(1, 5);
+    const c = new HttpOutboxTransport({ url: baseUrl, fetch: stubFetch(200, null), requestKeyId: REQ_KEY, requestSecret: reqSecret, resolveResponseKey: (kid) => (kid === RESP_KEY ? respSecret : null), ackVerifier });
+    await expect(c.deliverAndAwaitAck(record, head)).rejects.toBeInstanceOf(OutboxTransportError);
+  });
+
+  it('classifies 408 and 429 as TRANSIENT and other 4xx as TERMINAL', async () => {
+    const { record, head } = mkRH(1, 5);
+    const mk = (status: number) => new HttpOutboxTransport({ url: baseUrl, fetch: stubFetch(status, '{}'), requestKeyId: REQ_KEY, requestSecret: reqSecret, resolveResponseKey: (kid) => (kid === RESP_KEY ? respSecret : null), ackVerifier });
+    for (const s of [408, 429]) expect((await mk(s).deliverAndAwaitAck(record, head).catch((e) => e)).retriable, `HTTP ${s}`).toBe(true);
+    for (const s of [400, 403, 404]) expect((await mk(s).deliverAndAwaitAck(record, head).catch((e) => e)).retriable, `HTTP ${s}`).toBe(false);
   });
 
   it('classifies an oversize request as TERMINAL (non-retriable) and never dispatches', async () => {
@@ -169,11 +181,7 @@ describe('HttpOutboxTransport <-> createHttpOutboxReceiver (authenticated, decis
   it('rejects a replayed response envelope not bound to this request attempt (stale challenge)', async () => {
     const { record, head } = mkRH(1, 5);
     // a MITM returns a well-formed envelope whose challenge is for a DIFFERENT attempt
-    const staleFetch: never = (async () => ({
-      status: 200,
-      headers: { get: (n: string) => (n === 'content-type' ? 'application/json' : null) },
-      text: async () => JSON.stringify({ v: 'TSKv1-ack', keyId: RESP_KEY, challenge: 'some-other-attempt-nonce', requestDigest: 'deadbeef', receipt: signedAck(record, 'applied'), sig: 'AAAA' }),
-    })) as never;
+    const staleFetch: never = stubFetch(200, JSON.stringify({ v: 'TSKv1-ack', keyId: RESP_KEY, challenge: 'some-other-attempt-nonce', requestDigest: 'deadbeef', receipt: signedAck(record, 'applied'), sig: 'AAAA' }));
     const c = new HttpOutboxTransport({ url: baseUrl, fetch: staleFetch, requestKeyId: REQ_KEY, requestSecret: reqSecret, resolveResponseKey: (kid: string) => (kid === RESP_KEY ? respSecret : null), ackVerifier });
     const err = await c.deliverAndAwaitAck(record, head).catch((e) => e);
     expect(err).toBeInstanceOf(OutboxTransportError);
@@ -215,11 +223,28 @@ describe('HttpOutboxTransport <-> createHttpOutboxReceiver (authenticated, decis
     expect(res.status).toBe(415);
   });
 
-  it('enforces the nonce retention >= 2x freshness invariant at composition', () => {
+  it('enforces retention >= 2*freshness + 2*skew + safety at composition', () => {
+    // memory store skew=0: need retention >= 2*30000 + 0 + 30000 = 90000; 1000 fails.
     expect(() => createHttpOutboxReceiver({
       expectedPath: '/ingest', resolveRequestKey: () => reqSecret, responseKeyId: RESP_KEY, responseSecret: respSecret,
       receive: async (r) => signedAck(r, 'applied'), nonceStore: new MemoryReplayNonceStore(1_000), freshnessMs: 30_000,
-    })).toThrow(/retentionMs/);
+    })).toThrow(/retention/);
+    // a store whose retention is eaten by skew also fails: 200000 - 2*80000 = 40000 < 90000
+    const skewed: MemoryReplayNonceStore = Object.assign(new MemoryReplayNonceStore(200_000), { maxClockSkewMs: 80_000 });
+    expect(() => createHttpOutboxReceiver({
+      expectedPath: '/ingest', resolveRequestKey: () => reqSecret, responseKeyId: RESP_KEY, responseSecret: respSecret,
+      receive: async (r) => signedAck(r, 'applied'), nonceStore: skewed, freshnessMs: 30_000,
+    })).toThrow(/retention/);
+  });
+
+  it('(deterministic retention) a nonce is retained across the acceptance horizon and pruned only after retention', async () => {
+    const clk = { t: 0 };
+    const store = new MemoryReplayNonceStore(100_000, () => clk.t);
+    expect(await store.checkAndStore('n-horizon-xxxxxxxx')).toBe(true);   // first use
+    clk.t = 90_000;                                                       // still within retention
+    expect(await store.checkAndStore('n-horizon-xxxxxxxx')).toBe(false);  // replay STILL rejected
+    clk.t = 100_001;                                                      // past retention
+    expect(await store.checkAndStore('n-horizon-xxxxxxxx')).toBe(true);   // pruned, reusable
   });
 
   it('rejects a url with embedded credentials or a fragment', () => {
