@@ -53,8 +53,10 @@ export interface NodePostgresPool {
 
 export interface NodePostgresTransactorOptions {
   /** Durability level FORCED tx-locally + read back immediately before COMMIT, so the
-   *  commit's durability cannot be lowered by anything the callback did. Default 'on'. */
-  synchronousCommit?: 'on' | 'local' | 'remote_write' | 'remote_apply' | 'off';
+   *  commit's durability cannot be lowered by anything the callback did. Default 'on'.
+   *  'off' is NOT accepted: this driver backs a DURABLE outbox and 'off' does not wait
+   *  for the local WAL flush, so a confirmed COMMIT could not be called durable. */
+  synchronousCommit?: 'on' | 'local' | 'remote_write' | 'remote_apply';
   /** Server-side per-statement timeout, installed + verified inside the tx. */
   statementTimeoutMs?: number;
   /** Client-side total deadline covering acquire → BEGIN → work → COMMIT. */
@@ -109,7 +111,9 @@ export class ConnectionDisposalError extends Error {
 
 const MAX_TIMER_MS = 2_147_483_647;
 const RETRYABLE = new Set(['40001', '40P01']); // serialization_failure, deadlock_detected
-const SYNC_COMMIT_LEVELS = new Set(['on', 'local', 'remote_write', 'remote_apply', 'off']);
+// 'off' is intentionally excluded: it does not wait for the local WAL flush, so a
+// confirmed COMMIT on this durable-outbox driver would not actually be durable.
+const SYNC_COMMIT_LEVELS = new Set(['on', 'local', 'remote_write', 'remote_apply']);
 
 function boundedInteger(value: number, label: string, min = 1, max = MAX_TIMER_MS): number {
   if (!Number.isSafeInteger(value) || value < min || value > max) {
@@ -417,6 +421,14 @@ export class NodePostgresTransactor implements PgTransactor {
       const armed = await query(`SELECT pg_catalog.set_config('${CONTINUITY_GUC}', $1, true) AS n`, [nonce]);
       if (armed.command !== 'SELECT' || armed.rows[0]?.n !== nonce) {
         throw new ContractValidationError('failed to arm the transaction-continuity sentinel');
+      }
+      // (durability precondition) verify fsync=on ON THIS EXACT connection before any
+      // work: synchronous_commit only guarantees durability if the server fsyncs WAL.
+      // fsync is a server-level (SIGHUP) setting; a mismatch is a misconfigured server,
+      // so fail closed BEFORE the callback runs rather than write against it.
+      const fsync = await query("SELECT pg_catalog.current_setting('fsync') AS f");
+      if (fsync.command !== 'SELECT' || fsync.rows[0]?.f !== 'on') {
+        throw new ContractValidationError(`refusing to run a durable transaction: PostgreSQL fsync is '${String(fsync.rows[0]?.f)}', not 'on'`);
       }
       const exec: PgExecutor = {
         query: async (sql, params) => {

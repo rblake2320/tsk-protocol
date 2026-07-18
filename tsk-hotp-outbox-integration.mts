@@ -203,6 +203,11 @@ async function main() {
     await pool.query('DROP TABLE tsk_durab_probe');
   });
 
+  await check('(#10 transactor) fsync is verified on the EXACT transaction session (durability precondition)', async () => {
+    const f = await serial.transaction(async (exec) => (await exec.query("SELECT current_setting('fsync') AS f")).rows[0].f);
+    assert.equal(f, 'on', 'the durable-outbox transaction session must run with fsync=on');
+  });
+
   await check('(#10 transactor) DISCARD ALL scrubs session poison (advisory lock) before the pooled connection is reused', async () => {
     const p1 = new Pool({ connectionString: URL, max: 1 }); p1.on('error', () => {});
     const t1 = new NodePostgresTransactor(p1 as unknown as ConstructorParameters<typeof NodePostgresTransactor>[0]);

@@ -31,6 +31,23 @@ The caller must be able to tell three failure shapes apart:
 - **`ConnectionDisposalError`** (`committed === false`) means the transaction failed
   and the connection could not be disposed.
 
+## Durability preconditions
+
+A "confirmed COMMIT is durable" claim only holds under a durable configuration, which
+the transactor enforces per transaction:
+
+- `synchronousCommit` is forced tx-locally and read back before COMMIT. Accepted values
+  are `on` (default), `local`, `remote_write`, `remote_apply`. **`off` is rejected** — it
+  does not wait for the local WAL flush, so a confirmed COMMIT would not be durable.
+- `fsync = on` is verified on the exact transaction connection before any work; a server
+  with `fsync = off` is refused (fail closed) rather than written against.
+- `remote_write` / `remote_apply` do **not** by themselves establish standby durability:
+  they only matter when `synchronous_standby_names` configures synchronous standbys.
+  Absent that, they behave like `on` for local durability.
+
+This is single-node local durability. Cross-node/HA durability (#10) remains OPEN until
+the two-node PostgreSQL failover / split-brain drill records measured RPO and RTO.
+
 Serialization / deadlock (`40001` / `40P01`) retries are **disabled by default**
 because a transaction callback can contain non-database side effects that cannot be
 safely replayed. Enable bounded retries (`maxSerializationRetries`) only for callbacks

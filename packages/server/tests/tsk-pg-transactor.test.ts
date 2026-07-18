@@ -22,6 +22,7 @@ interface ClientScript {
   continuityBroken?: boolean;                   // continuity nonce readback differs (tx-local scope lost)
   syncCommitBad?: boolean;                      // synchronous_commit enforcement readback != requested
   discardFails?: boolean;                       // post-commit DISCARD ALL throws
+  fsyncOff?: boolean;                           // server fsync reads 'off' (misconfigured server)
 }
 class FakeClient implements NodePostgresClient {
   queries: string[] = [];
@@ -43,6 +44,7 @@ class FakeClient implements NodePostgresClient {
       if (typeof c === 'function') return c();
       return { rows: [], rowCount: null, command: c ?? 'COMMIT' };
     }
+    if (sql.includes("current_setting('fsync')")) { return { rows: [{ f: this.script.fsyncOff ? 'off' : 'on' }], rowCount: 1, command: 'SELECT' }; }
     if (sql.includes("set_config('synchronous_commit'")) { return { rows: [{ sc: this.script.syncCommitBad ? 'off' : String(params?.[0] ?? 'on') }], rowCount: 1, command: 'SELECT' }; }
     if (sql === 'DISCARD ALL') { if (this.script.discardFails) throw new Error('discard failed'); return { rows: [], rowCount: null, command: 'DISCARD' }; }
     if (sql === 'ROLLBACK') { if (this.script.rollbackHangs) return new Promise<never>(() => {}); return { rows: [], rowCount: null, command: 'ROLLBACK' }; }
@@ -299,8 +301,22 @@ describe('NodePostgresTransactor', () => {
     expect(client.destroyed).toBe(true);           // but the un-scrubbed connection is discarded
   });
 
-  it('rejects an unsafe synchronousCommit option', () => {
-    expect(() => new NodePostgresTransactor(poolOf(new FakeClient()), { synchronousCommit: 'maybe' as unknown as 'on' })).toThrow(ContractValidationError);
+  it('rejects an unsafe synchronousCommit option (including durability-lowering off)', () => {
+    for (const bad of ['maybe', 'off']) {
+      expect(() => new NodePostgresTransactor(poolOf(new FakeClient()), { synchronousCommit: bad as unknown as 'on' }), bad).toThrow(ContractValidationError);
+    }
+  });
+
+  it('(durability precondition) refuses to run when the server fsync is off, before the callback', async () => {
+    let callbackInvoked = false;
+    const client = new FakeClient({ fsyncOff: true });
+    const tx = new NodePostgresTransactor(poolOf(client));
+    const err = await tx.transaction(async () => { callbackInvoked = true; }).catch((e) => e);
+    expect(err).toBeInstanceOf(ContractValidationError);
+    expect(String(err.message)).toContain('fsync');
+    expect(callbackInvoked).toBe(false); // rejected before any work
+    expect(client.queries).not.toContain('COMMIT');
+    expect(client.destroyed).toBe(true);
   });
 
   it('(H2) clamps cleanup rollback to the transaction deadline, not the full rollback budget', async () => {
