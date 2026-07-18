@@ -553,32 +553,34 @@ async function enterSourceTx(exec: PgExecutor, schema: string): Promise<void> {
  *  co-located with the transactor that actually owns those tables in its own DB. */
 async function sourceFenceManifest(exec: PgExecutor, tables: readonly string[], ver: string): Promise<string> {
   const t = tables as string[];
+  // NB: do NOT rely on SQL `ORDER BY <text>` — the default collation differs across builds (glibc on
+  // Debian vs musl on Alpine sort punctuation differently), so the same catalog would hash to different
+  // digests. Fetch unordered and sort the emitted lines byte-canonically in application code instead.
   const cols = (await exec.query(
     `SELECT table_name, ordinal_position, column_name, data_type, is_nullable, COALESCE(column_default,'') AS d
-     FROM information_schema.columns WHERE table_schema = pg_catalog.current_schema() AND table_name = ANY($1)
-     ORDER BY table_name, ordinal_position`, [t])).rows;
+     FROM information_schema.columns WHERE table_schema = pg_catalog.current_schema() AND table_name = ANY($1)`, [t])).rows;
   const cons = (await exec.query(
     `SELECT rel.relname AS t, c.contype, pg_catalog.pg_get_constraintdef(c.oid) AS def
      FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class rel ON rel.oid = c.conrelid
      JOIN pg_catalog.pg_namespace n ON n.oid = rel.relnamespace
-     WHERE n.nspname = pg_catalog.current_schema() AND rel.relname = ANY($1) AND c.contype IN ('p','c','u','f')
-     ORDER BY rel.relname, c.contype, def`, [t])).rows;
+     WHERE n.nspname = pg_catalog.current_schema() AND rel.relname = ANY($1) AND c.contype IN ('p','c','u','f')`, [t])).rows;
   const idx = (await exec.query(
     `SELECT tablename AS t, indexname AS n, indexdef AS def FROM pg_catalog.pg_indexes
-     WHERE schemaname = pg_catalog.current_schema() AND tablename = ANY($1) ORDER BY tablename, indexname`, [t])).rows;
-  return [
-    ver,
+     WHERE schemaname = pg_catalog.current_schema() AND tablename = ANY($1)`, [t])).rows;
+  const lines = [
     ...cols.map((r) => `C|${r.table_name}|${r.ordinal_position}|${r.column_name}|${r.data_type}|${r.is_nullable}|${r.d}`),
     ...cons.map((r) => `K|${r.t}|${r.contype}|${r.def}`),
     ...idx.map((r) => `I|${r.t}|${r.n}|${r.def}`),
-  ].join('\n');
+  ];
+  lines.sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))); // collation-independent
+  return [ver, ...lines].join('\n');
 }
 
 /** COMPILED expected catalog digests (pinned in source; computed on PG16). Re-pin only via an offline
  *  code-reviewed step; there is deliberately NO runtime override (R5-H1). The lease digest gates the
  *  outbox (on A); the witness digest gates witness advances (on control). */
-export const SOURCE_LEASE_MANIFEST_DIGEST = 'b1020ac2e16fa0c622922d375b83a659ea9ee0f5e5db145655b49ad4c782cb62';
-export const SOURCE_WITNESS_MANIFEST_DIGEST = 'b12c9f68d9a2989339e5b446ead30c27a82e2669ad30d27e4e6a3d108dfcdc07';
+export const SOURCE_LEASE_MANIFEST_DIGEST = '7ff3783cbd37512140c34bb29ea755934f3a37f400f6fbb9ac4c540adca0c0c6';
+export const SOURCE_WITNESS_MANIFEST_DIGEST = '5a1071edc5996ac01696dd4cc2ac7955ca261c846f36226e7aa0f4b0c183de1a';
 
 async function attestSourceLease(exec: PgExecutor): Promise<void> {
   const digest = sha256hex(Buffer.from(await sourceFenceManifest(exec, TSK_SOURCE_LEASE_TABLES, 'Vsource_lease/1'), 'utf8'));

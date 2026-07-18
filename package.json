@@ -20,6 +20,7 @@
     "test:source-fence": "npm run build -w packages/server && npx tsx tsk-source-fence-drill.mts",
     "test:source-fence-outbox": "npm run build -w packages/server && npx tsx tsk-source-fence-outbox-drill.mts",
     "test:source-fence-crash": "npm run build -w packages/server && npx tsx tsk-source-fence-crash-drill.mts",
+    "test:source-fence-h3": "npm run build -w packages/server && npx tsx tsk-source-fence-h3-drill.mts",
     "test:two-node": "npm run build -w packages/server && npx tsx tsk-two-node-drill.mts",
     "test:pack": "npm run build && npx tsx package-boundary-suite.mts && npm pack --dry-run --workspaces",
     "test:bpc-compat": "npm run build && npx tsx bpc-compatibility-suite.mts",
