@@ -113,7 +113,12 @@ async function main() {
     const stateAtN = await serial.transaction((exec) => computeSourceStateDigest(exec, sid, 3));
     assert.equal(receipt.sourceStateDigestAtN, stateAtN, 'receipt binds the sorted state@N');
     verifySourceFrozenReceipt(resolver, receipt); // source signature verifies
+    // (C4) the receipt binds the REVOKE command + the fenced writer's lease identity + grant digest
+    assert.equal(receipt.revokeCommandId, cid('revoke', sid)); assert.equal(receipt.leaseId, 'l1'); assert.equal(receipt.leaseGrantDigest, rev.grantDigest);
     assert.throws(() => verifySourceFrozenReceipt(resolver, { ...receipt, n: 2 }), /digest mismatch/); // tampered N
+    assert.throws(() => verifySourceFrozenReceipt(resolver, { ...receipt, leaseGrantDigest: '0'.repeat(64) }), /digest mismatch/); // tampered binding
+    // (C4) sourceNodeId must equal the fenced lease holder
+    await assert.rejects(() => serial.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 0, sourceNodeId: 'EVIL' })), /!= fenced lease holder/);
     // wrong epoch → cannot freeze
     await assert.rejects(() => serial.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 1, sourceNodeId: 'A' })), /lease epoch/);
   });
