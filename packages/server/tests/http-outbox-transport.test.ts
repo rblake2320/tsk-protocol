@@ -47,6 +47,8 @@ function signedAck(record: OutboxRecord<TskHotpMutation>, decision: ReceiverDeci
 
 const REQ_KEY = 'req-key-1';
 const reqSecret = Buffer.alloc(32, 9);
+const RESP_KEY = 'resp-key-1';
+const respSecret = Buffer.alloc(32, 5);
 
 // one server; each test installs a fresh handler (fresh nonce store) via `install`
 let server: Server;
@@ -55,7 +57,10 @@ let handler: (req: import('node:http').IncomingMessage, res: import('node:http')
 function install(opts: Partial<HttpOutboxReceiverOptions> & { keys?: Record<string, Buffer> }) {
   const keys = opts.keys ?? { [REQ_KEY]: reqSecret };
   handler = createHttpOutboxReceiver({
+    expectedPath: '/ingest',
     resolveRequestKey: (kid) => keys[kid] ?? null,
+    responseKeyId: RESP_KEY,
+    responseSecret: respSecret,
     receive: opts.receive ?? (async (record) => signedAck(record, 'applied')),
     nonceStore: opts.nonceStore ?? new MemoryReplayNonceStore(),
     now: opts.now,
@@ -71,7 +76,7 @@ afterAll(() => new Promise<void>((r) => server.close(() => r())));
 beforeEach(() => install({}));
 
 function client(over: Partial<ConstructorParameters<typeof HttpOutboxTransport>[0]> = {}) {
-  return new HttpOutboxTransport({ url: baseUrl, fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: reqSecret, ackVerifier, ...over });
+  return new HttpOutboxTransport({ url: baseUrl, fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: reqSecret, responseKeyId: RESP_KEY, responseSecret: respSecret, ackVerifier, ...over });
 }
 
 describe('HttpOutboxTransport <-> createHttpOutboxReceiver (authenticated, decision-bound)', () => {
@@ -126,10 +131,53 @@ describe('HttpOutboxTransport <-> createHttpOutboxReceiver (authenticated, decis
 
   it('a network failure throws a retriable error and never fabricates an ack', async () => {
     const { record, head } = mkRH(1, 5);
-    const c = new HttpOutboxTransport({ url: 'http://127.0.0.1:9/ingest', fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: reqSecret, ackVerifier, timeoutMs: 500 });
+    const c = new HttpOutboxTransport({ url: 'http://127.0.0.1:9/ingest', fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: reqSecret, responseKeyId: RESP_KEY, responseSecret: respSecret, ackVerifier, timeoutMs: 500 });
     const err = await c.deliverAndAwaitAck(record, head).catch((e) => e);
     expect(err).toBeInstanceOf(OutboxTransportError);
     expect(err.retriable).toBe(true);
+  });
+
+  it('rejects a request to a path this receiver does not serve (path authorized, not just signed)', async () => {
+    const { record, head } = mkRH(1, 5);
+    const wrong = client({ url: baseUrl.replace('/ingest', '/wrong') });
+    await expect(wrong.deliverAndAwaitAck(record, head)).rejects.toBeInstanceOf(OutboxTransportError);
+  });
+
+  it('bounds the response-body read by the deadline (no unbounded body hang)', async () => {
+    const { record, head } = mkRH(1, 5);
+    const hangingFetch: never = (async (_u: string, init: { signal?: AbortSignal }) => ({
+      status: 200,
+      headers: { get: (n: string) => (n === 'content-type' ? 'application/json' : null) },
+      text: () => new Promise<string>((_, reject) => { init.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true }); }),
+    })) as never;
+    const c = new HttpOutboxTransport({ url: baseUrl, fetch: hangingFetch, requestKeyId: REQ_KEY, requestSecret: reqSecret, responseKeyId: RESP_KEY, responseSecret: respSecret, ackVerifier, timeoutMs: 200 });
+    const err = await c.deliverAndAwaitAck(record, head).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboxTransportError);
+  });
+
+  it('classifies an oversize request as TERMINAL (non-retriable) and never dispatches', async () => {
+    const { record, head } = mkRH(1, 5);
+    let dispatched = false;
+    const spyFetch: never = (async () => { dispatched = true; throw new Error('should not be called'); }) as never;
+    const c = new HttpOutboxTransport({ url: baseUrl, fetch: spyFetch, requestKeyId: REQ_KEY, requestSecret: reqSecret, responseKeyId: RESP_KEY, responseSecret: respSecret, ackVerifier, maxRequestBytes: 8 });
+    const err = await c.deliverAndAwaitAck(record, head).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboxTransportError);
+    expect(err.retriable).toBe(false); // terminal — not retried forever against the receiver's 413
+    expect(dispatched).toBe(false);
+  });
+
+  it('rejects a replayed response envelope not bound to this request attempt (stale challenge)', async () => {
+    const { record, head } = mkRH(1, 5);
+    // a MITM returns a well-formed envelope whose challenge is for a DIFFERENT attempt
+    const staleFetch: never = (async () => ({
+      status: 200,
+      headers: { get: (n: string) => (n === 'content-type' ? 'application/json' : null) },
+      text: async () => JSON.stringify({ v: 'TSKv1-ack', keyId: RESP_KEY, challenge: 'some-other-attempt-nonce', requestDigest: 'deadbeef', receipt: signedAck(record, 'applied'), sig: 'AAAA' }),
+    })) as never;
+    const c = new HttpOutboxTransport({ url: baseUrl, fetch: staleFetch, requestKeyId: REQ_KEY, requestSecret: reqSecret, responseKeyId: RESP_KEY, responseSecret: respSecret, ackVerifier });
+    const err = await c.deliverAndAwaitAck(record, head).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboxTransportError);
+    expect(String(err.message)).toMatch(/attempt/);
   });
 
   it('supports key rotation overlap (receiver accepts multiple keyIds)', async () => {
@@ -141,7 +189,7 @@ describe('HttpOutboxTransport <-> createHttpOutboxReceiver (authenticated, decis
   });
 
   it('rejects unsafe construction (short secret, bad url)', () => {
-    expect(() => new HttpOutboxTransport({ url: baseUrl, fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: 'short', ackVerifier })).toThrow();
-    expect(() => new HttpOutboxTransport({ url: 'ftp://x/y', fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: reqSecret, ackVerifier })).toThrow();
+    expect(() => new HttpOutboxTransport({ url: baseUrl, fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: 'short', responseKeyId: RESP_KEY, responseSecret: respSecret, ackVerifier })).toThrow();
+    expect(() => new HttpOutboxTransport({ url: 'ftp://x/y', fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: reqSecret, responseKeyId: RESP_KEY, responseSecret: respSecret, ackVerifier })).toThrow();
   });
 });
