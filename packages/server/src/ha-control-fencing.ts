@@ -407,11 +407,13 @@ async function attestControlSchema(exec: PgExecutor): Promise<string> {
   return digest;
 }
 
-/** (R8) Revalidate the singleton tsk_ha_schema authority stamp per op — a post-mint mutation of the
- *  version or stored catalog_manifest fails the op closed even if the live catalog still matches. */
+/** (R8/R11) Revalidate the singleton tsk_ha_schema authority stamp per op. Uses FOR SHARE (R11-HIGH):
+ *  ACCESS SHARE blocks DDL but NOT a concurrent UPDATE/DELETE of the stamp row, so a plain SELECT had
+ *  a DML TOCTOU. FOR SHARE row-locks the singleton so any concurrent stamp mutation blocks until this
+ *  tx commits; exactly one row is required. */
 async function revalidateAuthorityRow(exec: PgExecutor): Promise<void> {
-  const rows = (await exec.query('SELECT version, catalog_manifest FROM tsk_ha_schema WHERE id = 1')).rows;
-  if (!rows.length) throw new ContractValidationError('control schema authority row is missing');
+  const rows = (await exec.query('SELECT version, catalog_manifest FROM tsk_ha_schema WHERE id = 1 FOR SHARE')).rows;
+  if (rows.length !== 1) throw new ContractValidationError(`control schema authority row must be exactly one, got ${rows.length}`);
   if (vInt(rows[0].version, 'schema version', 1, MAX_EPOCH) !== CONTROL_SCHEMA_VERSION) throw new ContractValidationError('control schema authority version mismatch');
   if (String(rows[0].catalog_manifest) !== HA_CONTROL_MANIFEST_DIGEST) throw new ContractValidationError('control schema authority stamp (catalog_manifest) does not match the compiled pinned digest');
 }

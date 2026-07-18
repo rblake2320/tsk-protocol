@@ -52,6 +52,16 @@ async function main() {
   const storeFor = (sid: string) => new RedisFencingStore(redis, `tsk:fence:${sid}`);
   const nowMs = async () => Number((await pool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
   const histCount = async (t: string, sid: string) => Number((await pool.query(`SELECT count(*)::int AS n FROM ${t} WHERE stream_id=$1`, [sid])).rows[0].n);
+  // The EXACT criticalTx backend = the one waiting on an advisory lock that is blocked BY `gatePid`
+  // (which holds this stream's advisory lock) — binds to the exact stream key + backend, no bit math.
+  const criticalTxPid = async (gatePid: number): Promise<number | null> => {
+    const rows = (await pool.query("SELECT a.pid FROM pg_stat_activity a WHERE a.wait_event_type='Lock' AND a.wait_event='advisory' AND $1 = ANY(pg_blocking_pids(a.pid))", [gatePid])).rows;
+    return rows.length ? Number(rows[0].pid) : null;
+  };
+  const waitFor = async (fn: () => Promise<number | null>): Promise<number> => {
+    for (let i = 0; i < 250; i++) { const v = await fn(); if (v !== null) return v; await new Promise((r) => setTimeout(r, 20)); }
+    return -1;
+  };
 
   const ready: ControlSchemaReadyToken = await provisionControlSchema(tx as never, 'public');
   const ctl = new HaControlFencing(tx as never, signer, resolver, ready, POLICY);
@@ -190,34 +200,46 @@ async function main() {
       await c.end();
     }
   });
-  await check('R9-MED: the REAL criticalTx holds ACCESS SHARE — a concurrent ALTER on a governed table is blocked by its backend (exact relation + pg_blocking_pids)', async () => {
+  await check('R9/R10-MED: the REAL criticalTx holds ACCESS SHARE — a concurrent ALTER is blocked by its EXACT backend (bound to the exact stream advisory key + relation)', async () => {
     const S = 'tsk:r9lock/v1';
     await ctl.provision(S, 'g-r9lock');
     const gate = await pool.connect();
     await gate.query('BEGIN');
-    await gate.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [S]); // hold the per-stream lock criticalTx takes LAST
+    const gatePid = Number((await gate.query('SELECT pg_backend_pid() AS p')).rows[0].p);
+    await gate.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))', [S]); // hold THIS stream's lock (taken by criticalTx last)
     const op = ctl.lease(S); // enters the real criticalTx: ACCESS SHARE + attest, then BLOCKS on the advisory lock (holding ACCESS SHARE)
-    // deterministic ordering: wait until the real criticalTx is BLOCKED on the advisory lock — by
-    // then it has ALREADY acquired ACCESS SHARE on the governed tables (earlier in criticalTx).
-    let ctlBlocked = false;
-    for (let i = 0; i < 200 && !ctlBlocked; i++) {
-      ctlBlocked = Number((await pool.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype='advisory' AND NOT granted")).rows[0].n) >= 1;
-      if (!ctlBlocked) await new Promise((r) => setTimeout(r, 20));
-    }
-    assert.ok(ctlBlocked, 'the real criticalTx is blocked on the advisory lock (so ACCESS SHARE is already held)');
-    const ctlPid = Number((await pool.query("SELECT pid FROM pg_locks WHERE locktype='advisory' AND NOT granted ORDER BY pid LIMIT 1")).rows[0].pid); // the criticalTx backend (sole advisory-waiter)
+    const ctlPid = await waitFor(() => criticalTxPid(gatePid)); // the exact criticalTx backend, blocked BY the gate on THIS stream's advisory lock
+    assert.ok(ctlPid > 0, 'the real criticalTx is blocked on the exact stream advisory lock (ACCESS SHARE already held)');
     const altering = pool.query('ALTER TABLE tsk_ha_lease_head ADD COLUMN r9b int').catch(() => {}); // now must block on ctl ACCESS SHARE
-    let proven = false;
-    for (let i = 0; i < 200 && !proven; i++) {
+    const proven = await waitFor(async () => {
       const rows = (await pool.query("SELECT pg_blocking_pids(w.pid) AS blockers FROM pg_locks w WHERE w.mode='AccessExclusiveLock' AND NOT w.granted AND w.relation='public.tsk_ha_lease_head'::regclass")).rows;
-      proven = rows.length > 0 && (rows[0].blockers as number[]).map(Number).includes(ctlPid); // the EXACT criticalTx backend blocks the EXACT-relation ALTER
-      if (!proven) await new Promise((r) => setTimeout(r, 20));
-    }
-    assert.ok(proven, `the ALTER on tsk_ha_lease_head is blocked by the exact criticalTx backend pid ${ctlPid} (ACCESS SHARE)`);
+      return rows.length > 0 && (rows[0].blockers as number[]).map(Number).includes(ctlPid) ? 1 : null;
+    });
+    assert.equal(proven, 1, `the ALTER on tsk_ha_lease_head is blocked by the exact criticalTx backend pid ${ctlPid} (ACCESS SHARE)`);
     await gate.query('COMMIT'); gate.release(); // release the advisory lock -> the real criticalTx proceeds + commits
     await op; // ctl.lease returns once its tx commits (ACCESS SHARE released)
     await altering;
     await pool.query('ALTER TABLE tsk_ha_lease_head DROP COLUMN IF EXISTS r9b'); // cleanup
+  });
+  await check('R11-HIGH: revalidateAuthorityRow FOR SHARE blocks a concurrent stamp UPDATE (real criticalTx; exact backend)', async () => {
+    const S = 'tsk:r11stamp/v1';
+    await ctl.provision(S, 'g-r11');
+    const gate = await pool.connect();
+    await gate.query('BEGIN');
+    const gatePid = Number((await gate.query('SELECT pg_backend_pid() AS p')).rows[0].p);
+    await gate.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))', [S]);
+    const op = ctl.lease(S); // criticalTx: revalidateAuthorityRow FOR SHARE on the singleton stamp, then BLOCKS on the advisory lock (holding FOR SHARE)
+    const ctlPid = await waitFor(() => criticalTxPid(gatePid));
+    assert.ok(ctlPid > 0, 'the real criticalTx is blocked on the advisory lock (FOR SHARE on the stamp already held)');
+    const upd = pool.query("UPDATE tsk_ha_schema SET catalog_manifest='r11tamper' /* r11upd */ WHERE id=1").catch(() => {}); // must block on ctl FOR SHARE
+    const proven = await waitFor(async () => {
+      const rows = (await pool.query("SELECT pg_blocking_pids(a.pid) AS blockers FROM pg_stat_activity a WHERE a.query LIKE '%r11upd%' AND a.wait_event_type='Lock' AND a.pid <> pg_backend_pid()")).rows;
+      return rows.length > 0 && (rows[0].blockers as number[]).map(Number).includes(ctlPid) ? 1 : null;
+    });
+    assert.equal(proven, 1, `the concurrent stamp UPDATE is blocked by the criticalTx FOR SHARE backend pid ${ctlPid}`);
+    await gate.query('COMMIT'); gate.release(); // release -> ctl commits (FOR SHARE released) -> the UPDATE proceeds
+    await op; await upd;
+    await pool.query('UPDATE tsk_ha_schema SET catalog_manifest=$1 WHERE id=1', [HA_CONTROL_MANIFEST_DIGEST]); // restore the stamp
   });
   await check('R8: per-op revalidation of the tsk_ha_schema authority stamp (post-mint mutation fails closed)', async () => {
     await pool.query("UPDATE tsk_ha_schema SET catalog_manifest='tampered-stamp' WHERE id=1");
