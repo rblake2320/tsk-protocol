@@ -61,23 +61,58 @@ Production profile may select STONITH instead of wait-for-expiry; the drill uses
 
 ## 3. PR2a — Fencing foundation
 
-### 3.1 Schemas (PR2a)
+### 3.1 Schemas (PR2a) — executable DDL sketches (control DB unless noted)
 
-```
--- external monotonic epoch witness (authority PG, distinct failure domain from Redis)
-CREATE TABLE tsk_ha_epoch_witness (
+```sql
+-- schema/version authority for all PR2 control tables
+CREATE TABLE tsk_ha_schema (version int PRIMARY KEY, manifest_digest text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now());
+
+-- (H2) provisioning intent — written FIRST; explicit incomplete state
+CREATE TABLE tsk_ha_provisioning (
   stream_id       text PRIMARY KEY,
+  genesis_marker  text        NOT NULL,
+  state           text        NOT NULL CHECK (state IN ('intent','incomplete','provisioned')),
+  guard_key_id    text        NOT NULL,
+  guard_signature text        NOT NULL,       -- signs (stream_id, genesis_marker)
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  provisioned_at  timestamptz
+);
+
+-- external monotonic epoch witness (authoritative floor; distinct failure domain from Redis)
+CREATE TABLE tsk_ha_epoch_witness (
+  stream_id       text PRIMARY KEY REFERENCES tsk_ha_provisioning(stream_id),
   epoch           bigint      NOT NULL CHECK (epoch >= 0),   -- highest-ever promoted epoch
-  genesis_marker  text        NOT NULL,                       -- explicit provisioned-genesis nonce
-  provisioned_at  timestamptz NOT NULL DEFAULT now(),
+  state           text        NOT NULL CHECK (state IN ('incomplete','provisioned')),
   updated_at      timestamptz NOT NULL DEFAULT now()
 );
--- existing: tsk_outbox_fence(stream_id, fence_token) — the in-tx source write fence.
--- fence_token is DERIVED from the epoch (canonical decimal of the epoch), so advancing the
--- epoch advances the authoritative write token in the SAME PG tx.
+
+-- (H3) control-authority GRANTED write lease for the current source node. A cannot self-renew;
+-- the control DB records the externally-observable max expiry + a revocation flag.
+CREATE TABLE tsk_ha_lease (
+  stream_id          text PRIMARY KEY,
+  lease_id           text        NOT NULL,     -- opaque, rotated per grant
+  holder_node_id     text        NOT NULL,     -- the current source authority (A)
+  epoch              bigint      NOT NULL,     -- the epoch this lease authorizes
+  granted_max_expiry timestamptz NOT NULL,     -- CONTROL-DB clock; A must be dead after this (+skew+tx window)
+  revoked            boolean     NOT NULL DEFAULT false,
+  grant_digest       text        NOT NULL,     -- canonical digest of the grant
+  guard_key_id       text        NOT NULL,
+  guard_signature    text        NOT NULL,     -- signs (stream_id, lease_id, holder, epoch, granted_max_expiry)
+  updated_at         timestamptz NOT NULL DEFAULT now()
+);
 ```
 
-Redis side keeps the existing `FenceRecord {nodeId, fenceEpoch, expiresAt, commandId, active}`.
+On **each source PG** (A / a promoted B), the existing `tsk_outbox_fence(stream_id, fence_token)`
+gains lease columns; the write token AND an unexpired, non-revoked lease are checked in-tx:
+```sql
+ALTER TABLE tsk_outbox_fence
+  ADD COLUMN lease_id     text,
+  ADD COLUMN lease_epoch  bigint,
+  ADD COLUMN lease_until  timestamptz;   -- mirror of the control grant, checked in the pre-COMMIT hook
+```
+`fence_token` is the canonical decimal of `epoch`, so a promotion advances the authoritative
+write token in the SAME PG tx as the fence/lease update. Redis keeps the existing
+`FenceRecord {nodeId, fenceEpoch, expiresAt, commandId, active}` as the claim coordinator only.
 
 ### 3.2 Provisioned genesis — its own signed saga (H2)
 
@@ -113,10 +148,23 @@ step is idempotent, keyed by `(streamId, E', commandId)`.
    This is the first durable action; a crash after any later effect is always recoverable from
    this authenticated intent. Without a committed intent, no fence/claim happens.
 1. **Allocate/verify `E'`** against the witness (`W`), require provisioned + Redis-not-lost (§3.4).
-2. **Fence OLD A + PROVE it.** Advance `tsk_outbox_fence` (token = `E'`, `lease_until` frozen)
-   in A's PG, then **prove A fenced per H2** — wait `lease_until + margin` on A's PG clock (or
-   STONITH). Every in-flight/new A mutation re-reads the fence + lease `FOR UPDATE` in its own
-   SERIALIZABLE tx and loses. **Refuse (fail-closed) if A cannot be proven fenced.**
+2. **Fence OLD A + PROVE it — on the CONTROL clock, not A's PG (blocker 3/4).**
+   - **Revoke the control lease grant** (`tsk_ha_lease.revoked = true`) — always reachable, does
+     not depend on A. From now A gets no renewal.
+   - **Prove A dead without A-PG access**: wait `granted_max_expiry + clock_skew + max_tx/commit_window`
+     on the **control-DB clock**. (`granted_max_expiry` is the control-recorded max; A mirrors
+     `lease_until ≤ granted_max_expiry` and its non-bypassable pre-commit hook fails once passed.)
+   - **HONESTY (blocker 4):** a client deadline + pre-commit hook alone **cannot** stop a COMMIT
+     completing after expiry under a stalled partition, and **PG16 has no universal
+     server-side total-transaction-lifetime cap**. So A's node MUST enforce one of, and the
+     drill proves it: (a) a **session reaper** — a watchdog on A's PG that
+     `pg_terminate_backend()`s any backend older than the lease (backed by `statement_timeout` +
+     `idle_in_transaction_session_timeout` tuned below the lease margin); or (b) **STONITH**.
+     Lease-expiry-without-enforced-termination is documented as insufficient under a stalled
+     partition.
+   - If A's PG is reachable, also advance its `fence_token`/`lease_until` immediately (an
+     optimization; the control wait is the authority).
+   - **Refuse (fail-closed) if A cannot be proven fenced.**
 3. **Claim `E'` in Redis** (CAS: accept only if `R < E'`) — only after A is proven fenced.
 4. **Advance the witness** to `E'` (monotonic, `FOR UPDATE`, forward-only).
 5. **Advance B's PG fence + begin import** (PR2b/PR2c).
@@ -136,6 +184,21 @@ On any claim/promotion path, cross-check Redis `R` against the witness `W`:
   re-initialize the epoch from an empty/stale Redis, and never bump the epoch gratuitously.**
 - **Lost CAS response** (Redis ack lost): the claim is ambiguous → reconcile by re-reading
   Redis+witness; the claim is idempotent by `(nodeId, E', commandId)`; never assume success.
+- **`R > W` (Redis ahead of the witness)** — legitimate only mid-saga (Redis `E'` claimed at
+  step 3 before the witness advanced at step 4). **Only the exact signed active intent
+  `(streamId, E', commandId)` in `tsk_ha_cutover_head` may reconcile it** (complete step 4,
+  advancing `W` to `R`). **Every other caller quarantines** (a `R > W` without the matching
+  active intent is treated as an anomaly). `R < W` or Redis-absent stays the rollback path
+  (quarantine, governed reseed) — never re-initialize.
+
+**Governed ABORT & epoch reuse (blocker: abort semantics).** A governed `ABORT` of an intent
+**cannot undo** a fence / Redis claim / witness advance that already happened, nor permit reuse
+until reconciled:
+- **pre-effect abort** (intent still `PREPARING`, no fence/claim/witness effect) → the target
+  `E'` **is reused** by the next promotion (nothing was consumed);
+- **post-effect abort** (any effect applied) → the epoch is **consumed**; the next promotion
+  uses `witness.epoch + 1` against the reconciled state. Epochs are **never gratuitously
+  skipped** and never reused after an effect.
 
 **H4/H10 — Redis durability under Sentinel async failover (internet-verified against official
 Redis docs).** Redis OSS Sentinel **explicitly does NOT guarantee** that acknowledged writes
@@ -282,31 +345,47 @@ boundary; post-boundary unproven old record → isolated as evidence, new epoch 
 
 ### 5.1 Cutover state (durable, **per-transition signed**, forward-CAS) — H5
 
-Each phase transition writes a **new signed row** whose signature covers the **current**
-phase and the **previous state digest** (an immutable initial signature cannot authenticate a
-later mutated phase). Transitions are applied by **forward CAS on `prev_state_digest`** so a
-stale/racing writer cannot fork the state machine.
+**Blocker-2 fix — authoritative HEAD row + immutable HISTORY.** A partial-unique over history
+rows is self-violating (PREPARING stays while FENCED is appended → two non-terminal rows).
+Instead: **one `tsk_ha_cutover_head` row per stream** (the single authoritative current state,
+updated by `state_digest` CAS with `affected rows = 1`) + an append-only signed
+`tsk_ha_cutover_history`. This also closes the authoritative-head / fork gap.
 
-```
-CREATE TABLE tsk_ha_cutover (
-  stream_id        text        NOT NULL,
-  epoch            bigint      NOT NULL,            -- target E'
-  command_id       text        NOT NULL,
-  seqno            bigint      NOT NULL,            -- monotonic transition number
-  phase            text        NOT NULL,            -- PREPARING|FENCED|IMPORTING|READY|ACTIVE|ABORTED
-  -- exactly ONE active intent per stream (H1): a partial UNIQUE index over stream_id
-  -- WHERE phase NOT IN ('ACTIVE','ABORTED') rejects a second in-flight intent.
-  prev_state_digest text,                            -- digest of the prior row (forward CAS)
-  state_digest     text        NOT NULL,            -- canonical digest of THIS row
-  manifest_digest  text,                            -- bound once import attested
-  guard_key_id     text        NOT NULL,
-  guard_signature  text        NOT NULL,            -- signs (stream_id,epoch,command_id,seqno,phase,prev_state_digest,manifest_digest)
-  created_at       timestamptz NOT NULL DEFAULT now(),
+```sql
+-- authoritative CURRENT state: exactly one row per stream (H1: one active intent)
+CREATE TABLE tsk_ha_cutover_head (
+  stream_id       text PRIMARY KEY,
+  epoch           bigint      NOT NULL,      -- target E' of the in-flight/last intent
+  command_id      text        NOT NULL,
+  seqno           bigint      NOT NULL,      -- monotonic transition number
+  phase           text        NOT NULL CHECK (phase IN ('PREPARING','FENCED','IMPORTING','READY','ACTIVE','ABORTED')),
+  state_digest    text        NOT NULL,      -- canonical digest of the current head
+  manifest_digest text,                      -- bound once import attested
+  pending_n1_digest text,                    -- (H8/H6) full digest of the pending N+1 (head/fence/id) once READY->ACTIVE saga starts
+  updated_at      timestamptz NOT NULL DEFAULT now()
+);
+-- append-only, per-transition SIGNED history (forward CAS on prev_state_digest)
+CREATE TABLE tsk_ha_cutover_history (
+  stream_id         text        NOT NULL,
+  epoch             bigint      NOT NULL,
+  command_id        text        NOT NULL,
+  seqno             bigint      NOT NULL,
+  phase             text        NOT NULL,
+  prev_state_digest text,                     -- must equal the head's state_digest at apply time (CAS)
+  state_digest      text        NOT NULL,
+  manifest_digest   text,
+  pending_n1_digest text,
+  guard_key_id      text        NOT NULL,
+  guard_signature   text        NOT NULL,     -- signs (stream_id,epoch,command_id,seqno,phase,prev_state_digest,state_digest,manifest_digest,pending_n1_digest)
+  created_at        timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (stream_id, epoch, seqno)
 );
 ```
-A transition commits iff its `prev_state_digest` equals the current head row's `state_digest`
-(forward CAS) and the guard signature verifies against a currently-valid, non-revoked keyId.
+A transition, in one control-DB tx: append the signed history row, then
+`UPDATE tsk_ha_cutover_head SET ... WHERE stream_id=$1 AND state_digest = $prev` (must affect
+exactly 1 row — forward CAS). The guard signature must verify against a currently-valid,
+non-revoked keyId. A **new promotion is admitted only when the head phase is terminal**
+(`ACTIVE`/`ABORTED`) — H1 exactly-one-active-intent, enforced by the single head row.
 
 ### 5.2 States & transitions (forward-only, idempotent, each a durable signed tx)
 
@@ -323,12 +402,17 @@ A transition commits iff its `prev_state_digest` equals the current head row's `
   impossible**. Use a durable saga, idempotent at each step:
   1. **B-PG commits `N+1` as `pending`/NON-publishable** under `E'` (durable but not yet
      deliverable/authoritative);
-  2. the **signed `ACTIVE` transition** is written to the control DB (binding `manifest_digest`
-     + the pending `N+1` id);
-  3. **activate/publish `N+1` idempotently** (mark publishable).
-  A crash between steps leaves `N+1` durable-but-pending (never published, never two sources);
-  resume completes activation idempotently. This replaces the earlier (incorrect) single-tx
-  claim — a distributed 2PC is possible but not preferred.
+  2. the **signed `ACTIVE` transition** is written to the control DB, and its signature
+     **binds the pending `N+1`'s FULL digest** (`pending_n1_digest` = head + fence + row id) —
+     not just an id (blocker 8);
+  3. **activate/publish `N+1` idempotently** (mark publishable), only after verifying the B-PG
+     pending row matches `pending_n1_digest`.
+  **Recovery (blocker 8):** on restart in the READY→ACTIVE saga, **verify the B-PG pending/
+  published state against the signed `pending_n1_digest`** before reminting the capability or
+  allowing writes. If B-PG has **lost the pending `N+1` after ACTIVE was signed → FAIL CLOSED**;
+  never recreate `N+1` from unauthenticated data. A crash between steps leaves `N+1`
+  durable-but-pending (never published, never two sources); resume completes activation
+  idempotently. (A distributed 2PC is possible but not preferred.)
 
 ### 5.3 Epoch-transition boundary & epoch-separated streams (blocker 6)
 
@@ -386,13 +470,16 @@ evidence) + the PG witness. Run A→B promotion under faults §6 + the crash mat
 - **honest per-fault RPO** + per-fault RTO (§5.6);
 - the synchronous-durability RPO=0-under-storage-loss mode is a **separate gate**, not required.
 
-### 5.8 PR2a evidence harness (H11)
+### 5.8 PR2a evidence harness (H11 — honest topology)
 
-The PR2a drill uses **three distinct PostgreSQL systems** — A, B, and the **control DB** —
-plus Redis, and **attests all three have distinct `system_identifier`** (no shared instance).
-It **crashes at each saga step** (signed intent → fence → Redis claim → witness advance) and at
-provisioning steps, and **proves NO writer** exists after any crash (old A fenced/pending, B not
-ready). No split-brain claim; PR2a merges bounded/mechanism-only on this evidence.
+PR2a exercises the **fencing foundation only**, which involves the **source PG (A)** and the
+**control DB** + **Redis** — **two distinct PostgreSQL systems + Redis** (the distinct
+**receiver B** PG enters in PR2b; PR2a does **not** inflate the topology to 3 PG). The drill
+**attests A-PG and control-PG have distinct `system_identifier`** (no shared instance),
+**crashes at each saga/provisioning step** (provisioning intent → witness genesis → Redis
+genesis → complete; and promote: signed intent → lease revoke/expiry → fence → Redis claim →
+witness advance), and **proves NO writer** exists after any crash (old A fenced or fencing
+pending). No split-brain claim; PR2a merges **bounded/mechanism-only** on this evidence.
 
 ---
 
@@ -429,7 +516,7 @@ ready). No split-brain claim; PR2a merges bounded/mechanism-only on this evidenc
 | H8 | source-ledger vs receiver-applied conflation | 2b | N proven from contiguous source ledger + MMR; distinct tables/authorities |
 | H9 | valid backlog C+1..N exceeds one manifest | 2b | chunked/batched tail with per-batch MMR proof; never rejected for size |
 | H10 | Sentinel async failover loses acked fence / old-master partition | 2c | WAITAOF+AOF+min-replicas+CKQUORUM; old-master write-refusal; witness authoritative + quarantine/reseed |
-| H11 | crash at each saga/provision step (3 distinct PG + Redis) | 2a | distinct system_identifier attested; prove NO writer after any crash |
+| H11 | crash at each saga/provision step (A-PG + control-PG + Redis) | 2a | distinct system_identifier attested; prove NO writer after any crash (B-PG enters 2b) |
 
 ## 7. Resolved answers + remaining choices
 
