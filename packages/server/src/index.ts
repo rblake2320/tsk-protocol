@@ -80,6 +80,21 @@ export {
   assertControlSchemaReady,
   FenceAuthorityQuarantineError,
 } from './ha-control-fencing.js';
+export {
+  TSK_SOURCE_LEASE_SCHEMA,
+  TSK_SOURCE_LEASE_TABLES,
+  signLeaseGrant,
+  installLeaseGrant,
+  verifyLeaseGrant,
+  readSourceLease,
+  assertSourceLeaseWritable,
+  SourceFenceQuarantineError,
+} from './tsk-source-fence.js';
+export type {
+  LeaseGrant,
+  BareLeaseGrant,
+  LeaseState as SourceLeaseState,
+} from './tsk-source-fence.js';
 export type {
   GuardKeyResolver,
   ControlSchemaReadyToken,
