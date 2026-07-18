@@ -51,6 +51,21 @@ import {
 /** Contract HOTP counter bound (mirrors the TSK segment counter ceiling). */
 export const TSK_HOTP_MAX_COUNTER = 2_147_483_647;
 
+/**
+ * The ONLY `StreamHeadVerifier` error that is RETRYABLE: a transient verification
+ * DEPENDENCY (key store / HSM / network) is unavailable. Every other throw from a
+ * verifier — an invalid signature, an unknown key/alg, OR an unexpected/unknown
+ * exception — is treated as a PERMANENT reject-fork (fail-closed). Verification
+ * failures therefore can never be turned into an attacker-controlled retry loop:
+ * only an explicitly-typed unavailability defers; ambiguity fails closed.
+ */
+export class StreamHeadVerificationUnavailableError extends Error {
+  constructor(message = 'stream-head verifier dependency unavailable') {
+    super(message);
+    this.name = 'StreamHeadVerificationUnavailableError';
+  }
+}
+
 // ── Backend brand + transaction primitives (re-derived from the hardened core) ──
 
 export interface TskPgBackend { readonly __tskHaOutbox: unique symbol }
@@ -710,7 +725,10 @@ export class PgTskReceiverCheckpoint implements TskReceiverCheckpoint<TskPgBacke
     try { assertStreamHeadBinds(record, head); } catch { return 'reject-fork'; }
     try { await this.headVerifier.verify(head); }
     catch (err) {
-      if ((err as { transient?: boolean })?.transient === true) throw err;
+      // ONLY a typed unavailability error retries; EVERY other throw (invalid
+      // signature, unknown key/alg, or an UNKNOWN exception) is a permanent
+      // reject-fork (fail-closed) — no attacker-controlled retry loop.
+      if (err instanceof StreamHeadVerificationUnavailableError) throw err;
       return 'reject-fork';
     }
 

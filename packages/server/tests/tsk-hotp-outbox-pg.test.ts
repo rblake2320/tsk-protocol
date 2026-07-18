@@ -15,6 +15,7 @@ import {
 import {
   GENESIS_HEAD,
   PgTskReceiverCheckpoint,
+  StreamHeadVerificationUnavailableError,
   __unsafeMintReadyTokenForTests,
   type HotpApplier,
   type PgExecutor,
@@ -118,12 +119,33 @@ describe('PgTskReceiverCheckpoint — HOTP exactly-once + signed hash-linked hea
     expect(applied.length).toBe(0);
   });
 
-  it('signed head: a TRANSIENT verifier error (key-store outage) is re-thrown for retry, NOT rejected', async () => {
-    const flaky: StreamHeadVerifier = { async verify() { const e: Error & { transient?: boolean } = new Error('key store unavailable'); e.transient = true; throw e; } };
+  it('signed head: a TYPED unavailability error retries (re-thrown), does NOT apply/ack/quarantine', async () => {
+    const flaky: StreamHeadVerifier = { async verify() { throw new StreamHeadVerificationUnavailableError('HSM offline'); } };
     const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, flaky, applier, __unsafeMintReadyTokenForTests(db, 'public'));
     const r = mkRecordHead(1, { tumblerId: 'T1', counter: 1 }, GENESIS_HEAD);
-    await expect(r2.verifyAndApplyTumblerDelivered(r.record, r.head)).rejects.toThrow(/key store unavailable/);
+    await expect(r2.verifyAndApplyTumblerDelivered(r.record, r.head)).rejects.toBeInstanceOf(StreamHeadVerificationUnavailableError);
     expect(db.rcvOf(SID).seq).toBe(0); // not applied, not rejected — retry
+    expect(applied.length).toBe(0);
+  });
+
+  it('signed head: an UNKNOWN/untyped verifier exception FAILS CLOSED (reject-fork, no ack, no retry loop)', async () => {
+    const chaos: StreamHeadVerifier = { async verify() { throw new TypeError('unexpected boom'); } };
+    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, chaos, applier, __unsafeMintReadyTokenForTests(db, 'public'));
+    const r = mkRecordHead(1, { tumblerId: 'T1', counter: 1 }, GENESIS_HEAD);
+    expect(await r2.verifyAndApplyTumblerDelivered(r.record, r.head)).toBe('reject-fork');
+    expect(db.rcvOf(SID).seq).toBe(0);
+    expect(applied.length).toBe(0);
+  });
+
+  it('signed head: a swapped keyId or alg is rejected (unknown key -> reject-fork; unknown alg -> reject-fork)', async () => {
+    const good = mkRecordHead(1, { tumblerId: 'T1', counter: 1 }, GENESIS_HEAD);
+    // wrong keyId: headVerifier throws unknown keyId -> permanent reject-fork
+    const wrongKey = { record: good.record, head: { ...good.head, keyId: 'attacker-key' } };
+    expect(await apply(wrongKey)).toBe('reject-fork');
+    // swapped alg: headDigest binds alg, so ecdsa alg makes the digest mismatch -> reject-fork at binding
+    const swappedAlg = { record: good.record, head: { ...good.head, alg: 'ecdsa-p256-sha256' as const } };
+    expect(await apply(swappedAlg)).toBe('reject-fork');
+    expect(applied.length).toBe(0);
   });
 
   it('hash-chain continuity: a broken prevHeadDigest link is reject-fork', async () => {
