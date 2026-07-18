@@ -26,18 +26,26 @@ mesh design packets. Incorporates Codex's review blockers (1)–(6) and precisio
 or B — otherwise loss of the old source would block promotion. Redis, the control DB, and
 each node's PG are three distinct domains.
 
-**H2 — proving A is fenced under partition/outage.** "Advance A's PG fence first" is **not
-sufficient** for HA: a promoter partitioned from A cannot advance A's fence, yet an isolated
-A that can still reach its own PG would keep writing. Therefore A's write authority is a
-**DB-clock-bounded expiring write lease** (`tsk_outbox_fence.lease_until`, A's PG clock),
-re-checked `FOR UPDATE` inside **every** A mutation tx immediately before commit — so a tx
-cannot commit once the lease has expired. Promotion proves A fenced by **one of**:
-(a) **wait-for-expiry** — advance the fence/epoch, then wait `lease_until + margin` on A's PG
-clock so any in-flight A tx fails its in-tx lease check; or (b) **STONITH / infrastructure
-fencing** of A's node. **Promotion MUST refuse to proceed (fail-closed) if it cannot prove A
-is fenced** (neither expiry elapsed nor STONITH confirmed). Fault test: A reaches its PG but
-not Redis/guard with an in-flight tx → A's lease expires → A self-fences → promotion proceeds
-only after proven expiry.
+**H2/H3 — proving A is fenced under partition/outage (control-granted lease).** "Advance A's
+PG fence first" is **not sufficient**: a promoter partitioned from A cannot advance A's fence,
+and A must not be able to self-renew its own authority. So A's write authority is a
+**control-authority-GRANTED, DB-clock-bounded expiring write lease**:
+- **Renewal requires a control-authority grant** — A cannot extend its own lease; a partitioned
+  A therefore cannot keep writing past the current grant.
+- The lease's **max expiry is recorded in the control DB** (externally observable without
+  reaching A's PG), so the promoter knows exactly when A must be dead.
+- Every A authority tx **re-checks the lease in a non-bypassable PRE-COMMIT hook**, and the
+  **total tx deadline is strictly shorter than the remaining lease margin** (leveraging the #10
+  transactor's transaction deadline + `statement_timeout`), so a socket pause/GC after the
+  check cannot let a commit land after expiry.
+- **To promote**, the control authority **stops granting renewals and revokes**, then **waits
+  `max_expiry + clock_skew + max_tx/commit_window`** (all control-observable, **no A-PG access
+  needed**) — **or** performs **STONITH**. **Promotion refuses (fail-closed) if it cannot prove
+  A fenced.** Fault test: A reaches its own PG but not Redis/control with an in-flight tx → its
+  grant lapses → its pre-commit lease check fails → self-fenced; promotion proceeds only after
+  the control-observable wait.
+Production profile may select STONITH instead of wait-for-expiry; the drill uses lease-expiry
+(deterministic, no infra).
 
 ## 2. Slice order (reordered per Codex)
 
@@ -71,13 +79,20 @@ CREATE TABLE tsk_ha_epoch_witness (
 
 Redis side keeps the existing `FenceRecord {nodeId, fenceEpoch, expiresAt, commandId, active}`.
 
-### 3.2 Provisioned genesis
+### 3.2 Provisioned genesis — its own signed saga (H2)
 
-Provisioning writes the witness genesis row (`epoch = 0`, `genesis_marker` = a random
-provisioning nonce) **and** the Redis fence record for epoch 0. A stream is *provisioned*
-iff the witness row exists. This distinguishes **never-provisioned** (no witness) from
-**provisioned-then-Redis-lost** (witness present, Redis absent/lower) → the latter is
-fail-closed, never re-initialized.
+Provisioning is itself cross-resource (witness + Redis) and crash-ambiguous, so it uses the
+same write-ahead pattern and **an explicit completion flag — never infer "provisioned" from a
+witness row alone**:
+1. **Signed `PROVISIONING` intent** in the control DB first (`stream_id`, `genesis_marker`,
+   guard signature), idempotent.
+2. Write the witness genesis row (`epoch = 0`) **with `state = 'incomplete'`**.
+3. Write the Redis fence record for epoch 0.
+4. Flip the witness to **`state = 'provisioned'`** (the ONLY marker of a usable stream).
+A crash mid-provision leaves an **explicit incomplete-provision state** → promotion/writes
+refuse until provisioning is idempotently completed or governed-reset. `never-provisioned`
+(no intent) is distinct from `incomplete` (intent present, not `provisioned`) is distinct from
+`provisioned-then-Redis-lost` (provisioned + Redis absent/lower → §3.4 quarantine).
 
 ### 3.3 Promotion saga (Redis + 3 PG are NOT atomic — write-ahead intent + resource-fencing order)
 
@@ -86,12 +101,17 @@ write-ahead INTENT** (H1) as the single authoritative record of an in-flight pro
 orders the effects so a partial failure leaves **no writer**. `E' = witness.epoch + 1`. Every
 step is idempotent, keyed by `(streamId, E', commandId)`.
 
-0. **(H1) Durable signed intent BEFORE any effect.** Atomically insert a `PREPARING`
-   reservation into the **control DB** keyed `(streamId, E')` with `commandId` + a **guard
-   signature** — an `INSERT ... ON CONFLICT (streamId, E') DO NOTHING` so two promoters racing
-   the same epoch resolve to exactly one reservation (the other must pick `E'+1`). This is the
-   first durable action; a crash after any later effect is always recoverable from this
-   authenticated intent. Without a committed intent, no fence/claim happens.
+0. **(H1) Durable signed intent BEFORE any effect — exactly ONE active intent per stream.**
+   Atomically insert a `PREPARING` reservation into the **control DB** keyed by `stream_id`
+   (a `UNIQUE (stream_id) WHERE phase NOT IN (terminal states)` partial constraint) with
+   `epoch = E'`, `commandId`, and a **guard signature**. Conflict resolution — **never
+   leapfrog an in-flight intent**:
+   - **same `commandId`** → **idempotent resume** of the existing intent;
+   - **different `commandId`** while an intent is active → **deny / quarantine**; the new
+     promotion is refused until the current intent reaches a **terminal governed state**
+     (`ACTIVE`, or an explicit governed `ABORTED`). A racing promoter does **not** pick `E'+1`.
+   This is the first durable action; a crash after any later effect is always recoverable from
+   this authenticated intent. Without a committed intent, no fence/claim happens.
 1. **Allocate/verify `E'`** against the witness (`W`), require provisioned + Redis-not-lost (§3.4).
 2. **Fence OLD A + PROVE it.** Advance `tsk_outbox_fence` (token = `E'`, `lease_until` frozen)
    in A's PG, then **prove A fenced per H2** — wait `lease_until + margin` on A's PG clock (or
@@ -117,16 +137,25 @@ On any claim/promotion path, cross-check Redis `R` against the witness `W`:
 - **Lost CAS response** (Redis ack lost): the claim is ambiguous → reconcile by re-reading
   Redis+witness; the claim is idempotent by `(nodeId, E', commandId)`; never assume success.
 
-**H4 — Redis durability under Sentinel async failover.** Sentinel can promote a replica that
-lost the last acknowledged fence write, silently rolling the epoch back. To close #10 the
-Redis authority must be configured + evidenced: **`appendonly yes` + `appendfsync everysec`
-(or always)**, **`min-replicas-to-write` ≥ 1 with a bounded `min-replicas-max-lag`**, and a
-**`WAIT`/`WAITAOF` after every fence write** to confirm replication/fsync before the write is
-treated as committed. Even so, a rollback remains possible; the **external witness cross-check
-(§3.4) quarantines** on `R < W` and forces a **governed reseed**. The design defines the
-resulting **write-outage window / RTO** during a Sentinel failover (writes fail-closed until a
-quorum-durable fence is re-confirmed). Single Redis (no Sentinel) is **mechanism-only** and
-cannot close #10.
+**H4/H10 — Redis durability under Sentinel async failover (internet-verified against official
+Redis docs).** Redis OSS Sentinel **explicitly does NOT guarantee** that acknowledged writes
+survive a failover; async replication + an old-master partition can lose writes, and **3-node
+Sentinel is failure-detection, NOT consensus**. `WAIT` is **best-effort replication ack, not
+strong consistency and not fsync**. `WAITAOF` (Redis **≥ 7.2**) proves local/replica **AOF
+fsync counts**. Therefore:
+- the **external control-DB witness remains the epoch authority + quarantine backstop** —
+  Redis is the coordinator/optimization, never the sole truth;
+- config to evidence for #10: **`appendonly yes` + `appendfsync everysec|always`**,
+  **`min-replicas-to-write ≥ 1`** with bounded `min-replicas-max-lag`, and a **`WAITAOF` after
+  every fence write with validated return counts** (not `WAIT` alone);
+- drill (Redis ≥ 7.2) validates: **`WAITAOF` local+replica fsync counts**, **Sentinel
+  `CKQUORUM`**, min-replicas, AOF **rewrite/restart**, **min-replica split partition**,
+  **old-master isolation → write refusal**, and a **rollback cross-check** (on `R < W` the
+  witness quarantines → governed reseed);
+- the design defines the **write-outage window / RTO** during failover (writes fail-closed
+  until a quorum-durable fence is re-confirmed against the witness).
+Single Redis (no Sentinel) is **mechanism-only** and cannot close #10.
+Sources: redis.io/docs/latest/commands/wait, /commands/waitaof, /operate/oss_and_stack/management/sentinel.
 
 ### 3.5 In-tx source fence (TOCTOU close, blocker 2)
 
@@ -171,19 +200,17 @@ frozen final head **N**:
 - `streamId`, `epoch` (the fence epoch of the frozen source), `sourceNodeId`
 - **final source head N**: the signed `SignedStreamHead` at `sequence = N`
 - `sourceCheckpoint` (final applied source `sequence = N`)
-- **head-chain integrity (Q2 — no over-claim)**: a compact rolling hash + the signed head at
-  `N` is **NOT** an independently verifiable `genesis→N` proof. Two honest options; PR2b picks
-  ONE and labels it precisely:
-  - **(default) dual-signature STATE ATTESTATION**: the manifest carries the source **and**
-    guard signatures over `canonicalDigest`; B trusts the attested `N`/head/HOTP because two
-    independent keys signed it — **not** a cryptographic replay proof. **Full head + HOTP
-    lineage is retained on the source/control DB for audit** so an independent verifier can
-    replay `genesis→N` out-of-band.
-  - **(optional stronger)** an **incrementally maintained, externally anchored MMR/Merkle
-    checkpoint** updated atomically with each append, giving a **bounded inclusion/consistency
-    proof** `genesis→N` that B verifies independently. Deferred unless required to close #10.
-- **HOTP authoritative state**: per-tumbler high-water counters + a consumed-lineage
-  **attestation** digest (same honesty caveat; full lineage retained for audit).
+- **head-chain integrity — REQUIRED externally-anchored MMR (Decision 3, Q2).**
+  Dual-signature attestation alone is **insufficient** for our independently-verifiable
+  evidence target. The source maintains an **incremental Merkle Mountain Range (MMR)** over the
+  head chain, **updated atomically with every append** (the MMR root advances in the same
+  SERIALIZABLE append tx) and its roots **anchored in the control DB**. The manifest carries the
+  MMR root at `N` + a **bounded inclusion/consistency proof** so B **independently verifies**
+  `genesis→N` continuity — not merely trusts two signatures. Dual signatures still authenticate
+  the manifest; the MMR provides the verifiable proof. Full lineage is also retained for audit.
+- **HOTP authoritative state**: per-tumbler high-water counters + a consumed-lineage covered by
+  the same MMR/anchored-checkpoint mechanism (verifiable, not attestation-only); full lineage
+  retained for audit.
 - `fenceToken` / `epoch`
 - `canonicalDigest` = sha256 over the canonicalized manifest
 - **signatures**: source signature **and** guard signature over `canonicalDigest`
@@ -211,11 +238,23 @@ HOTP monotonic lineage; verify `epoch`/`streamId`/`sourceNodeId` binding; enforc
 bound. **Only if all pass**, atomically persist B's imported source state and mark
 `import-complete`. Any failure rolls back entirely → no partial source authority.
 
-### 4.3 C, N, tail — corrected old-epoch handling (blocker 1, precision fix 1)
+### 4.3 C, N, tail — distinct authorities (H8) + chunked tail (H9) + old-epoch handling
 
-- **C** = B's receiver-**applied** checkpoint (what B already applied as a receiver).
-- **N** = the frozen final source head (A fenced before the snapshot → nothing after the fence).
-- **tail** = `C+1 .. N`.
+**H8 — do NOT conflate source-ledger vs receiver-applied state.** Define each authority/table:
+- the **SOURCE ledger** = `tsk_outbox_rows` + `tsk_outbox_source_checkpoint` on the source PG:
+  the contiguous `1..N` sequence the source has **committed/produced**, with the hash-linked
+  head chain + MMR. **N is proven from this contiguous source ledger** (no gaps, MMR-verified),
+  NOT from any receiver state.
+- the **RECEIVER applied** state = `tsk_outbox_receiver_checkpoint` on B: what B has **applied**.
+- **C** = B's receiver-**applied** checkpoint; **N** = the frozen final **source** head (A fenced
+  before the snapshot → the source ledger cannot grow past `N`).
+- **tail** = `C+1 .. N` (the source rows B has not yet applied).
+
+**H9 — the tail is CHUNKED, never terminally rejected for size.** The bounded-size limit
+applies to the **snapshot manifest** (state at `N`). A large backlog `C+1..N` is **transported
+in bounded BATCHES**, each with its own bounded MMR inclusion proof, applied idempotently in
+order until B reaches `N`. A valid backlog exceeding one manifest is **resynced in chunks**, not
+rejected.
 - A late **old-epoch** record is classified, **never silently dropped**:
   - `seq ≤ C` (already in applied history) → **duplicate-ok**;
   - `C < seq ≤ N` → **MUST apply/reconcile as tail** (it is real committed source data);
@@ -254,7 +293,9 @@ CREATE TABLE tsk_ha_cutover (
   epoch            bigint      NOT NULL,            -- target E'
   command_id       text        NOT NULL,
   seqno            bigint      NOT NULL,            -- monotonic transition number
-  phase            text        NOT NULL,            -- PREPARING|FENCED|IMPORTING|READY|ACTIVE
+  phase            text        NOT NULL,            -- PREPARING|FENCED|IMPORTING|READY|ACTIVE|ABORTED
+  -- exactly ONE active intent per stream (H1): a partial UNIQUE index over stream_id
+  -- WHERE phase NOT IN ('ACTIVE','ABORTED') rejects a second in-flight intent.
   prev_state_digest text,                            -- digest of the prior row (forward CAS)
   state_digest     text        NOT NULL,            -- canonical digest of THIS row
   manifest_digest  text,                            -- bound once import attested
@@ -277,11 +318,17 @@ A transition commits iff its `prev_state_digest` equals the current head row's `
   the unforgeable source-readiness capability** (module-private mint, WeakMap-bound to
   `manifest_digest` + `E'`, same pattern as `SchemaReadyToken`); write the signed `READY`
   transition binding `manifest_digest`.
-- **READY → ACTIVE — atomic with the first origination (H6)**: B's first source mutation
-  (append `seq N+1`, chained from N through the epoch boundary, requiring the capability) **and**
-  the signed `ACTIVE` transition commit in **ONE SERIALIZABLE tx**. So a crash can never leave a
-  committed `N+1` while the phase still reads `READY` (which would look un-promoted). Equivalent
-  safe form: a durable pending-origination record reconciled idempotently — never two sources.
+- **READY → ACTIVE — cross-DB durable-operation saga (H6).** The `N+1` append lives in **B-PG**
+  and the `ACTIVE` transition in the **control DB** — **distinct DBs, so one SERIALIZABLE tx is
+  impossible**. Use a durable saga, idempotent at each step:
+  1. **B-PG commits `N+1` as `pending`/NON-publishable** under `E'` (durable but not yet
+     deliverable/authoritative);
+  2. the **signed `ACTIVE` transition** is written to the control DB (binding `manifest_digest`
+     + the pending `N+1` id);
+  3. **activate/publish `N+1` idempotently** (mark publishable).
+  A crash between steps leaves `N+1` durable-but-pending (never published, never two sources);
+  resume completes activation idempotently. This replaces the earlier (incorrect) single-tx
+  claim — a distributed 2PC is possible but not preferred.
 
 ### 5.3 Epoch-transition boundary & epoch-separated streams (blocker 6)
 
@@ -320,19 +367,32 @@ evidence) + the PG witness. Run A→B promotion under faults §6 + the crash mat
     still durable on A, so attested import + tail `C+1..N` converges losslessly.
   - **catastrophic old-A disk/volume loss** with the async outbox → **RPO = the
     committed-but-undelivered tail** (it existed only on A). This is honestly non-zero.
-  - To claim **RPO = 0 even under source-storage loss**, the write path must add a
-    **synchronous durable receipt**: a source mutation ACKs the client only after it has
-    synchronously reached an **independent durable quorum / third journal** (e.g. the receiver
-    or the control DB) — a latency trade-off, offered as an optional **synchronous-durability
-    mode**, not the default.
+  - **#10 closes with the HONEST measured per-fault RPO** (0 for recoverable faults; = the
+    committed-undelivered tail for source-volume loss). The doc does **not** imply
+    storage-loss RPO=0. A **synchronous independent durable receipt before the source ACK**
+    (mutation reaches an independent durable quorum/third journal first) is tracked as a
+    **separate higher-assurance mode/gate** that achieves RPO=0 under storage loss at a latency
+    cost — **not required to close #10**.
 - **RTO — reported per fault** = wall-clock from the fault/promote trigger to the new authority
   being **writable** (originating `N+1` under `E'`) **and** converged to `N`; includes the H2
   lease-expiry wait and the H4 Redis failover write-outage window.
 
 ### 5.7 To close #10
 
-PR2c green **including** real 3-node Redis Sentinel/quorum with configured
-persistence/replication and demonstrated **failover + rollback** evidence, measured RPO/RTO.
+- PR2c green **including** real Redis (≥7.2) Sentinel with `WAITAOF`/AOF/min-replicas evidence,
+  `CKQUORUM`, old-master-isolation write-refusal, and rollback cross-check (§3.4) — with the
+  **external control-DB witness remaining authoritative** (Sentinel is not consensus);
+- the **externally-anchored MMR** `genesis→N` proof (Decision 3), independently verified on import;
+- **honest per-fault RPO** + per-fault RTO (§5.6);
+- the synchronous-durability RPO=0-under-storage-loss mode is a **separate gate**, not required.
+
+### 5.8 PR2a evidence harness (H11)
+
+The PR2a drill uses **three distinct PostgreSQL systems** — A, B, and the **control DB** —
+plus Redis, and **attests all three have distinct `system_identifier`** (no shared instance).
+It **crashes at each saga step** (signed intent → fence → Redis claim → witness advance) and at
+provisioning steps, and **proves NO writer** exists after any crash (old A fenced/pending, B not
+ready). No split-brain claim; PR2a merges bounded/mechanism-only on this evidence.
 
 ---
 
@@ -363,29 +423,28 @@ persistence/replication and demonstrated **failover + rollback** evidence, measu
 | H3 | catastrophic old-A disk/volume loss (async outbox) | 2c | RPO = committed-undelivered tail (honest); 0 only in synchronous-durability mode |
 | H4 | Redis Sentinel async failover loses an acked fence | 2c | witness cross-check quarantines; bounded write-outage RTO; needs AOF/min-replicas/WAIT |
 | H5 | tampered/mutated cutover phase row | 2c | per-transition signature + forward CAS rejects |
-| H6 | crash between READY and first N+1 origination | 2c | atomic ACTIVE+append: never committed N+1 while phase=READY |
+| H6 | crash between READY and first N+1 origination | 2c | durable saga: N+1 pending→ACTIVE→publish; never published-while-READY, never two sources |
+| H1b | different-commandId promotion vs an in-flight intent | 2a/2c | deny/quarantine until current intent terminal; no leapfrog |
+| H2b | crash mid-provisioning (witness+Redis) | 2a | explicit incomplete-provision state; refuse until completed; never infer provisioned |
+| H8 | source-ledger vs receiver-applied conflation | 2b | N proven from contiguous source ledger + MMR; distinct tables/authorities |
+| H9 | valid backlog C+1..N exceeds one manifest | 2b | chunked/batched tail with per-batch MMR proof; never rejected for size |
+| H10 | Sentinel async failover loses acked fence / old-master partition | 2c | WAITAOF+AOF+min-replicas+CKQUORUM; old-master write-refusal; witness authoritative + quarantine/reseed |
+| H11 | crash at each saga/provision step (3 distinct PG + Redis) | 2a | distinct system_identifier attested; prove NO writer after any crash |
 
 ## 7. Resolved answers + remaining choices
 
-- **Q1 (resolved):** witness/control DB is a **fixed third failure domain**, never node A or B (§1).
-- **Q2 (resolved):** the manifest is **dual-signature state attestation with full lineage
-  retained for audit** by default; a real MMR/Merkle `genesis→N` proof is an optional stronger
-  upgrade (§4.1). No over-claim of "independently verifiable proof."
-- **Q3 (resolved):** **PR2a may merge as bounded, mechanism-only** (no split-brain claim) after
-  its fencing evidence is green.
-- **H1–H7 (folded into the design):** write-ahead signed intent (§3.3), lease-based A fencing
-  proof under partition (§1/§3.3), per-fault RPO incl. synchronous-durability mode (§5.6),
-  Redis Sentinel AOF/min-replicas/WAIT + witness quarantine (§3.4), per-transition signed
-  forward-CAS cutover (§5.1), atomic READY→ACTIVE+N+1 (§5.2), manifest key
-  custody/rotation/revocation/schema-attestation/limits (§4.1).
-
-### Remaining choices for Codex
-1. **Fencing model for A (H2):** wait-for-lease-expiry (pure software, adds RTO = lease TTL) vs
-   require STONITH/infrastructure fencing (faster, needs infra). Propose: **support both**;
-   the drill uses lease-expiry (deterministic, no infra), STONITH documented as the production
-   option. Confirm.
-2. **RPO target for #10:** accept per-fault RPO (0 for recoverable, tail for source-storage
-   loss) as the honest closure, or **require the synchronous-durability mode** (RPO=0 under
-   storage loss, with the latency cost) to close #10?
-3. **Manifest proof (Q2):** dual-signature attestation + audit lineage sufficient for #10, or
-   require the MMR/Merkle independent proof?
+All decisions from Codex's reviews are now folded in — **no open choices remain**:
+- **Q1 / Fencing domain:** witness = fixed **third** failure-domain control DB (§1).
+- **A fencing (H2/H3):** **control-granted expiring lease** + wait-for-expiry (drill) **or**
+  STONITH (production profile); promotion refuses without proof (§1/§3.3).
+- **RPO (Decision 2):** **honest per-fault RPO** closes #10; storage-loss RPO=0 is **not
+  implied**; synchronous-durability is a **separate higher-assurance gate** (§5.6).
+- **Manifest proof (Decision 3):** **externally-anchored incremental MMR is REQUIRED** for #10;
+  dual-signature-only is insufficient (§4.1).
+- **Redis (H10, internet-verified):** Sentinel is not consensus; **witness stays authoritative**;
+  `WAITAOF`/AOF/min-replicas/`CKQUORUM`/old-master-isolation/rollback evidence, Redis ≥ 7.2 (§3.4).
+- **Q3:** PR2a merges **bounded/mechanism-only** after its fencing evidence (§5.8).
+- **H1** exactly-one-active-intent, no leapfrog (§3.3.0); **H2** provisioning saga (§3.2);
+  **H5** per-transition forward-CAS signatures (§5.1); **H6** cross-DB durable saga (§5.2);
+  **H7** manifest keys/limits (§4.1); **H8** source-ledger vs applied (§4.3); **H9** chunked
+  tail (§4.3); **H11** 3-distinct-PG evidence (§5.8).
