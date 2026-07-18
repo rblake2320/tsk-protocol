@@ -18,7 +18,7 @@ import type { AddressInfo } from 'node:net';
 import pg from 'pg';
 import {
   ContractValidationError, TSK_OUTBOX_PG_SCHEMA, provisionSchemaVersion,
-  NodePostgresTransactor, PgTskDurableOutbox, PgTskPublisher, PgTskReceiverCheckpoint,
+  NodePostgresTransactor, UnfencedSingleNodeTskDurableOutbox, PgTskPublisher, PgTskReceiverCheckpoint,
   HttpOutboxTransport, createHttpOutboxReceiver, PgReplayNonceStore, TSK_TRANSPORT_NONCE_SCHEMA,
   type PgTransactor, type PgExecutor, type HotpApplier, type HotpMutationSanitizer,
   type OutboxRecord, type SanitizedMutation, type SignedStreamHead,
@@ -149,7 +149,7 @@ async function main() {
   const transportUrl = `http://127.0.0.1:${proxy.port}/ingest`;
   const transport = new HttpOutboxTransport({ url: transportUrl, fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: reqSecret, resolveResponseKey: (kid) => (kid === RESP_KEY ? respSecret : null), ackVerifier, timeoutMs: 3_000 });
 
-  const outbox = new PgTskDurableOutbox(txA, READY_A, { streamId: SID, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' });
+  const outbox = new UnfencedSingleNodeTskDurableOutbox(txA, READY_A, { streamId: SID, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' });
   const mkPublisher = () => new PgTskPublisher(txA, SID, transport, 'quarantine', sanitizer, ackVerifier, READY_A, { leaseMs: 30_000 });
   const appendN = async (from: number, n: number) => { for (let i = 0; i < n; i++) await outbox.withOutboxTx((tx) => outbox.appendInTx(tx, { streamId: SID, rawMutation: { tumblerId: `T${(from + i) % 3}`, counter: 1000 + from + i }, fenceToken: 0n })); };
   const drain = async (maxRounds = 60) => { const pub = mkPublisher(); for (let r = 0; r < maxRounds; r++) { await pub.drainOnce(); if ((await unackedA(poolA)) === 0) return; await sleep(20); } };

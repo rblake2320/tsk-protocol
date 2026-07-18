@@ -119,6 +119,29 @@ jobs:
         env:
           TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
           TSK_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # PR2b-0 source in-tx fence/lease gate (#10): the gate primitive + external witness (single
+      # source PG); the non-bypassable append wiring + transactor pre-commit re-check + frozen
+      # receipt through a real PgTskDurableOutbox; and the deterministic crash-point drills across
+      # INDEPENDENT source A (5432) + control (5434) PG16 + real Redis. THROW if env is unset (no
+      # silent skip). Bounded/mechanism-only; does NOT close #10.
+      - run: npm run test:source-fence
+        env:
+          TSK_TEST_SOURCE_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+      - run: npm run test:source-fence-outbox
+        env:
+          TSK_TEST_SOURCE_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+      - run: npm run test:source-fence-crash
+        env:
+          TSK_TEST_SOURCE_PG_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+          TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
+          TSK_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # (H3) REAL concurrency (barrier append-vs-revoke, pg_locks-proven) + REAL physical
+      # snapshot/restore/divergent-write fork caught by the witness. Independent source A (5432) +
+      # control (5434) PG16. Also exercises the C2/H1 compiled attestation + mandatory bound gate.
+      - run: npm run test:source-fence-h3
+        env:
+          TSK_TEST_SOURCE_PG_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+          TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
       - run: npm run test:pack
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
