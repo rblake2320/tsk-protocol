@@ -66,19 +66,25 @@ export {
 export {
   HA_CONTROL_PG_SCHEMA,
   HA_CONTROL_TABLES,
+  CONTROL_SCHEMA_VERSION,
   HaControlFencing,
   GuardSigner,
   verifyGuard,
   fenceTokenForEpoch,
+  encodeEvidence,
+  provisionControlSchema,
+  assertControlSchemaReady,
   FenceAuthorityQuarantineError,
 } from './ha-control-fencing.js';
 export type {
   GuardKeyResolver,
+  ControlSchemaReadyToken,
   ProvisioningState,
   LeaseState,
   WitnessState,
   CutoverState,
   FenceProof,
+  FenceEvidence,
 } from './ha-control-fencing.js';
 export type {
   ReplayNonceStore,
