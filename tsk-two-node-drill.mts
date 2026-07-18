@@ -225,6 +225,22 @@ async function main() {
       console.log(`     RTO=${rtoMs}ms from B-down to converged`);
     });
 
+    await check('(3) TERMINAL transport failure (auth 401) -> publisher QUARANTINES + HALTS the stream (not retried forever)', async () => {
+      const base = await rcvSeqB(probeB);
+      await appendN(base + 1, 1);
+      // a transport whose request key is wrong -> receiver 401 -> TERMINAL (retriable:false)
+      const badTransport = new HttpOutboxTransport({ url: transportUrl, fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: Buffer.alloc(32, 0xff), resolveResponseKey: (kid) => (kid === RESP_KEY ? respSecret : null), ackVerifier, timeoutMs: 3_000 });
+      const res = await new PgTskPublisher(txA, SID, badTransport, 'quarantine', sanitizer, ackVerifier, READY_A, { leaseMs: 30_000 }).drainOnce();
+      assert.equal(res.quarantined, 1, 'a terminal transport failure quarantines the row');
+      assert.equal(res.halted, true, 'the stream is durably halted');
+      assert.equal(await unackedA(poolA), 0, 'the quarantined row is no longer an active undelivered row');
+      const q = Number((await poolA.query("SELECT count(*)::int AS n FROM tsk_outbox_quarantine WHERE stream_id=$1 AND decision='reject-transport-terminal'", [SID])).rows[0].n);
+      const h = Number((await poolA.query('SELECT count(*)::int AS n FROM tsk_outbox_stream_halted WHERE stream_id=$1', [SID])).rows[0].n);
+      assert.equal(q, 1, 'quarantined with the reject-transport-terminal decision');
+      assert.equal(h, 1, 'stream durably halted (no forever-retry of an unauthenticatable delivery)');
+      console.log(`     terminal transport 401 -> quarantined=1 halted=1 (not retried forever)`);
+    });
+
     console.log(`\n# ${passed} two-node checks passed (proxy ack-drops: ${proxy.drops()})`);
   } finally {
     await proxy.close();

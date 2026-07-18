@@ -30,6 +30,7 @@ import {
   assertHeaderConformant,
   assertStreamHeadBinds,
   canonicalOpDigest,
+  isTerminalTransportError,
   fenceTokenToDecimal,
   streamHeadDigest,
   type DurableTx,
@@ -757,7 +758,20 @@ export class PgTskPublisher {
         // fail closed on a corrupted stored head
         assertStreamHeadBinds({ contractVersion: '1', streamId: this.streamId, sourceEpoch, sequence, fenceToken: String(r.fence_token), opDigest: storedDigest }, head);
 
-        const rawReceipt = await this.transport.deliverAndAwaitAck(record, head);
+        let rawReceipt: TskAckReceipt;
+        try {
+          rawReceipt = await this.transport.deliverAndAwaitAck(record, head);
+        } catch (err) {
+          // (transport taxonomy) a TERMINAL transport failure (auth/protocol/validation)
+          // can never be delivered — quarantine + halt exactly like a terminal receiver
+          // decision, rather than retry it forever. A TRANSIENT failure (default) is left
+          // undelivered: rethrow so the row stays for the next drain, no ack, no drop.
+          if (isTerminalTransportError(err)) {
+            await this.quarantineAndHalt(leaseToken, sourceEpoch, sequence, storedDigest, 'reject-transport-terminal');
+            quarantined++; halted = true; break;
+          }
+          throw err;
+        }
         published++;
         // (TOCTOU) snapshot + strict-validate + FREEZE the FULL receipt BEFORE the
         // verify await, and use ONLY the snapshot afterward — the transport cannot
@@ -778,27 +792,33 @@ export class PgTskPublisher {
           acked++; continue;
         }
         if (TRANSIENT_DECISIONS.has(receipt.decision)) { retriable = true; break; }
-        // terminal → quarantine + halt
-        await this.tx(async (exec) => {
-          const lease = (await exec.query('SELECT lease_token FROM tsk_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
-          if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — not quarantining');
-          const ins = await exec.query('INSERT INTO tsk_outbox_quarantine (stream_id, source_epoch, sequence, op_digest, decision) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (stream_id, source_epoch, sequence) DO NOTHING', [this.streamId, sourceEpoch, sequence, storedDigest, receipt.decision]);
-          if (ins.rowCount === 0) {
-            const ex = (await exec.query('SELECT op_digest, decision FROM tsk_outbox_quarantine WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 FOR UPDATE', [this.streamId, sourceEpoch, sequence])).rows;
-            if (!ex.length) throw new ContractValidationError('quarantine conflict without an existing row');
-            if (!digestEquals(String(ex[0].op_digest), storedDigest) || String(ex[0].decision) !== receipt.decision) throw new ContractValidationError('quarantine record conflict: existing digest/decision differ from this record');
-          } else if (ins.rowCount !== 1) throw new ContractValidationError('quarantine insert affected unexpected row count');
-          affectedOne(await exec.query('UPDATE tsk_outbox_rows SET quarantined_at = now() WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 AND acked_at IS NULL AND quarantined_at IS NULL', [this.streamId, sourceEpoch, sequence]), 'quarantine mark');
-          // (MED) DURABLY halt the stream in the SAME tx as the quarantine so the
-          // divergence cannot silently become a permanent reject-gap spin. Idempotent.
-          await exec.query('INSERT INTO tsk_outbox_stream_halted (stream_id, source_epoch, sequence, op_digest, decision) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (stream_id) DO NOTHING', [this.streamId, sourceEpoch, sequence, storedDigest, receipt.decision]);
-        });
+        // terminal receiver decision → quarantine + halt
+        await this.quarantineAndHalt(leaseToken, sourceEpoch, sequence, storedDigest, receipt.decision);
         quarantined++; halted = true; break;
       }
     } finally {
       await this.releaseLease(leaseToken);
     }
     return { published, acked, quarantined, retriable, halted };
+  }
+
+  /** Quarantine the current row and DURABLY halt the stream in ONE tx (idempotent).
+   *  Shared by terminal receiver decisions AND terminal transport failures. */
+  private async quarantineAndHalt(leaseToken: string, sourceEpoch: string, sequence: number, storedDigest: string, decision: string): Promise<void> {
+    await this.tx(async (exec) => {
+      const lease = (await exec.query('SELECT lease_token FROM tsk_outbox_publisher_lease WHERE stream_id = $1 FOR UPDATE', [this.streamId])).rows;
+      if (!lease.length || lease[0].lease_token !== leaseToken) throw new ContractValidationError('publisher lease lost — not quarantining');
+      const ins = await exec.query('INSERT INTO tsk_outbox_quarantine (stream_id, source_epoch, sequence, op_digest, decision) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (stream_id, source_epoch, sequence) DO NOTHING', [this.streamId, sourceEpoch, sequence, storedDigest, decision]);
+      if (ins.rowCount === 0) {
+        const ex = (await exec.query('SELECT op_digest, decision FROM tsk_outbox_quarantine WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 FOR UPDATE', [this.streamId, sourceEpoch, sequence])).rows;
+        if (!ex.length) throw new ContractValidationError('quarantine conflict without an existing row');
+        if (!digestEquals(String(ex[0].op_digest), storedDigest) || String(ex[0].decision) !== decision) throw new ContractValidationError('quarantine record conflict: existing digest/decision differ from this record');
+      } else if (ins.rowCount !== 1) throw new ContractValidationError('quarantine insert affected unexpected row count');
+      affectedOne(await exec.query('UPDATE tsk_outbox_rows SET quarantined_at = now() WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 AND acked_at IS NULL AND quarantined_at IS NULL', [this.streamId, sourceEpoch, sequence]), 'quarantine mark');
+      // DURABLY halt the stream in the SAME tx as the quarantine so the divergence
+      // cannot silently become a permanent reject-gap spin. Idempotent.
+      await exec.query('INSERT INTO tsk_outbox_stream_halted (stream_id, source_epoch, sequence, op_digest, decision) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (stream_id) DO NOTHING', [this.streamId, sourceEpoch, sequence, storedDigest, decision]);
+    });
   }
 }
 

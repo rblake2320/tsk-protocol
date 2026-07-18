@@ -32,13 +32,24 @@ The receiver replies with a `TskAckReceipt` whose signature binds the **decision
 exact record `(streamId, sourceEpoch, sequence, opDigest)`. The client verifies the receipt
 binds and verifies its signature; a forged or swapped-decision receipt is rejected.
 
-## Fail-closed ambiguity
+## Error taxonomy (enforced by the publisher)
 
-A transient network / HTTP / timeout / oversize / malformed-reply condition **throws**
-(`OutboxTransportError`, retriable) and **never fabricates an ack** — the outbox row stays
-undelivered and is retried. If the request was applied on B but the reply was lost,
-redelivery reconciles by the receiver's idempotency (`duplicate-ok`), so delivery is
-exactly-once.
+Every failure throws an `OutboxTransportError` carrying `retriable`, and **never fabricates
+an ack**. `PgTskPublisher.drainOnce` enforces the taxonomy (via the core
+`isTerminalTransportError` contract):
+
+| Condition | `retriable` | Publisher action |
+|---|---|---|
+| network error, connect refused, timeout/deadline | **true** (transient) | leave row undelivered, retry next drain |
+| HTTP 5xx, 408 (request timeout), 429 (too many requests) | **true** (transient) | leave row undelivered, retry |
+| HTTP 3xx redirect, 401/403/404 and all other 4xx | **false** (terminal) | **quarantine + durably halt** the stream (`reject-transport-terminal`) |
+| unknown response key, envelope MAC invalid, receipt malformed/unbound, stale challenge, bad content-type/JSON | **false** (terminal) | **quarantine + halt** |
+| request body over `maxRequestBytes` (client preflight) | **false** (terminal) | quarantine + halt (never dispatched) |
+
+A **transient** failure leaves the row undelivered and never acked; if the request was
+applied on B but the reply was lost, redelivery reconciles by the receiver's idempotency
+(`duplicate-ok`), so delivery is exactly-once. A **terminal** failure can never succeed, so
+the publisher quarantines the row and halts the stream rather than retry it forever.
 
 ## Boundary
 

@@ -9,6 +9,7 @@ import {
   HttpOutboxTransport,
   OutboxTransportError,
   MemoryReplayNonceStore,
+  PgReplayNonceStore,
   createHttpOutboxReceiver,
   type HttpOutboxReceiverOptions,
 } from '../src/http-outbox-transport.js';
@@ -235,6 +236,34 @@ describe('HttpOutboxTransport <-> createHttpOutboxReceiver (authenticated, decis
       expectedPath: '/ingest', resolveRequestKey: () => reqSecret, responseKeyId: RESP_KEY, responseSecret: respSecret,
       receive: async (r) => signedAck(r, 'applied'), nonceStore: skewed, freshnessMs: 30_000,
     })).toThrow(/retention/);
+  });
+
+  it('(deterministic Pg DB-clock swing) a nonce survives (retention - 2*skew) of real time under worst-case drift', async () => {
+    // fake Pg modeling DB-clock-driven expiry: SELECT now() -> dbClock; DELETE prunes
+    // expires_at < dbClock; INSERT sets expires_at = dbClock + retention (ON CONFLICT NOTHING).
+    const dbClock = { v: 0 };
+    const table = new Map<string, number>();
+    const fakePg = async (sql: string, params?: unknown[]) => {
+      if (sql.includes('extract(epoch')) return { rows: [{ ms: String(dbClock.v) }], rowCount: 1 };
+      if (sql.startsWith('DELETE')) { for (const [k, exp] of table) if (exp < dbClock.v) table.delete(k); return { rows: [], rowCount: 0 }; }
+      const nonce = String((params as unknown[])[0]); const ret = Number((params as unknown[])[1]);
+      if (table.has(nonce)) return { rows: [], rowCount: 0 };
+      table.set(nonce, dbClock.v + ret); return { rows: [], rowCount: 1 };
+    };
+    const app = { v: 0 };
+    const store = new PgReplayNonceStore(fakePg, { retentionMs: 100_000, maxClockSkewMs: 10_000, now: () => app.v });
+    // insert while the DB clock reads LATE (behind app by the max skew)
+    app.v = 1_000_000; dbClock.v = 990_000;
+    expect(await store.checkAndStore('n')).toBe(true);           // expires_at = 1_090_000
+    // replay just before (retention - 2*skew) with the DB clock now reading EARLY (ahead by skew)
+    app.v = 1_079_999; dbClock.v = 1_089_999;
+    expect(await store.checkAndStore('n')).toBe(false);          // still retained -> replay rejected
+    // just past (retention - 2*skew): pruned, reusable
+    app.v = 1_080_001; dbClock.v = 1_090_001;
+    expect(await store.checkAndStore('n')).toBe(true);
+    // skew beyond the bound fails closed
+    app.v = 2_000_000; dbClock.v = 2_020_000;
+    await expect(store.checkAndStore('m')).rejects.toThrow(/skew/);
   });
 
   it('(deterministic retention) a nonce is retained across the acceptance horizon and pruned only after retention', async () => {

@@ -295,6 +295,10 @@ export class HttpOutboxTransport implements TskOutboxTransport {
     const stream = res.body;
     if (!stream || typeof stream.getReader !== 'function') throw terminal('transport response has no readable body stream');
     const reader = stream.getReader();
+    // Explicitly CANCEL the reader on abort/deadline: a hostile/nonconforming reader
+    // whose read() never settles would otherwise be left dangling by the outer race.
+    const onAbort = () => { reader.cancel(new Error('aborted')).catch(() => { /* swallow late */ }); };
+    if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
     const chunks: Buffer[] = [];
     let total = 0;
     try {
@@ -307,6 +311,7 @@ export class HttpOutboxTransport implements TskOutboxTransport {
         chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
       }
     } finally {
+      signal.removeEventListener('abort', onAbort);
       try { reader.releaseLock(); } catch { /* noop */ }
     }
     return Buffer.concat(chunks).toString('utf8');
