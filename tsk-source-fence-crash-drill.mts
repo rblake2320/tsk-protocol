@@ -31,9 +31,9 @@ if (!A_URL || !C_URL || !R_URL) throw new Error('TSK_TEST_SOURCE_PG_URL_A + TSK_
 
 const GUARD_KEY = 'guard-1'; const guard = generateKeyPairSync('ed25519'); const guardSecret = guard.privateKey;
 const SOURCE_KEY = 'source-1'; const source = generateKeyPairSync('ed25519'); const sourceSecret = source.privateKey; // independent custody
-const resolver: SourceVerifyKeyResolver = { resolve: (k) => (k === GUARD_KEY ? guard.publicKey : k === SOURCE_KEY ? source.publicKey : null) };
+const HEAD_KEY = 'k1'; const headKp = generateKeyPairSync('ed25519'); const privateKey = headKp.privateKey; // outbox head signer
+const resolver: SourceVerifyKeyResolver = { resolve: (k) => (k === GUARD_KEY ? guard.publicKey : k === SOURCE_KEY ? source.publicKey : k === HEAD_KEY ? headKp.publicKey : null) };
 const HOUR = 3_600_000;
-const { privateKey } = generateKeyPairSync('ed25519');
 const signer: StreamHeadSigner = { keyId: 'k1', alg: 'ed25519', async sign(d) { return edSign(null, Buffer.from(d, 'utf8'), privateKey).toString('base64url'); } };
 const sanitizer: HotpMutationSanitizer = {
   sanitize(raw) { if (typeof raw.tumblerId !== 'string' || !Number.isInteger(raw.counter)) throw new ContractValidationError('bad'); return { tumblerId: raw.tumblerId, counter: raw.counter } as SanitizedMutation<TskHotpMutation>; },
@@ -66,7 +66,7 @@ async function main() {
   // (C2/H1) mint the mandatory, identity-bound readiness capability from the installed grant (lease
   // tables attested on A, where the gate reads them in the append tx).
   const mkOutbox = async (sid: string, g: LeaseGrant) => {
-    const ready = await assertSourceFenceReady(aTx, 'public', { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest });
+    const ready = await assertSourceFenceReady(aTx, 'public', resolver, { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest });
     return new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready });
   };
   async function provision(sid: string) { await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [sid]); await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [sid, 'e1']); }
@@ -102,8 +102,8 @@ async function main() {
     const ob = await mkOutbox(sid, g); await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 9 }, fenceToken: 0n }));
     const rev = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'revoked', holderNodeId: 'A', leaseId: 'l1', commandId: 'r1', leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 2, prevGrantDigest: g.grantDigest });
     await aTx.transaction((exec) => installLeaseGrant(exec, resolver, rev)); // revoke commits; "crash" before receipt
-    const r1 = await aTx.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 0, sourceNodeId: 'A' })); // resume
-    const r2 = await aTx.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 0, sourceNodeId: 'A' })); // re-emit
+    const r1 = await emitSourceFrozenReceipt(aTx, 'public', { sourceKeyId: SOURCE_KEY, sourcePrivateKey: sourceSecret, leaseResolver: resolver, headResolver: resolver }, { streamId: sid, commandId: 'promote-1', epoch: 0, sourceNodeId: 'A' }); // resume
+    const r2 = await emitSourceFrozenReceipt(aTx, 'public', { sourceKeyId: SOURCE_KEY, sourcePrivateKey: sourceSecret, leaseResolver: resolver, headResolver: resolver }, { streamId: sid, commandId: 'promote-1', epoch: 0, sourceNodeId: 'A' }); // re-emit
     assert.equal(r1.receiptDigest, r2.receiptDigest, 'frozen receipt is deterministic/idempotent on resume');
     verifySourceFrozenReceipt(resolver, r1); assert.equal(r1.n, 1);
   });

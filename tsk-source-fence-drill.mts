@@ -158,46 +158,54 @@ async function main() {
     await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, privResolver, SID3, 0, 0, { holderNodeId: 'A', leaseId: 'l1', grantDigest: g.grantDigest })), /PUBLIC/);
   });
 
-  await check('(H3) full-catalog attestation catches an UNLOGGED / RLS drift', async () => {
-    const ok = await assertSourceFenceReady(tx as never, 'public', { streamId: SID, holderNodeId: 'A', leaseId: 'l1', grantDigest: '0'.repeat(64) });
-    assert.ok(ok, 'clean catalog attests');
-    await pool.query('ALTER TABLE tsk_source_lease SET UNLOGGED');
-    await assert.rejects(() => assertSourceFenceReady(tx as never, 'public', { streamId: SID, holderNodeId: 'A', leaseId: 'l1', grantDigest: '0'.repeat(64) }), /attestation failed/);
-    await pool.query('ALTER TABLE tsk_source_lease SET LOGGED'); // revert
-    await assertSourceFenceReady(tx as never, 'public', { streamId: SID, holderNodeId: 'A', leaseId: 'l1', grantDigest: '0'.repeat(64) }); // clean again
-  });
-
-  await check('(H4) the gate fails closed when the head is not the exact latest history row (fork/relabel)', async () => {
-    const SID4 = 'tsk:pair:h4/v1';
+  await check('(H3) full-catalog attestation catches an UNLOGGED / RLS drift; (M1) readiness mint full-chain-verifies the lease', async () => {
+    const SIDR = 'tsk:pair:ready/v1';
     const now = await nowMs();
-    const g1 = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: SID4, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'h4-g1', leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 1, prevGrantDigest: null });
+    const g1 = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: SIDR, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'ready-g1', leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 1, prevGrantDigest: null });
     await tx.transaction((exec) => installLeaseGrant(exec, resolver, g1));
-    const g2 = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: SID4, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'h4-g2', leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 2, prevGrantDigest: g1.grantDigest });
-    await tx.transaction((exec) => installLeaseGrant(exec, resolver, g2));
-    const bound = { holderNodeId: 'A', leaseId: 'l1', grantDigest: g2.grantDigest };
-    await tx.transaction(async (exec) => { await assertSourceLeaseWritable(exec, resolver, SID4, 0, 0, bound); }); // ok: head@2 == latest history
-    // delete the latest history row so the (still valid, signed) head no longer matches the latest history
-    await pool.query('DELETE FROM tsk_source_lease_history WHERE stream_id=$1 AND lease_grant_seq=2', [SID4]);
-    await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, SID4, 0, 0, bound)), /latest history row/);
-    // and a further install fails the full-chain check too
-    const g3 = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: SID4, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'h4-g3', leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 3, prevGrantDigest: g2.grantDigest });
-    await assert.rejects(() => tx.transaction((exec) => installLeaseGrant(exec, resolver, g3)), /not the exact latest history row|not contiguous/);
+    const bind = { streamId: SIDR, holderNodeId: 'A', leaseId: 'l1', grantDigest: g1.grantDigest };
+    const ok = await assertSourceFenceReady(tx as never, 'public', resolver, bind);
+    assert.ok(ok, 'clean catalog + verified chain mints a token');
+    // (M1) minting a token whose grantDigest is NOT the verified lease head fails closed
+    await assert.rejects(() => assertSourceFenceReady(tx as never, 'public', resolver, { ...bind, grantDigest: '0'.repeat(64) }), /not the authorized holder\/leaseId\/grant/);
+    // (H3) an UNLOGGED drift fails ATTESTATION (before the chain check)
+    await pool.query('ALTER TABLE tsk_source_lease SET UNLOGGED');
+    await assert.rejects(() => assertSourceFenceReady(tx as never, 'public', resolver, bind), /attestation failed/);
+    await pool.query('ALTER TABLE tsk_source_lease SET LOGGED'); // revert
+    await assertSourceFenceReady(tx as never, 'public', resolver, bind); // clean again
   });
 
-  await check('(H2) the APPEND gate verifies the FULL chain — deleting an INTERMEDIATE history row fails closed', async () => {
-    const SID5 = 'tsk:pair:h2gate/v1';
+  await check('(H4) decision-grade readSourceLease + readiness mint verify the FULL chain (intermediate delete → quarantine)', async () => {
+    const SID4 = 'tsk:pair:h4/v1';
     const now = await nowMs();
     let prev: string | null = null;
     for (let seq = 1; seq <= 3; seq++) {
-      const g = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: SID5, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: `h2g-${seq}`, leaseExpiresAtMs: now + HOUR, leaseGrantSeq: seq, prevGrantDigest: prev });
+      const g = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: SID4, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: `h4-g${seq}`, leaseExpiresAtMs: now + HOUR, leaseGrantSeq: seq, prevGrantDigest: prev });
+      await tx.transaction((exec) => installLeaseGrant(exec, resolver, g)); prev = g.grantDigest;
+    }
+    const head = (await readSourceLease(await poolExec(pool), resolver, SID4))!;
+    const bind = { streamId: SID4, holderNodeId: 'A', leaseId: 'l1', grantDigest: head.grantDigest };
+    await assertSourceFenceReady(tx as never, 'public', resolver, bind); // clean chain mints
+    // delete an INTERMEDIATE row (seq2) — the head (seq3) is still signed, but the chain is now broken
+    await pool.query('DELETE FROM tsk_source_lease_history WHERE stream_id=$1 AND lease_grant_seq=2', [SID4]);
+    await assert.rejects(() => tx.transaction((exec) => readSourceLease(exec, resolver, SID4)), /not contiguous|chain broken|latest history row/); // decision read fails
+    await assert.rejects(() => assertSourceFenceReady(tx as never, 'public', resolver, bind), /not contiguous|chain broken|latest history row/); // mint fails
+  });
+
+  await check('(M1) the per-append gate is BOUNDED: a pre-minted token still appends after a history-row delete (safety rests on mint + the no-mutation deployment boundary)', async () => {
+    const SID5 = 'tsk:pair:bounded/v1';
+    const now = await nowMs();
+    let prev: string | null = null;
+    for (let seq = 1; seq <= 3; seq++) { // renewals accumulate history; the LATEST is the authorized grant
+      const g = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: SID5, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: `m1-g${seq}`, leaseExpiresAtMs: now + HOUR, leaseGrantSeq: seq, prevGrantDigest: prev });
       await tx.transaction((exec) => installLeaseGrant(exec, resolver, g)); prev = g.grantDigest;
     }
     const head = (await readSourceLease(await poolExec(pool), resolver, SID5))!;
     const bound = { holderNodeId: 'A', leaseId: 'l1', grantDigest: head.grantDigest };
-    await tx.transaction(async (exec) => { await assertSourceLeaseWritable(exec, resolver, SID5, 0, 0, bound); }); // ok: full chain 1..3
-    // delete an INTERMEDIATE row (seq2) — head==latest (seq3) still holds, but the chain is now broken
+    // delete an OLD intermediate history row AFTER the (full-chain-verified) grant is the head
     await pool.query('DELETE FROM tsk_source_lease_history WHERE stream_id=$1 AND lease_grant_seq=2', [SID5]);
-    await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, SID5, 0, 0, bound)), /not contiguous|chain broken/);
+    // the bounded gate does NOT re-scan history — it matches the signed head to the token identity → still writable
+    await tx.transaction(async (exec) => { const st = await assertSourceLeaseWritable(exec, resolver, SID5, 0, 0, bound); assert.equal(st.grantDigest, head.grantDigest); });
   });
 
   console.log(`\n# ${passed} PR2b-0 source fence-gate checks passed`);

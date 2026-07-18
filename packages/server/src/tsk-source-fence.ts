@@ -17,7 +17,8 @@
  */
 import { createHash, sign as edSign, verify as edVerify, createPrivateKey, type KeyObject } from 'node:crypto';
 
-import { ContractValidationError } from './ha-outbox-contract.js';
+import { ContractValidationError, assertStreamHeadBinds } from './ha-outbox-contract.js';
+import type { OutboxRecordHeader, SignedStreamHead, StreamHeadAlg } from './ha-outbox-contract.js';
 import type { PgExecutor, PgTransactor } from './tsk-hotp-outbox-pg.js';
 
 // ── bounds + grammar ─────────────────────────────────────────────────────────
@@ -331,9 +332,13 @@ export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: Sour
   const r = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
   if (!r) throw new SourceFenceQuarantineError('no source lease — writer is not leased; fail closed');
   const st = verifiedLeaseHead(s, r as Record<string, unknown>, resolver);
-  // (H2/H4) the head (locked FOR SHARE) must be the EXACT latest row of a FULL contiguous signed chain
-  // from genesis — a same-seq fork, a relabelled head, OR a deleted intermediate history row fails closed.
-  await verifyLeaseHistoryChain(exec, resolver, s, st);
+  // (M1) BOUNDED per-append check — O(1), no history scan. The `bound.grantDigest` comes from a
+  // `SourceFenceReadyToken` that was minted only after `assertSourceFenceReady` FULL-CHAIN-verified the
+  // lease AND pinned this exact grantDigest; so a head whose signed grantDigest still equals `bound`
+  // is the same verified-chain high-water. A renewal changes the head grantDigest → a new token must be
+  // minted (re-verifying the chain). DEPLOYMENT BOUNDARY: the runtime source role MUST have no
+  // UPDATE/DELETE on tsk_source_lease / _history except via the separately-authorized installer — the
+  // append path deliberately does NOT re-scan the whole chain on every write (availability).
   if (st.leaseStatus !== 'active') throw new SourceFenceQuarantineError(`source lease is ${st.leaseStatus} — fenced; fail closed`);
   if (st.leaseEpoch !== epoch) throw new SourceFenceQuarantineError(`source lease epoch ${st.leaseEpoch} != expected ${epoch} — stale writer; fail closed`);
   // A's own clock; the signed deadline is on the control clock, bounded by the measured skew.
@@ -402,38 +407,52 @@ export function verifySourceFrozenReceipt(resolver: SourceVerifyKeyResolver, r: 
   verifySig(resolver, r.sourceKeyId, frozenReceiptMsg(bare, r.receiptDigest), r.sourceSignature);
 }
 
+const GENESIS_HEAD_ZERO = '0'.repeat(64);
+
+/** Options for the owned frozen-receipt emitter. `leaseResolver` = guard PUBLIC key (verify the lease
+ *  chain); `headResolver` = outbox head-signer PUBLIC key (verify the signed ledger). */
+export interface FrozenReceiptOptions {
+  sourceKeyId: string; sourcePrivateKey: KeyObject | string;
+  leaseResolver: SourceVerifyKeyResolver; headResolver: SourceVerifyKeyResolver;
+}
+
 /**
- * Emit a SourceFrozenReceipt AFTER the A-PG revoke has committed. Asserts the lease is REVOKED at
- * `epoch` (the freeze is proven, not merely control-clock expiry), reads the committed final source
- * head `N` + `signedHeadDigest@N` from the source checkpoint, computes `sourceStateDigest@N`, and
- * source-signs the receipt. Fails closed if the lease is not revoked at `epoch`.
+ * (H4/R4) Emit a SourceFrozenReceipt AFTER the A-PG revoke has committed — a TRANSACTOR-OWNED,
+ * SERIALIZABLE, schema-pinned, attested authority (the raw `signSourceFrozenReceipt` is NOT on the
+ * public API). Full-chain-verifies the terminally-REVOKED lease at `epoch` with the exact holder, then
+ * derives the frozen head `N` from the SIGNED append-only ledger via the shared full-range verifier
+ * (the mutable checkpoint pointer must agree) and computes `sourceStateDigest@N` before source-signing.
+ * Fails closed unless the lease is revoked at `epoch` for the exact holder.
  */
-export async function emitSourceFrozenReceipt(exec: PgExecutor, resolver: SourceVerifyKeyResolver, sourceKeyId: string, sourcePrivateKey: KeyObject | string, input: { streamId: string; commandId: string; epoch: number; sourceNodeId: string }): Promise<SourceFrozenReceipt> {
+export async function emitSourceFrozenReceipt(db: PgTransactor, schema: string, opts: FrozenReceiptOptions, input: { streamId: string; commandId: string; epoch: number; sourceNodeId: string }): Promise<SourceFrozenReceipt> {
   const s = vId(input.streamId, STREAM_ID_RE, 'streamId');
   const commandId = vId(input.commandId, ID_RE, 'commandId');
   const epoch = vInt(input.epoch, 'epoch', 0, MAX_EPOCH);
   const sourceNodeId = vId(input.sourceNodeId, ID_RE, 'sourceNodeId');
-  // (C4) SERIALIZABLE-lock the EXACT revoked lease head FOR UPDATE + the checkpoint, so the frozen N
-  // is captured against a state that cannot change under this tx.
-  const lr = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease WHERE stream_id=$1 FOR UPDATE', [s])).rows[0];
-  if (!lr) throw new SourceFenceQuarantineError('cannot freeze: no source lease');
-  const m = rowToLease(s, lr);
-  if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease head digest mismatch');
-  verifySig(resolver, m.keyId, m.sigMsg, m.sig);
-  const lease = m.state;
-  if (lease.leaseEpoch !== epoch) throw new SourceFenceQuarantineError(`cannot freeze: lease epoch ${lease.leaseEpoch} != ${epoch}`);
-  if (lease.leaseStatus !== 'revoked') throw new SourceFenceQuarantineError('cannot freeze: lease is not revoked — N is not provably frozen');
-  if (lease.holderNodeId !== sourceNodeId) throw new SourceFenceQuarantineError(`cannot freeze: sourceNodeId ${sourceNodeId} != fenced lease holder ${lease.holderNodeId}`);
-  const cp = (await exec.query('SELECT sequence, head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1 FOR UPDATE', [s])).rows[0];
-  if (!cp) throw new SourceFenceQuarantineError('cannot freeze: no source checkpoint');
-  const n = vInt(cp.sequence, 'source sequence', 0, MAX_SEQ);
-  const headDigest = String(cp.head_digest || '') || GENESIS_HEAD_ZERO;
-  if (!DIGEST_RE.test(headDigest)) throw new ContractValidationError('invalid source head_digest at freeze');
-  const sourceStateDigestAtN = await computeSourceStateDigest(exec, s, n);
-  return signSourceFrozenReceipt(sourceKeyId, sourcePrivateKey, { streamId: s, commandId, epoch, n, signedHeadDigestAtN: headDigest, sourceStateDigestAtN, sourceNodeId, revokeCommandId: lease.commandId, leaseId: lease.leaseId, leaseGrantDigest: lease.grantDigest });
+  return db.transaction(async (exec) => {
+    await enterSourceTx(exec, schema);
+    await attestSourceLease(exec);
+    // lock + FULL-CHAIN verify the terminally-revoked lease (the freeze is proven, not clock expiry)
+    await exec.query('SELECT 1 FROM tsk_source_lease WHERE stream_id=$1 FOR UPDATE', [s]);
+    const lease = await readSourceLease(exec, opts.leaseResolver, s);
+    if (!lease) throw new SourceFenceQuarantineError('cannot freeze: no source lease');
+    if (lease.leaseEpoch !== epoch) throw new SourceFenceQuarantineError(`cannot freeze: lease epoch ${lease.leaseEpoch} != ${epoch}`);
+    if (lease.leaseStatus !== 'revoked') throw new SourceFenceQuarantineError('cannot freeze: lease is not revoked — N is not provably frozen');
+    if (lease.holderNodeId !== sourceNodeId) throw new SourceFenceQuarantineError(`cannot freeze: sourceNodeId ${sourceNodeId} != fenced lease holder ${lease.holderNodeId}`);
+    // derive N + head@N from the SIGNED ledger (checkpoint pointer must agree); N=0 = genesis freeze
+    const cp = (await exec.query('SELECT source_epoch, sequence, head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1 FOR UPDATE', [s])).rows[0];
+    if (!cp) throw new SourceFenceQuarantineError('cannot freeze: no source checkpoint');
+    const cpEpoch = String(cp.source_epoch);
+    const n = vInt(cp.sequence, 'source sequence', 0, MAX_SEQ);
+    let headDigest = GENESIS_HEAD_ZERO;
+    if (n >= 1) {
+      headDigest = await verifyOutboxLedgerRange(exec, opts.headResolver, s, cpEpoch, 0, GENESIS_HEAD_ZERO, n);
+      if (vHeadDigest(cp.head_digest, 'cp head') !== headDigest) throw new SourceFenceQuarantineError('checkpoint pointer diverges from the signed ledger head at N — quarantine');
+    }
+    const sourceStateDigestAtN = await computeSourceStateDigest(exec, s, n);
+    return signSourceFrozenReceipt(opts.sourceKeyId, opts.sourcePrivateKey, { streamId: s, commandId, epoch, n, signedHeadDigestAtN: headDigest, sourceStateDigestAtN, sourceNodeId, revokeCommandId: lease.commandId, leaseId: lease.leaseId, leaseGrantDigest: lease.grantDigest });
+  });
 }
-
-const GENESIS_HEAD_ZERO = '0'.repeat(64);
 
 // ── external restore/fork witness (§A.3) — lives on the CONTROL DB ────────────
 
@@ -588,9 +607,15 @@ export async function advanceSourceWitnessInTx(exec: PgExecutor, resolver: Sourc
     if (sysId !== cur.sourceSystemId) throw new SourceFenceQuarantineError(`source system_identifier changed (${sysId} != witnessed ${cur.sourceSystemId}) — restore/clone; quarantine`);
     if (gs < cur.maxGrantSeq) throw new SourceFenceQuarantineError(`grant_seq ${gs} < witnessed ${cur.maxGrantSeq} — restore/rollback; quarantine`);
     if (ss < cur.maxSourceSeq) throw new SourceFenceQuarantineError(`source seq ${ss} < witnessed ${cur.maxSourceSeq} — restore/rollback; quarantine`);
-    // (C5) continuity at the witnessed height — catches a restore+fork that grew past it.
+    // (C5) continuity at the witnessed height — catches a restore+fork that grew past it. The issuer
+    // proves the FULL range (priorSeq, ss] from the signed ledger, so this pin closes the prefix.
     if (receipt.priorSeq !== cur.maxSourceSeq) throw new SourceFenceQuarantineError(`checkpoint priorSeq ${receipt.priorSeq} != witnessed height ${cur.maxSourceSeq} — quarantine`);
     if (receipt.priorHeadDigest !== cur.headDigest) throw new SourceFenceQuarantineError('checkpoint head at the witnessed height diverges from the witness — restore/FORK; quarantine');
+  } else {
+    // (H2/R4) the FIRST witness advance MUST anchor at genesis (priorSeq=0, genesis head) so the issuer's
+    // proven range is (0, N] = the FULL 1..N prefix — a genesis stamp cannot skip 1..W-1.
+    if (receipt.priorSeq !== 0) throw new SourceFenceQuarantineError(`first witness advance must anchor at genesis (priorSeq=0), got ${receipt.priorSeq} — quarantine`);
+    if (receipt.priorHeadDigest !== GENESIS_HEAD_ZERO) throw new SourceFenceQuarantineError('first witness advance priorHeadDigest is not genesis — quarantine');
   }
   const wseq = (cur?.witnessSeq ?? 0) + 1;
   const prev = cur?.witnessDigest ?? null;
@@ -709,15 +734,26 @@ export function requireSourceFenceReady(token: SourceFenceReadyToken, ctx: { db:
   return st;
 }
 
-/** Attest the compiled source-fence catalog in the pinned schema (via the source transactor) + mint
- *  an unforgeable capability bound to db+schema+stream+holder+leaseId+grantDigest. The fencible outbox
- *  path REQUIRES this token, so the gate is MANDATORY and the authorized writer identity is bound. */
-export async function assertSourceFenceReady(db: PgTransactor, schema: string, binding: { streamId: string; holderNodeId: string; leaseId: string; grantDigest: string }): Promise<SourceFenceReadyToken> {
+/** Attest the compiled source-fence catalog in the pinned schema (via the source transactor), FULL-
+ *  CHAIN-VERIFY the live lease, assert its verified head EXACTLY equals the authorized identity, then
+ *  mint an unforgeable capability bound to db+schema+stream+holder+leaseId+grantDigest. Because the
+ *  full contiguous signed chain is verified HERE and the token pins the exact grantDigest, the token is
+ *  a VERIFIED-CHAIN HIGH-WATER: the per-append gate then does only a bounded O(1) head/token match (M1).
+ *  A lease renewal changes the head grantDigest, so a fresh token must be minted (re-verifying the chain). */
+export async function assertSourceFenceReady(db: PgTransactor, schema: string, resolver: SourceVerifyKeyResolver, binding: { streamId: string; holderNodeId: string; leaseId: string; grantDigest: string }): Promise<SourceFenceReadyToken> {
   const streamId = vId(binding.streamId, STREAM_ID_RE, 'streamId');
   const holderNodeId = vId(binding.holderNodeId, ID_RE, 'holderNodeId');
   const leaseId = vId(binding.leaseId, ID_RE, 'leaseId');
   if (!DIGEST_RE.test(binding.grantDigest)) throw new ContractValidationError('invalid grantDigest');
-  await db.transaction(async (exec) => { await enterSourceTx(exec, schema); await attestSourceLease(exec); });
+  await db.transaction(async (exec) => {
+    await enterSourceTx(exec, schema);
+    await attestSourceLease(exec);
+    const head = await readSourceLease(exec, resolver, streamId); // (M1) full contiguous signed chain from genesis
+    if (!head) throw new SourceFenceQuarantineError('cannot mint readiness: no source lease for the stream');
+    if (head.holderNodeId !== holderNodeId || head.leaseId !== leaseId || head.grantDigest !== binding.grantDigest) {
+      throw new SourceFenceQuarantineError('cannot mint readiness: the verified lease head is not the authorized holder/leaseId/grant');
+    }
+  });
   return mintReady({ db, schema, streamId, holderNodeId, leaseId, grantDigest: binding.grantDigest });
 }
 
@@ -761,17 +797,24 @@ export async function advanceSourceWitness(db: PgTransactor, ready: SourceWitnes
  *  checkpoint FOR SHARE, DERIVES the committed (system_identifier, grantSeq, head@N, head@N-1)
  *  straight from the ledger, then source-signs. The low-level `signSourceCheckpointReceipt` accepts
  *  arbitrary caller state and MUST NOT attest live source state on the runtime path — use this. */
-const OUTBOX_GENESIS_HEAD = '0'.repeat(64);
+const OUTBOX_ROW_COLS = 'sequence, source_epoch, fence_token, op_digest, head_prev, head_digest, head_key_id, head_alg, head_sig';
 
-/** Verify + return the SIGNED committed outbox head at `seq` (over the stored head_digest, which itself
- *  commits to sequence + prevHeadDigest). Never trusts a head digest without its signature. */
-function verifyOutboxHead(headResolver: SourceVerifyKeyResolver, seq: number, row: Record<string, unknown>): { headDigest: string; headPrev: string } {
-  if (vInt(row.sequence, 'outbox row sequence', 1, MAX_SEQ) !== seq) throw new SourceFenceQuarantineError('outbox row sequence mismatch — ledger tamper; quarantine');
+/** (H2) Verify ONE signed committed outbox row: reconstruct the header + SignedStreamHead from the
+ *  stored fields, RECOMPUTE the canonical head-digest binding via the contract's `assertStreamHeadBinds`
+ *  (pins streamId + sequence + opDigest + prev + keyId + alg — so a signed head/digest cannot be
+ *  replayed from another row or stream), then verify the ed25519 signature. Returns {headDigest, headPrev}. */
+function verifyOneOutboxRow(headResolver: SourceVerifyKeyResolver, streamId: string, epoch: string, expectSeq: number, row: Record<string, unknown>): { headDigest: string; headPrev: string } {
+  const seq = vInt(row.sequence, 'outbox row sequence', 1, MAX_SEQ);
+  if (seq !== expectSeq) throw new SourceFenceQuarantineError(`outbox row seq ${seq} != expected ${expectSeq} — ledger gap/fork; quarantine`);
+  if (String(row.source_epoch) !== epoch) throw new SourceFenceQuarantineError(`outbox row @${seq} source_epoch ${String(row.source_epoch)} != ${epoch} — cross-epoch; quarantine`);
   const headDigest = vHeadDigest(row.head_digest, `outbox head@${seq}`);
   const headPrev = vHeadDigest(row.head_prev, `outbox head_prev@${seq}`);
-  const keyId = String(row.head_key_id), alg = String(row.head_alg), sig = String(row.head_sig);
-  if (alg !== 'ed25519') throw new ContractValidationError(`unsupported outbox head alg '${alg}' for checkpoint issuance`);
-  if (!KEY_ID_RE.test(keyId)) throw new ContractValidationError('invalid outbox head keyId');
+  const opDigest = vHeadDigest(row.op_digest, `outbox op_digest@${seq}`);
+  const keyId = String(row.head_key_id), alg = String(row.head_alg) as StreamHeadAlg, sig = String(row.head_sig);
+  const header: OutboxRecordHeader = { contractVersion: '1', streamId, sourceEpoch: epoch, sequence: seq, fenceToken: String(row.fence_token), opDigest };
+  const head: SignedStreamHead = { streamId, sequence: seq, prevHeadDigest: headPrev, opDigest, keyId, alg, headDigest, signature: sig };
+  assertStreamHeadBinds(header, head); // (H2) recompute canonical digest + binding — no replay from another row/stream
+  if (alg !== 'ed25519') throw new ContractValidationError(`unsupported outbox head alg '${alg}' for checkpoint/freeze`);
   if (!B64U_CANON.test(sig)) throw new ContractValidationError('invalid outbox head signature encoding');
   const pub = headResolver.resolve(keyId);
   if (pub === null) throw new ContractValidationError('unknown or revoked outbox head keyId');
@@ -781,11 +824,43 @@ function verifyOutboxHead(headResolver: SourceVerifyKeyResolver, seq: number, ro
   return { headDigest, headPrev };
 }
 
+/** (H1) Verify the ENTIRE signed outbox ledger range (fromSeq, toSeq] for the EXACT source epoch:
+ *  every row present + contiguous, canonical-binding + signature verified, and the prev-digest chain
+ *  linked from `fromHeadDigest` (head@fromSeq, or genesis when fromSeq===0). A missing/broken/copied
+ *  middle row → quarantine. Returns head@toSeq. */
+async function verifyOutboxLedgerRange(exec: PgExecutor, headResolver: SourceVerifyKeyResolver, streamId: string, epoch: string, fromSeq: number, fromHeadDigest: string, toSeq: number): Promise<string> {
+  if (toSeq < fromSeq) throw new SourceFenceQuarantineError(`ledger range toSeq ${toSeq} < fromSeq ${fromSeq} — quarantine`);
+  if (toSeq === fromSeq) return fromHeadDigest;
+  const rows = (await exec.query(`SELECT ${OUTBOX_ROW_COLS} FROM tsk_outbox_rows WHERE stream_id=$1 AND source_epoch=$2 AND sequence > $3 AND sequence <= $4 ORDER BY sequence ASC`, [streamId, epoch, fromSeq, toSeq])).rows;
+  if (rows.length !== toSeq - fromSeq) throw new SourceFenceQuarantineError(`ledger range (${fromSeq},${toSeq}] expected ${toSeq - fromSeq} rows, got ${rows.length} — gap; quarantine`);
+  let prev = fromHeadDigest;
+  for (let i = 0; i < rows.length; i++) {
+    const { headDigest, headPrev } = verifyOneOutboxRow(headResolver, streamId, epoch, fromSeq + 1 + i, rows[i] as Record<string, unknown>);
+    if (headPrev !== prev) throw new SourceFenceQuarantineError(`row ${fromSeq + 1 + i} head_prev does not chain — ledger fork; quarantine`);
+    prev = headDigest;
+  }
+  return prev;
+}
+
+/** Read the committed source checkpoint (mutable pointer) + verify it agrees with the SIGNED ledger:
+ *  full-verify the range (0, N] and assert the checkpoint's (sequence, head) equal N + head@N. Returns
+ *  { epoch, n, headN }. Never trusts the mutable checkpoint row alone. */
+async function deriveSignedLedgerHead(exec: PgExecutor, headResolver: SourceVerifyKeyResolver, streamId: string): Promise<{ epoch: string; n: number; headN: string }> {
+  const cp = (await exec.query('SELECT source_epoch, sequence, head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1 FOR SHARE', [streamId])).rows[0];
+  if (!cp) throw new SourceFenceQuarantineError('no source checkpoint — stream not provisioned');
+  const epoch = String(cp.source_epoch);
+  const n = vInt(cp.sequence, 'cp sequence', 0, MAX_SEQ);
+  if (n < 1) throw new SourceFenceQuarantineError('source checkpoint at genesis (N=0) — nothing to derive');
+  const headN = await verifyOutboxLedgerRange(exec, headResolver, streamId, epoch, 0, GENESIS_HEAD_ZERO, n);
+  if (vHeadDigest(cp.head_digest, 'cp head') !== headN) throw new SourceFenceQuarantineError('checkpoint pointer diverges from the signed ledger head at N — quarantine');
+  return { epoch, n, headN };
+}
+
 /** Options for the atomic checkpoint issuer. `leaseResolver` holds the guard PUBLIC key (verify the
  *  lease chain); `headResolver` holds the outbox head-signer PUBLIC key (verify the signed ledger
  *  heads); `priorWitnessSeq` is the CURRENT witnessed height W (0 = genesis) — the issuer anchors the
- *  receipt's continuity proof at W and derives head@W from the committed ledger, so a witness that lags
- *  the source by more than 1 (W=3, N=10) can still advance in one proven step. */
+ *  receipt's continuity proof at W, derives head@W, and verifies the FULL range (W, N] from the signed
+ *  ledger, so a witness that lags the source by more than 1 (W=3, N=10) advances in one proven step. */
 export interface CheckpointIssueOptions {
   sourceKeyId: string; sourcePrivateKey: KeyObject | string;
   leaseResolver: SourceVerifyKeyResolver; headResolver: SourceVerifyKeyResolver; priorWitnessSeq: number;
@@ -801,35 +876,18 @@ export async function issueSourceCheckpointReceipt(db: PgTransactor, schema: str
     await exec.query('SELECT 1 FROM tsk_source_lease WHERE stream_id=$1 FOR SHARE', [s]);
     const lease = await readSourceLease(exec, opts.leaseResolver, s); // chain-verified head
     if (!lease) throw new SourceFenceQuarantineError('no source lease — cannot issue for an unleased stream');
-    // (H4) derive N from the SIGNED append-only ledger (tsk_outbox_rows), verify the signed head, and
-    // assert the MUTABLE checkpoint pointer agrees — never trust the mutable checkpoint row alone.
-    const topRow = (await exec.query('SELECT sequence, head_digest, head_prev, head_key_id, head_alg, head_sig FROM tsk_outbox_rows WHERE stream_id=$1 ORDER BY sequence DESC LIMIT 1 FOR SHARE', [s])).rows[0];
-    if (!topRow) throw new SourceFenceQuarantineError('no committed source rows — nothing to witness');
-    const n = vInt(topRow.sequence, 'source N', 1, MAX_SEQ);
-    const { headDigest: headN, headPrev: headNPrev } = verifyOutboxHead(opts.headResolver, n, topRow as Record<string, unknown>);
-    const cp = (await exec.query('SELECT sequence, head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
-    if (!cp) throw new SourceFenceQuarantineError('no source checkpoint — stream not provisioned');
-    if (vInt(cp.sequence, 'cp sequence', 0, MAX_SEQ) !== n || vHeadDigest(cp.head_digest, 'cp head') !== headN) {
-      throw new SourceFenceQuarantineError('checkpoint pointer diverges from the committed signed row at N — quarantine');
-    }
-    // (H4) local ledger continuity at the tip: row N.head_prev must chain the SIGNED row N-1 (or genesis)
-    if (n > 1) {
-      const prevRow = (await exec.query('SELECT sequence, head_digest, head_prev, head_key_id, head_alg, head_sig FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=$2', [s, n - 1])).rows[0];
-      if (!prevRow) throw new SourceFenceQuarantineError('missing committed row at N-1 — ledger gap; quarantine');
-      const { headDigest: headNm1 } = verifyOutboxHead(opts.headResolver, n - 1, prevRow as Record<string, unknown>);
-      if (headNPrev !== headNm1) throw new SourceFenceQuarantineError('row N head_prev does not chain row N-1 — ledger fork; quarantine');
-    } else if (headNPrev !== OUTBOX_GENESIS_HEAD) {
-      throw new SourceFenceQuarantineError('row 1 head_prev is not genesis — ledger fork; quarantine');
-    }
-    // (H5) anchor continuity at the caller's CURRENT witnessed height W, deriving head@W from the signed
-    // ledger — supports a witness that lags the source by more than 1.
+    // (H4) derive N + head@N from the SIGNED append-only ledger (checkpoint pointer must agree)
+    const { epoch, n, headN } = await deriveSignedLedgerHead(exec, opts.headResolver, s);
     if (priorW > n) throw new SourceFenceQuarantineError(`witnessed height ${priorW} exceeds source N ${n} — restore/rollback; quarantine`);
-    let priorHeadDigest = OUTBOX_GENESIS_HEAD;
+    // (H1/H5) anchor at the witnessed height W (head@W derived from the signed ledger) and verify the FULL range (W, N]
+    let priorHeadDigest = GENESIS_HEAD_ZERO;
     if (priorW >= 1) {
-      const wRow = (await exec.query('SELECT sequence, head_digest, head_prev, head_key_id, head_alg, head_sig FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=$2', [s, priorW])).rows[0];
-      if (!wRow) throw new SourceFenceQuarantineError(`missing committed row at the witnessed height ${priorW} — quarantine`);
-      priorHeadDigest = verifyOutboxHead(opts.headResolver, priorW, wRow as Record<string, unknown>).headDigest;
+      const wRow = (await exec.query(`SELECT ${OUTBOX_ROW_COLS} FROM tsk_outbox_rows WHERE stream_id=$1 AND source_epoch=$2 AND sequence=$3`, [s, epoch, priorW])).rows[0];
+      if (!wRow) throw new SourceFenceQuarantineError(`missing committed row at witnessed height ${priorW} — quarantine`);
+      priorHeadDigest = verifyOneOutboxRow(opts.headResolver, s, epoch, priorW, wRow as Record<string, unknown>).headDigest;
     }
+    const headAtN = await verifyOutboxLedgerRange(exec, opts.headResolver, s, epoch, priorW, priorHeadDigest, n);
+    if (headAtN !== headN) throw new SourceFenceQuarantineError('range head@N != checkpoint head@N — quarantine');
     return signSourceCheckpointReceipt(opts.sourceKeyId, opts.sourcePrivateKey, { streamId: s, sourceSystemId: sysId, sourceSeq: n, sourceHeadDigest: headN, grantSeq: lease.leaseGrantSeq, priorSeq: priorW, priorHeadDigest });
   });
 }

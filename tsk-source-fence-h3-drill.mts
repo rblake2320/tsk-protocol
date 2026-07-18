@@ -69,7 +69,7 @@ async function main() {
   const aSysId = String((await aPool.query('SELECT system_identifier::text AS s FROM pg_control_system()')).rows[0].s);
   async function provision(sid: string) { await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [sid]); await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [sid, 'e1']); }
   const grant = async (sid: string, over: Record<string, unknown> = {}): Promise<LeaseGrant> => signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'g1', leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 1, prevGrantDigest: null, ...over } as never);
-  const mkGate = async (sid: string, g: LeaseGrant): Promise<SourceFenceGate> => ({ resolver, controlToASkewBoundMs: 0, ready: await assertSourceFenceReady(aTx, 'public', { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest }) });
+  const mkGate = async (sid: string, g: LeaseGrant): Promise<SourceFenceGate> => ({ resolver, controlToASkewBoundMs: 0, ready: await assertSourceFenceReady(aTx, 'public', resolver, { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest }) });
   const append = (ob: PgTskDurableOutbox, sid: string, counter: number) => ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter }, fenceToken: 0n }));
   // real head at a given committed source height, straight from the row chain (for assertions only)
   const headAt = async (sid: string, seq: number): Promise<string> => seq <= 0 ? GEN : String((await aPool.query('SELECT head_digest FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=$2', [sid, seq])).rows[0].head_digest);
@@ -100,10 +100,11 @@ async function main() {
     assert.equal(await seqOf(sid), before + 1, 'the in-flight append committed');
     await revokeP; // only now does the revoke proceed
     assert.equal(revokeDone, true, 'the revoke committed after the append released the lock');
-    // and the freeze is now authoritative — new appends fail closed
-    const ob2 = new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer: plainSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, await mkGate(sid, g));
+    // and the freeze is now authoritative — a new append via the SAME (still-valid-token) outbox fails
+    // closed at the gate because the live lease is revoked. (A fresh token cannot even be minted against a
+    // revoked lease — that is the M1 mint-time guard; here we exercise the in-tx gate path.)
     const at = await seqOf(sid);
-    await assert.rejects(() => append(ob2, sid, 2), SourceFenceQuarantineError);
+    await assert.rejects(() => append(ob, sid, 2), SourceFenceQuarantineError);
     assert.equal(await seqOf(sid), at, 'nothing committed after the authoritative freeze');
   });
 
@@ -159,6 +160,28 @@ async function main() {
     assert.equal(r.priorSeq, 3); assert.equal(r.sourceSeq, 10);
     const w = await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, r);
     assert.equal(w.maxSourceSeq, 10); assert.equal(w.headDigest, headAt10, 'witness caught up 3→10 in one proven step');
+  });
+
+  await check('(H1) issuer FULL-range verify rejects a tampered ledger: missing-middle / broken-middle / replayed-head / cross-epoch', async () => {
+    const grow = async (suffix: string): Promise<string> => {
+      const sid = `tsk:h3:tamper-${suffix}/v1`; await provision(sid); const g = await grant(sid);
+      await aTx.transaction((exec) => installLeaseGrant(exec, resolver, g));
+      const ob = new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer: plainSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, await mkGate(sid, g));
+      for (let c = 1; c <= 5; c++) await append(ob, sid, c);
+      return sid;
+    };
+    assert.equal((await issue(await grow('ok'), 0)).sourceSeq, 5); // baseline: a clean 1..5 ledger issues
+    const s1 = await grow('missing'); await aPool.query('DELETE FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=3', [s1]);
+    await assert.rejects(() => issue(s1, 0), /gap|expected .* rows|does not chain/);
+    const s2 = await grow('broken'); await aPool.query('UPDATE tsk_outbox_rows SET head_prev=$2 WHERE stream_id=$1 AND sequence=3', [s2, 'f'.repeat(64)]);
+    await assert.rejects(() => issue(s2, 0), /does not chain|digest mismatch/);
+    // replayed head: copy row 4's SIGNED head fields onto row 3 — the canonical-binding recompute (seq 3
+    // vs the seq-4 digest) rejects it even though the signature itself is a genuine guard signature.
+    const s3 = await grow('replay');
+    await aPool.query('UPDATE tsk_outbox_rows r SET head_digest=src.head_digest, head_sig=src.head_sig, head_prev=src.head_prev, op_digest=src.op_digest FROM (SELECT head_digest, head_sig, head_prev, op_digest FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=4) src WHERE r.stream_id=$1 AND r.sequence=3', [s3]);
+    await assert.rejects(() => issue(s3, 0), /digest mismatch|does not chain/);
+    const s4 = await grow('epoch'); await aPool.query("UPDATE tsk_outbox_rows SET source_epoch='e2' WHERE stream_id=$1 AND sequence=3", [s4]);
+    await assert.rejects(() => issue(s4, 0), /gap|expected .* rows|cross-epoch/);
   });
 
   console.log(`\n# ${passed} PR2b-0 H3 real concurrency + restore/fork checks passed`);
