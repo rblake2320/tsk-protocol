@@ -933,7 +933,7 @@ export interface ExportStateChunk { kind: 'state'; ordinal: number; itemCount: n
 export interface SourceExportBundle { historyChunks: ExportHistoryChunk[]; stateChunk: ExportStateChunk; }
 /** The signed manifest binding the exact ordered chunk inventory + the replay-derived head/state @N. */
 export interface SourceExportManifest {
-  manifestSchemaVersion: string; streamId: string; epoch: number; sourceEpoch: string; commandId: string; sourceNodeId: string; n: number;
+  manifestSchemaVersion: string; streamId: string; epoch: number; sourceEpoch: string; commandId: string; sourceNodeId: string; sourceSystemId: string; n: number;
   frozenReceiptDigest: string; signedHeadDigestAtN: string; sourceStateDigestAtN: string;
   chunkCount: number; inventory: ExportChunkInventoryEntry[]; manifestRoot: string;
   canonicalDigest: string; sourceKeyId: string; sourceSignature: string;
@@ -959,7 +959,7 @@ function computeManifestRoot(inventory: ExportChunkInventoryEntry[]): string {
   return sha256hex(frame(...parts));
 }
 function manifestMsg(m: Omit<SourceExportManifest, 'canonicalDigest' | 'sourceKeyId' | 'sourceSignature'>): Buffer {
-  return frame(EXPORT_MANIFEST_VERSION, m.manifestSchemaVersion, m.streamId, m.epoch, m.sourceEpoch, m.commandId, m.sourceNodeId, m.n,
+  return frame(EXPORT_MANIFEST_VERSION, m.manifestSchemaVersion, m.streamId, m.epoch, m.sourceEpoch, m.commandId, m.sourceNodeId, m.sourceSystemId, m.n,
     m.frozenReceiptDigest, m.signedHeadDigestAtN, m.sourceStateDigestAtN, m.chunkCount, m.manifestRoot);
 }
 
@@ -1110,6 +1110,7 @@ export async function buildSourceExportManifest<Clean>(db: PgTransactor, schema:
   return db.transaction(async (exec) => {
     await enterSourceTx(exec, schema);
     await attestSourceLease(exec);
+    const sourceSystemId = String((await exec.query('SELECT system_identifier::text AS s FROM pg_catalog.pg_control_system()')).rows[0]?.s); // (H3) A's REAL PG system_identifier, source-signed
     const cp = (await exec.query('SELECT source_epoch, sequence, head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
     if (!cp) throw new SourceFenceQuarantineError('no source checkpoint');
     const n = vInt(cp.sequence, 'N', 1, MAX_SEQ);
@@ -1125,7 +1126,7 @@ export async function buildSourceExportManifest<Clean>(db: PgTransactor, schema:
     const inventory = bundleInventory(bundle);
     assertExportInventory(inventory, n); // (R5-M1) strict inventory structure
     const manifestRoot = computeManifestRoot(inventory);
-    const bare = { manifestSchemaVersion: EXPORT_MANIFEST_VERSION, streamId: s, epoch, sourceEpoch, commandId, sourceNodeId, n, frozenReceiptDigest: fr.receiptDigest, signedHeadDigestAtN: replay.signedHeadDigestAtN, sourceStateDigestAtN: replay.sourceStateDigestAtN, chunkCount: inventory.length, inventory, manifestRoot };
+    const bare = { manifestSchemaVersion: EXPORT_MANIFEST_VERSION, streamId: s, epoch, sourceEpoch, commandId, sourceNodeId, sourceSystemId, n, frozenReceiptDigest: fr.receiptDigest, signedHeadDigestAtN: replay.signedHeadDigestAtN, sourceStateDigestAtN: replay.sourceStateDigestAtN, chunkCount: inventory.length, inventory, manifestRoot };
     const canonicalDigest = sha256hex(manifestMsg(bare));
     const sourceSignature = edSignB64u(opts.sourceKeyId, opts.sourcePrivateKey, Buffer.concat([manifestMsg(bare), frame('tsk_manifest_digest', canonicalDigest)]));
     return { bundle, manifest: { ...bare, canonicalDigest, sourceKeyId: opts.sourceKeyId, sourceSignature } };
@@ -1134,7 +1135,7 @@ export async function buildSourceExportManifest<Clean>(db: PgTransactor, schema:
 
 /** Verify a source-signed manifest's canonical digest + the source signature over it + strict inventory. */
 export function verifySourceExportManifest(resolver: SourceVerifyKeyResolver, m: SourceExportManifest): void {
-  const bare = { manifestSchemaVersion: m.manifestSchemaVersion, streamId: m.streamId, epoch: m.epoch, sourceEpoch: m.sourceEpoch, commandId: m.commandId, sourceNodeId: m.sourceNodeId, n: m.n, frozenReceiptDigest: m.frozenReceiptDigest, signedHeadDigestAtN: m.signedHeadDigestAtN, sourceStateDigestAtN: m.sourceStateDigestAtN, chunkCount: m.chunkCount, inventory: m.inventory, manifestRoot: m.manifestRoot };
+  const bare = { manifestSchemaVersion: m.manifestSchemaVersion, streamId: m.streamId, epoch: m.epoch, sourceEpoch: m.sourceEpoch, commandId: m.commandId, sourceNodeId: m.sourceNodeId, sourceSystemId: m.sourceSystemId, n: m.n, frozenReceiptDigest: m.frozenReceiptDigest, signedHeadDigestAtN: m.signedHeadDigestAtN, sourceStateDigestAtN: m.sourceStateDigestAtN, chunkCount: m.chunkCount, inventory: m.inventory, manifestRoot: m.manifestRoot };
   assertExportInventory(m.inventory, m.n); // (R5-M1) strict inventory structure
   if (m.chunkCount !== m.inventory.length) throw new ContractValidationError('chunkCount != inventory length');
   if (computeManifestRoot(m.inventory) !== m.manifestRoot) throw new ContractValidationError('manifestRoot != inventory');
@@ -1198,18 +1199,48 @@ export function verifyGuardCountersignedExport(sourceResolver: SourceVerifyKeyRe
   verifySig(guardResolver, m.guardKeyId, frame('tsk_guard_countersign/v1', m.canonicalDigest, m.sourceKeyId, m.sourceSignature), m.guardSignature);
 }
 
-// ── PR2b-2 (§3): receiver B — isolated staging, strict replay/verify, ONE atomic finalize ──
+// ── PR2b-2 (§3): receiver B — PERSISTENT isolated staging, strict replay/verify, ONE atomic finalize ──
 //
-// B stages a guard-countersigned export into an ISOLATED candidate generation (not visible as
-// authority), INDEPENDENTLY replays 1..N (the same canonical replay authority) + materializes
-// state-at-N, verifies BOTH source + guard signatures + the frozen binding + manifestRoot, and that
-// B's system_identifier is DISTINCT from A and control. Only then it CONSTRUCTS + SIGNS the
-// BFinalizedReceipt FIRST, and ONE SERIALIZABLE CAS tx verifies that signed receipt and atomically
-// installs checkpoint/head/materialized-state + flips the singleton generation pointer + stores the
-// receipt — so there is no post-flip / pre-receipt state; recovery returns the stored receipt. The
-// generation is authoritative RECEIVER/candidate state (NOT a writable source — that is PR2c).
+// B STAGES a guard-countersigned export into an ISOLATED candidate generation (persisted manifest +
+// chunk rows, status 'staged', not visible as authority) with exact duplicate-digest idempotency +
+// same-ordinal conflict rejection + gap/completeness validation — crash-resumable. Then, in a separate
+// step, B FINALIZES: it rebuilds the bundle FROM THE PERSISTED STAGING (never caller memory),
+// re-verifies BOTH signatures + the frozen binding + the manifestRoot, INDEPENDENTLY replays 1..N +
+// materializes state-at-N, asserts B's system_identifier is DISTINCT from the SIGNED source
+// system_identifier and the (validated) control set, CONSTRUCTS + SIGNS the BFinalizedReceipt, and ONE
+// SERIALIZABLE CAS tx VERIFIES that signed receipt + atomically installs checkpoint/head/materialized
+// state + flips the singleton pointer + seals the generation + stores the receipt — so there is no
+// post-flip / pre-receipt state and recovery returns the stored receipt. NOT a writable source (PR2c).
 
 export const TSK_RECEIVER_SCHEMA = `
+CREATE TABLE IF NOT EXISTS tsk_receiver_stage (
+  stream_id     text NOT NULL CHECK (length(stream_id) BETWEEN 1 AND 512),
+  generation_id text NOT NULL CHECK (generation_id ~ '^[A-Za-z0-9:._-]{1,128}$'),
+  command_id    text NOT NULL,
+  epoch         bigint NOT NULL CHECK (epoch >= 0),
+  source_epoch  text NOT NULL,
+  n             bigint NOT NULL CHECK (n >= 1),
+  manifest_digest text NOT NULL CHECK (manifest_digest ~ '^[0-9a-f]{64}$'),
+  manifest_root text NOT NULL CHECK (manifest_root ~ '^[0-9a-f]{64}$'),
+  source_system_id text NOT NULL,
+  chunk_count   integer NOT NULL CHECK (chunk_count >= 2),
+  manifest      jsonb NOT NULL,
+  status        text NOT NULL CHECK (status IN ('staged','installed')),
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (stream_id, generation_id)
+);
+CREATE TABLE IF NOT EXISTS tsk_receiver_stage_chunk (
+  stream_id     text NOT NULL CHECK (length(stream_id) BETWEEN 1 AND 512),
+  generation_id text NOT NULL,
+  ordinal       integer NOT NULL CHECK (ordinal >= 0),
+  kind          text NOT NULL CHECK (kind IN ('history','state')),
+  seq_from      bigint NOT NULL CHECK (seq_from >= 0),
+  seq_to        bigint NOT NULL CHECK (seq_to >= 0),
+  item_count    integer NOT NULL CHECK (item_count >= 0),
+  byte_digest   text NOT NULL CHECK (byte_digest ~ '^[0-9a-f]{64}$'),
+  content       jsonb NOT NULL,
+  PRIMARY KEY (stream_id, generation_id, ordinal)
+);
 CREATE TABLE IF NOT EXISTS tsk_receiver_generation (
   stream_id     text NOT NULL CHECK (length(stream_id) BETWEEN 1 AND 512),
   generation_id text NOT NULL CHECK (generation_id ~ '^[A-Za-z0-9:._-]{1,128}$'),
@@ -1245,27 +1276,44 @@ CREATE TABLE IF NOT EXISTS tsk_receiver_state (
 );
 `.trim();
 
-export const TSK_RECEIVER_TABLES = ['tsk_receiver_generation', 'tsk_receiver_pointer', 'tsk_receiver_state'] as const;
+export const TSK_RECEIVER_TABLES = ['tsk_receiver_stage', 'tsk_receiver_stage_chunk', 'tsk_receiver_generation', 'tsk_receiver_pointer', 'tsk_receiver_state'] as const;
 
 /** COMPILED expected receiver catalog digest (pinned; computed on PG16 — collation-independent). */
-export const RECEIVER_MANIFEST_DIGEST = '58e3bbe23ccad632ac59606243dadc1206f9108662da03845fcee34fd8871fea';
+export const RECEIVER_MANIFEST_DIGEST = '0a1b8f007d1b720871ab20cbb509a1c51fc7f16cf2172ae3e03e827e2b744af6';
 export async function attestReceiver(exec: PgExecutor): Promise<void> {
   const digest = sha256hex(Buffer.from(await sourceFenceManifest(exec, TSK_RECEIVER_TABLES, 'Vreceiver/1'), 'utf8'));
   if (digest !== RECEIVER_MANIFEST_DIGEST) throw new ContractValidationError(`receiver attestation failed: live catalog digest ${digest} != pinned ${RECEIVER_MANIFEST_DIGEST}`);
 }
 
 /** B's finalize receipt — every field is DERIVED from the verified manifest (not free-standing). */
+const RECEIVER_READY_BRAND: unique symbol = Symbol('tsk_receiver_ready');
+export interface SourceReceiverReadyToken { readonly [RECEIVER_READY_BRAND]: true }
+const RECEIVER_READY_STATE = new WeakMap<object, { db: PgTransactor; schema: string }>();
+/** Attest the receiver catalog on the B transactor + mint a db/schema-bound readiness capability. */
+export async function assertReceiverReady(bDb: PgTransactor, schema: string): Promise<SourceReceiverReadyToken> {
+  await bDb.transaction(async (exec) => { await enterSourceTx(exec, schema); await attestReceiver(exec); });
+  const t = Object.freeze({ [RECEIVER_READY_BRAND]: true as const });
+  RECEIVER_READY_STATE.set(t, { db: bDb, schema });
+  return t as SourceReceiverReadyToken;
+}
+export function requireReceiverReady(token: SourceReceiverReadyToken, ctx: { db: PgTransactor }): { db: PgTransactor; schema: string } {
+  const st = RECEIVER_READY_STATE.get(token as unknown as object);
+  if (!st) throw new ContractValidationError('invalid receiver capability (forged or foreign token)');
+  if (st.db !== ctx.db) throw new ContractValidationError('receiver capability bound to a different transactor');
+  return st;
+}
+
 export interface BFinalizedReceipt {
   streamId: string; commandId: string; epoch: number; sourceEpoch: string; n: number; generationId: string;
-  frozenReceiptDigest: string; manifestDigest: string; manifestRoot: string;
+  frozenReceiptDigest: string; manifestDigest: string; manifestRoot: string; sourceSystemId: string;
   sourceKeyId: string; sourceSignature: string; guardKeyId: string; guardSignature: string;
   signedHeadDigestAtN: string; sourceStateDigestAtN: string; bSystemId: string;
   receiptDigest: string; bKeyId: string; bSignature: string;
 }
 type BareBFinalized = Omit<BFinalizedReceipt, 'receiptDigest' | 'bKeyId' | 'bSignature'>;
 function bFinalizedMsg(b: BareBFinalized, digest: string): Buffer {
-  return frame('tsk_b_finalized/v1', b.streamId, b.commandId, b.epoch, b.sourceEpoch, b.n, b.generationId,
-    b.frozenReceiptDigest, b.manifestDigest, b.manifestRoot, b.sourceKeyId, b.sourceSignature, b.guardKeyId, b.guardSignature,
+  return frame('tsk_b_finalized/v2', b.streamId, b.commandId, b.epoch, b.sourceEpoch, b.n, b.generationId,
+    b.frozenReceiptDigest, b.manifestDigest, b.manifestRoot, b.sourceSystemId, b.sourceKeyId, b.sourceSignature, b.guardKeyId, b.guardSignature,
     b.signedHeadDigestAtN, b.sourceStateDigestAtN, b.bSystemId, digest);
 }
 function signBFinalizedReceipt(bKeyId: string, bPrivateKey: KeyObject | string, b: BareBFinalized): BFinalizedReceipt {
@@ -1274,71 +1322,177 @@ function signBFinalizedReceipt(bKeyId: string, bPrivateKey: KeyObject | string, 
   return { ...b, receiptDigest, bKeyId, bSignature };
 }
 /** Verify a BFinalizedReceipt digest + B signature (resolver holds B's PUBLIC key). Control uses this
- *  at READY (§4), comparing commandId / frozenReceiptDigest / manifestDigest+root / sig identities to
- *  the active cutover command. */
+ *  at READY (§4), comparing commandId / frozenReceiptDigest / manifestDigest+root / sig identities. */
 export function verifyBFinalizedReceipt(resolver: SourceVerifyKeyResolver, r: BFinalizedReceipt): void {
-  const bare: BareBFinalized = { streamId: r.streamId, commandId: r.commandId, epoch: r.epoch, sourceEpoch: r.sourceEpoch, n: r.n, generationId: r.generationId, frozenReceiptDigest: r.frozenReceiptDigest, manifestDigest: r.manifestDigest, manifestRoot: r.manifestRoot, sourceKeyId: r.sourceKeyId, sourceSignature: r.sourceSignature, guardKeyId: r.guardKeyId, guardSignature: r.guardSignature, signedHeadDigestAtN: r.signedHeadDigestAtN, sourceStateDigestAtN: r.sourceStateDigestAtN, bSystemId: r.bSystemId };
+  const bare: BareBFinalized = { streamId: r.streamId, commandId: r.commandId, epoch: r.epoch, sourceEpoch: r.sourceEpoch, n: r.n, generationId: r.generationId, frozenReceiptDigest: r.frozenReceiptDigest, manifestDigest: r.manifestDigest, manifestRoot: r.manifestRoot, sourceSystemId: r.sourceSystemId, sourceKeyId: r.sourceKeyId, sourceSignature: r.sourceSignature, guardKeyId: r.guardKeyId, guardSignature: r.guardSignature, signedHeadDigestAtN: r.signedHeadDigestAtN, sourceStateDigestAtN: r.sourceStateDigestAtN, bSystemId: r.bSystemId };
   if (sha256hex(bFinalizedMsg(bare, '')) !== r.receiptDigest) throw new ContractValidationError('BFinalizedReceipt digest mismatch');
   verifySig(resolver, r.bKeyId, bFinalizedMsg(bare, r.receiptDigest), r.bSignature);
 }
 
-/** Options for the receiver stage + finalize. `distinctFromSystemIds` = A + control system_identifiers
- *  (B's must differ). `bVerifyResolver` holds B's PUBLIC key (verify the receipt inside the CAS tx). */
-export interface ReceiverFinalizeOptions<Clean> {
+/** (H1) Detach an untrusted input from the caller by a JSON deep-clone — subsequent caller mutation
+ *  cannot reach the returned snapshot, and only the snapshot is used across awaits. */
+function snapshot<T>(x: T): T { return JSON.parse(JSON.stringify(x)) as T; }
+
+export interface ReceiverVerifyOptions<Clean> {
   sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'sanitize'>;
-  sourceResolver: SourceVerifyKeyResolver; guardResolver: SourceVerifyKeyResolver; headResolver: SourceVerifyKeyResolver; frozenResolver: SourceVerifyKeyResolver; bVerifyResolver: SourceVerifyKeyResolver;
+  sourceResolver: SourceVerifyKeyResolver; guardResolver: SourceVerifyKeyResolver; headResolver: SourceVerifyKeyResolver; frozenResolver: SourceVerifyKeyResolver;
   frozenReceipt: SourceFrozenReceipt; expectedCommandId: string;
-  bKeyId: string; bPrivateKey: KeyObject | string; distinctFromSystemIds: string[];
+}
+/** Synchronously (before any await) SNAPSHOT the untrusted manifest/bundle/frozen receipt, verify BOTH
+ *  signatures + the caller-expected command + the frozen binding + the bundle re-digest + an INDEPENDENT
+ *  replay, and return the frozen snapshots + the replay result. Used by BOTH stage and finalize so the
+ *  persisted staging is re-verified, never trusted. */
+function verifiedExportSnapshot<Clean>(bundle: SourceExportBundle, manifest: GuardCountersignedExport, opts: ReceiverVerifyOptions<Clean>): { bundle: SourceExportBundle; manifest: GuardCountersignedExport; frozenReceipt: SourceFrozenReceipt; replay: { signedHeadDigestAtN: string; sourceStateDigestAtN: string; derivedStatePairs: [string, number][]; n: number } } {
+  const m = snapshot(manifest), b = snapshot(bundle), fr = snapshot(opts.frozenReceipt);
+  if (m.commandId !== vId(opts.expectedCommandId, ID_RE, 'expectedCommandId')) throw new SourceFenceQuarantineError('manifest commandId != caller-expected command — quarantine');
+  verifyGuardCountersignedExport(opts.sourceResolver, opts.guardResolver, m); // both signatures
+  const replay = assertExportBundleBinds(b, m, fr, opts.frozenResolver, opts.sanitizer, opts.headResolver);
+  return { bundle: b, manifest: m, frozenReceipt: fr, replay };
 }
 
-/** (§3) B: verify the dual-signed export + INDEPENDENTLY replay, then CONSTRUCT + SIGN the
- *  BFinalizedReceipt, then ONE SERIALIZABLE CAS tx verifies that signed receipt and atomically installs
- *  checkpoint/head/materialized-state + flips the pointer + stores the receipt (no post-flip/pre-receipt
- *  state; idempotent re-finalize returns the stored receipt). */
-export async function stageAndFinalizeReceiverGeneration<Clean>(bDb: PgTransactor, schema: string, generationId: string, bundle: SourceExportBundle, manifest: GuardCountersignedExport, opts: ReceiverFinalizeOptions<Clean>): Promise<BFinalizedReceipt> {
+/** (§3) STAGE — persist the verified export into an ISOLATED candidate generation (not authority).
+ *  Idempotent on the exact chunk digests (re-stage OK); a same-ordinal DIFFERENT digest or a different
+ *  manifest for the generation is a CONFLICT (isolate, never merge). Crash-resumable. */
+export async function stageReceiverExport<Clean>(bDb: PgTransactor, schema: string, ready: SourceReceiverReadyToken, generationId: string, bundle: SourceExportBundle, manifest: GuardCountersignedExport, opts: ReceiverVerifyOptions<Clean>): Promise<void> {
+  requireReceiverReady(ready, { db: bDb });
   const gid = vId(generationId, ID_RE, 'generationId');
-  const s = vId(manifest.streamId, STREAM_ID_RE, 'streamId');
-  if (manifest.commandId !== vId(opts.expectedCommandId, ID_RE, 'expectedCommandId')) throw new SourceFenceQuarantineError('manifest commandId != caller-expected command — quarantine');
-  // (verify OUTSIDE the CAS tx) both signatures + bundle binding + INDEPENDENT replay
-  verifyGuardCountersignedExport(opts.sourceResolver, opts.guardResolver, manifest);
-  const replay = assertExportBundleBinds(bundle, manifest, opts.frozenReceipt, opts.frozenResolver, opts.sanitizer, opts.headResolver);
+  const snap = verifiedExportSnapshot(bundle, manifest, opts);
+  const m = snap.manifest, s = vId(m.streamId, STREAM_ID_RE, 'streamId');
+  const chunks: { ordinal: number; kind: string; seqFrom: number; seqTo: number; itemCount: number; byteDigest: string; content: string }[] = [
+    ...snap.bundle.historyChunks.map((c) => ({ ordinal: c.ordinal, kind: 'history', seqFrom: c.seqFrom, seqTo: c.seqTo, itemCount: c.records.length, byteDigest: c.byteDigest, content: JSON.stringify(c.records) })),
+    { ordinal: snap.bundle.stateChunk.ordinal, kind: 'state', seqFrom: 0, seqTo: 0, itemCount: snap.bundle.stateChunk.itemCount, byteDigest: snap.bundle.stateChunk.byteDigest, content: JSON.stringify(snap.bundle.stateChunk.pairs) },
+  ];
+  await bDb.transaction(async (exec) => {
+    await enterSourceTx(exec, schema);
+    await attestReceiver(exec);
+    const existing = (await exec.query('SELECT manifest_digest, status FROM tsk_receiver_stage WHERE stream_id=$1 AND generation_id=$2 FOR UPDATE', [s, gid])).rows[0];
+    if (existing) {
+      if (String(existing.manifest_digest) !== m.canonicalDigest) throw new SourceFenceQuarantineError('generation already staged with a DIFFERENT manifest — conflict; quarantine');
+      // idempotent re-stage: assert the same chunk digests (duplicate-ok) and return
+      for (const c of chunks) {
+        const row = (await exec.query('SELECT byte_digest FROM tsk_receiver_stage_chunk WHERE stream_id=$1 AND generation_id=$2 AND ordinal=$3', [s, gid, c.ordinal])).rows[0];
+        if (!row || String(row.byte_digest) !== c.byteDigest) throw new SourceFenceQuarantineError(`re-stage chunk ${c.ordinal} digest conflict — quarantine`);
+      }
+      return;
+    }
+    await exec.query('INSERT INTO tsk_receiver_stage (stream_id, generation_id, command_id, epoch, source_epoch, n, manifest_digest, manifest_root, source_system_id, chunk_count, manifest, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)',
+      [s, gid, m.commandId, m.epoch, m.sourceEpoch, m.n, m.canonicalDigest, m.manifestRoot, m.sourceSystemId, m.chunkCount, JSON.stringify(m), 'staged']);
+    for (const c of chunks) {
+      await exec.query('INSERT INTO tsk_receiver_stage_chunk (stream_id, generation_id, ordinal, kind, seq_from, seq_to, item_count, byte_digest, content) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+        [s, gid, c.ordinal, c.kind, c.seqFrom, c.seqTo, c.itemCount, c.byteDigest, c.content]);
+    }
+  });
+}
+
+export interface ReceiverFinalizeOptions<Clean> extends ReceiverVerifyOptions<Clean> {
+  bVerifyResolver: SourceVerifyKeyResolver; bKeyId: string; bPrivateKey: KeyObject | string; controlSystemIds: string[];
+}
+
+/** Rebuild the export bundle from the PERSISTED staging rows (crash-resume — never caller memory). */
+async function rebuildStagedBundle(exec: PgExecutor, streamId: string, generationId: string): Promise<{ bundle: SourceExportBundle; manifest: GuardCountersignedExport }> {
+  const st = (await exec.query('SELECT manifest, chunk_count, status FROM tsk_receiver_stage WHERE stream_id=$1 AND generation_id=$2', [streamId, generationId])).rows[0];
+  if (!st) throw new SourceFenceQuarantineError('no staged generation to finalize — stage first; quarantine');
+  const manifest = st.manifest as GuardCountersignedExport;
+  const rows = (await exec.query('SELECT ordinal, kind, seq_from, seq_to, item_count, byte_digest, content FROM tsk_receiver_stage_chunk WHERE stream_id=$1 AND generation_id=$2 ORDER BY ordinal ASC', [streamId, generationId])).rows;
+  if (rows.length !== vInt(st.chunk_count, 'chunk_count', 2, 100_000)) throw new SourceFenceQuarantineError('staged chunk count mismatch — quarantine');
+  const historyChunks: ExportHistoryChunk[] = []; let stateChunk: ExportStateChunk | null = null;
+  for (const r of rows) {
+    const ordinal = vInt(r.ordinal, 'ordinal', 0, 100_000);
+    if (String(r.kind) === 'history') {
+      const records = r.content as ExportedSourceRecord[];
+      historyChunks.push({ kind: 'history', ordinal, seqFrom: vInt(r.seq_from, 'seq_from', 1, MAX_SEQ), seqTo: vInt(r.seq_to, 'seq_to', 1, MAX_SEQ), records, byteDigest: String(r.byte_digest) });
+    } else {
+      const pairs = r.content as [string, number][];
+      stateChunk = { kind: 'state', ordinal, itemCount: vInt(r.item_count, 'item_count', 0, 1_000_000), pairs, byteDigest: String(r.byte_digest) };
+    }
+  }
+  if (!stateChunk) throw new SourceFenceQuarantineError('staged generation missing the state chunk — quarantine');
+  return { bundle: { historyChunks, stateChunk }, manifest };
+}
+
+/** (§3) FINALIZE — one serializable CAS tx: rebuild from persisted staging, RE-VERIFY (both sigs +
+ *  bundle bind + independent replay), assert B system_identifier DISTINCT from the SIGNED source
+ *  system_identifier + the validated control set, CONSTRUCT + SIGN + VERIFY the BFinalizedReceipt, and
+ *  atomically install checkpoint/head/state + flip the pointer + seal + store — all together.
+ *  Idempotent (returns the stored receipt); refuses to flip a different generation. */
+export async function finalizeReceiverGeneration<Clean>(bDb: PgTransactor, schema: string, ready: SourceReceiverReadyToken, generationId: string, opts: ReceiverFinalizeOptions<Clean>): Promise<BFinalizedReceipt> {
+  requireReceiverReady(ready, { db: bDb });
+  const gid = vId(generationId, ID_RE, 'generationId');
+  // (H3) validate the control authority set: non-empty + no duplicates
+  const control = opts.controlSystemIds.map(String);
+  if (control.length === 0) throw new SourceFenceQuarantineError('controlSystemIds is empty — a distinct-authority set is required; quarantine');
+  if (new Set(control).size !== control.length) throw new SourceFenceQuarantineError('controlSystemIds has duplicates — quarantine');
+  const bKeyId = vId(opts.bKeyId, KEY_ID_RE, 'bKeyId');
   return bDb.transaction(async (exec) => {
     await enterSourceTx(exec, schema);
     await attestReceiver(exec);
+    const s = await stagedStreamId(exec, gid);
+    const { bundle, manifest } = await rebuildStagedBundle(exec, s, gid);
+    if (vId(manifest.streamId, STREAM_ID_RE, 'streamId') !== s) throw new SourceFenceQuarantineError('staged manifest streamId != staged row streamId — quarantine');
+    // RE-VERIFY the persisted staging (never trust staging blindly) — BEFORE touching the pointer
+    const snap = verifiedExportSnapshot(bundle, manifest, opts);
+    const m = snap.manifest, replay = snap.replay;
+    // (H3) B system_identifier must be DISTINCT from the SIGNED source system_identifier + the control set
     const bSystemId = String((await exec.query('SELECT system_identifier::text AS s FROM pg_catalog.pg_control_system()')).rows[0]?.s);
-    if (opts.distinctFromSystemIds.map(String).includes(bSystemId)) throw new SourceFenceQuarantineError(`B system_identifier ${bSystemId} is NOT distinct from A/control — quarantine`);
-    // idempotent re-finalize: an already-installed generation for this stream returns the STORED receipt
+    if (bSystemId === m.sourceSystemId) throw new SourceFenceQuarantineError('B system_identifier == the signed source system_identifier — NOT distinct; quarantine');
+    if (control.includes(bSystemId)) throw new SourceFenceQuarantineError('B system_identifier is in the control set — NOT distinct; quarantine');
+    // idempotent / single-flip: an already-installed generation returns the STORED receipt; a DIFFERENT one is refused
     const ptr = (await exec.query('SELECT active_generation_id, b_finalized_receipt FROM tsk_receiver_pointer WHERE stream_id=$1 FOR UPDATE', [s])).rows[0];
-    if (ptr && String(ptr.active_generation_id) === gid) {
-      const stored = ptr.b_finalized_receipt as BFinalizedReceipt;
-      verifyBFinalizedReceipt(opts.bVerifyResolver, stored);
-      if (stored.manifestDigest !== manifest.canonicalDigest || stored.manifestRoot !== manifest.manifestRoot) throw new SourceFenceQuarantineError('stored BFinalizedReceipt does not match this manifest — quarantine');
-      return stored;
+    if (ptr) {
+      if (String(ptr.active_generation_id) === gid) {
+        const stored = ptr.b_finalized_receipt as BFinalizedReceipt;
+        verifyBFinalizedReceipt(opts.bVerifyResolver, stored);
+        if (stored.manifestDigest !== manifest.canonicalDigest || stored.manifestRoot !== manifest.manifestRoot) throw new SourceFenceQuarantineError('stored BFinalizedReceipt does not match the staged manifest — quarantine');
+        return stored;
+      }
+      throw new SourceFenceQuarantineError(`receiver pointer already at a DIFFERENT generation ${String(ptr.active_generation_id)} — refusing to re-flip; quarantine`);
     }
-    if (ptr) throw new SourceFenceQuarantineError(`receiver pointer already at a DIFFERENT generation ${String(ptr.active_generation_id)} — refusing to re-flip; quarantine`);
-    // CONSTRUCT + SIGN the receipt (B custody) — all fields DERIVED from the verified manifest
-    const bare: BareBFinalized = { streamId: s, commandId: manifest.commandId, epoch: manifest.epoch, sourceEpoch: manifest.sourceEpoch, n: manifest.n, generationId: gid, frozenReceiptDigest: manifest.frozenReceiptDigest, manifestDigest: manifest.canonicalDigest, manifestRoot: manifest.manifestRoot, sourceKeyId: manifest.sourceKeyId, sourceSignature: manifest.sourceSignature, guardKeyId: manifest.guardKeyId, guardSignature: manifest.guardSignature, signedHeadDigestAtN: replay.signedHeadDigestAtN, sourceStateDigestAtN: replay.sourceStateDigestAtN, bSystemId };
-    const receipt = signBFinalizedReceipt(opts.bKeyId, opts.bPrivateKey, bare);
-    verifyBFinalizedReceipt(opts.bVerifyResolver, receipt); // (§3) the CAS tx VERIFIES the signed receipt before installing
-    // atomically INSTALL: generation + materialized state + pointer flip + stored receipt — all together
+    // CONSTRUCT + SIGN + VERIFY the receipt (all fields DERIVED from the verified manifest)
+    const bare: BareBFinalized = { streamId: s, commandId: m.commandId, epoch: m.epoch, sourceEpoch: m.sourceEpoch, n: m.n, generationId: gid, frozenReceiptDigest: m.frozenReceiptDigest, manifestDigest: m.canonicalDigest, manifestRoot: m.manifestRoot, sourceSystemId: m.sourceSystemId, sourceKeyId: m.sourceKeyId, sourceSignature: m.sourceSignature, guardKeyId: m.guardKeyId, guardSignature: m.guardSignature, signedHeadDigestAtN: replay.signedHeadDigestAtN, sourceStateDigestAtN: replay.sourceStateDigestAtN, bSystemId };
+    const receipt = signBFinalizedReceipt(bKeyId, opts.bPrivateKey, bare);
+    verifyBFinalizedReceipt(opts.bVerifyResolver, receipt);
     const rjson = JSON.stringify(receipt);
     await exec.query('INSERT INTO tsk_receiver_generation (stream_id, generation_id, command_id, epoch, source_epoch, n, manifest_digest, manifest_root, frozen_receipt_digest, signed_head_digest_at_n, source_state_digest_at_n, b_system_id, b_finalized_receipt) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
-      [s, gid, manifest.commandId, manifest.epoch, manifest.sourceEpoch, manifest.n, manifest.canonicalDigest, manifest.manifestRoot, manifest.frozenReceiptDigest, replay.signedHeadDigestAtN, replay.sourceStateDigestAtN, bSystemId, rjson]);
+      [s, gid, m.commandId, m.epoch, m.sourceEpoch, m.n, m.canonicalDigest, m.manifestRoot, m.frozenReceiptDigest, replay.signedHeadDigestAtN, replay.sourceStateDigestAtN, bSystemId, rjson]);
     for (const [tumblerId, counter] of replay.derivedStatePairs) {
       await exec.query('INSERT INTO tsk_receiver_state (stream_id, generation_id, tumbler_id, hotp_counter) VALUES ($1,$2,$3,$4)', [s, gid, tumblerId, counter]);
     }
     await exec.query('INSERT INTO tsk_receiver_pointer (stream_id, active_generation_id, checkpoint_seq, head_digest, state_digest, b_finalized_receipt) VALUES ($1,$2,$3,$4,$5,$6)',
-      [s, gid, manifest.n, replay.signedHeadDigestAtN, replay.sourceStateDigestAtN, rjson]);
+      [s, gid, m.n, replay.signedHeadDigestAtN, replay.sourceStateDigestAtN, rjson]);
+    affectedOne(await exec.query("UPDATE tsk_receiver_stage SET status='installed' WHERE stream_id=$1 AND generation_id=$2 AND status='staged'", [s, gid]), 'seal staged generation');
     return receipt;
   });
 }
 
-/** Read the installed receiver pointer + its stored BFinalizedReceipt (verified). Null if not installed. */
-export async function readReceiverPointer(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<{ generationId: string; checkpointSeq: number; headDigest: string; stateDigest: string; receipt: BFinalizedReceipt } | null> {
+async function stagedStreamId(exec: PgExecutor, generationId: string): Promise<string> {
+  const r = (await exec.query('SELECT stream_id FROM tsk_receiver_stage WHERE generation_id=$1', [generationId])).rows[0];
+  if (!r) throw new SourceFenceQuarantineError('no staged generation to finalize — stage first; quarantine');
+  return String(r.stream_id);
+}
+
+/** Convenience: stage then finalize (two durable steps). */
+export async function stageAndFinalizeReceiverGeneration<Clean>(bDb: PgTransactor, schema: string, ready: SourceReceiverReadyToken, generationId: string, bundle: SourceExportBundle, manifest: GuardCountersignedExport, opts: ReceiverFinalizeOptions<Clean>): Promise<BFinalizedReceipt> {
+  await stageReceiverExport(bDb, schema, ready, generationId, bundle, manifest, opts);
+  return finalizeReceiverGeneration(bDb, schema, ready, generationId, opts);
+}
+
+/** (H4) OWNED read: serializable, schema-pinned + receiver-attested; verifies the stored receipt AND
+ *  asserts the pointer's (generationId / checkpointSeq / headDigest / stateDigest) EQUAL the receipt. */
+export async function readReceiverPointer(bDb: PgTransactor, schema: string, ready: SourceReceiverReadyToken, resolver: SourceVerifyKeyResolver, streamId: string): Promise<{ generationId: string; checkpointSeq: number; headDigest: string; stateDigest: string; receipt: BFinalizedReceipt } | null> {
+  requireReceiverReady(ready, { db: bDb });
   const s = vId(streamId, STREAM_ID_RE, 'streamId');
-  const r = (await exec.query('SELECT active_generation_id, checkpoint_seq, head_digest, state_digest, b_finalized_receipt FROM tsk_receiver_pointer WHERE stream_id=$1', [s])).rows[0];
-  if (!r) return null;
-  const receipt = r.b_finalized_receipt as BFinalizedReceipt;
-  verifyBFinalizedReceipt(resolver, receipt);
-  return { generationId: String(r.active_generation_id), checkpointSeq: vInt(r.checkpoint_seq, 'checkpoint_seq', 1, MAX_SEQ), headDigest: vHeadDigest(r.head_digest, 'head_digest'), stateDigest: vHeadDigest(r.state_digest, 'state_digest'), receipt };
+  return bDb.transaction(async (exec) => {
+    await enterSourceTx(exec, schema);
+    await attestReceiver(exec);
+    const r = (await exec.query('SELECT active_generation_id, checkpoint_seq, head_digest, state_digest, b_finalized_receipt FROM tsk_receiver_pointer WHERE stream_id=$1', [s])).rows[0];
+    if (!r) return null;
+    const receipt = r.b_finalized_receipt as BFinalizedReceipt;
+    verifyBFinalizedReceipt(resolver, receipt);
+    const generationId = String(r.active_generation_id), checkpointSeq = vInt(r.checkpoint_seq, 'checkpoint_seq', 1, MAX_SEQ);
+    const headDigest = vHeadDigest(r.head_digest, 'head_digest'), stateDigest = vHeadDigest(r.state_digest, 'state_digest');
+    if (receipt.streamId !== s || receipt.generationId !== generationId || receipt.n !== checkpointSeq || receipt.signedHeadDigestAtN !== headDigest || receipt.sourceStateDigestAtN !== stateDigest) {
+      throw new SourceFenceQuarantineError('receiver pointer fields do not match the stored BFinalizedReceipt — quarantine');
+    }
+    return { generationId, checkpointSeq, headDigest, stateDigest, receipt };
+  });
 }

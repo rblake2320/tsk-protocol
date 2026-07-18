@@ -119,7 +119,11 @@ export {
   TSK_RECEIVER_TABLES,
   RECEIVER_MANIFEST_DIGEST,
   attestReceiver,
+  assertReceiverReady,
+  requireReceiverReady,
   verifyBFinalizedReceipt,
+  stageReceiverExport,
+  finalizeReceiverGeneration,
   stageAndFinalizeReceiverGeneration,
   readReceiverPointer,
 } from './tsk-source-fence.js';
@@ -144,7 +148,9 @@ export type {
   SourceExportOptions,
   GuardCountersignOptions,
   BFinalizedReceipt,
+  ReceiverVerifyOptions,
   ReceiverFinalizeOptions,
+  SourceReceiverReadyToken,
   SourceLiveState,
   WitnessState as SourceWitnessState,
 } from './tsk-source-fence.js';

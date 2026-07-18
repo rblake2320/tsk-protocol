@@ -1,11 +1,12 @@
 /**
- * PR2b-2 (§3) — receiver B: isolated staging, strict replay/verify, ONE atomic finalize.
- * Real PG16 x2 (independent A and B instances, distinct system_identifier). Proves: A freezes at N and
- * builds a guard-countersigned export; B verifies BOTH signatures + the frozen binding + the bundle
- * root + INDEPENDENTLY replays 1..N + materializes state-at-N + asserts B's system_identifier is
- * distinct from A/control; then constructs + signs the BFinalizedReceipt and installs it atomically
- * (checkpoint/head/state + pointer flip + stored receipt). Negatives: not-distinct B, tampered guard
- * sig, wrong expected command, idempotent re-finalize, refusal to re-flip a different generation.
+ * PR2b-2 (§3) — receiver B: PERSISTENT isolated staging, strict replay/verify, ONE atomic finalize.
+ * Real PG16 x2 (independent A and B, distinct system_identifier). A freezes at N and builds a
+ * guard-countersigned export (now binding A's real PG system_identifier). B stages the manifest+chunks
+ * into an isolated candidate generation (persisted, crash-resumable, exact-duplicate-ok, same-ordinal
+ * conflict-reject), then finalizes: rebuilds FROM STAGING, re-verifies both signatures + bundle bind +
+ * independent replay, asserts B's system_identifier is distinct from the SIGNED source id + a validated
+ * control set, and installs the BFinalizedReceipt atomically. Negatives: not-distinct (signed A + control
+ * set + empty/dup), staging conflict, tampered guard sig, wrong command, refuse-different-generation.
  *
  * Env: TSK_TEST_SOURCE_PG_URL_A (A) + TSK_TEST_RECEIVER_PG_URL_B (B). #10 stays OPEN.
  */
@@ -17,7 +18,8 @@ import {
   PgTskDurableOutbox, NodePostgresTransactor, ContractValidationError,
   signLeaseGrant, installLeaseGrant, assertSourceFenceReady, emitSourceFrozenReceipt,
   buildSourceExportManifest, guardCountersignSourceExport,
-  stageAndFinalizeReceiverGeneration, verifyBFinalizedReceipt, readReceiverPointer, SourceFenceQuarantineError,
+  assertReceiverReady, stageReceiverExport, finalizeReceiverGeneration, stageAndFinalizeReceiverGeneration,
+  verifyBFinalizedReceipt, readReceiverPointer, SourceFenceQuarantineError,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation,
   type TskHotpMutation, type SourceVerifyKeyResolver, type SourceExportBundle, type GuardCountersignedExport,
 } from './packages/server/dist/index.js';
@@ -42,7 +44,7 @@ async function check(name: string, fn: () => Promise<void>) { await fn(); passed
 const clone = <T,>(x: T): T => JSON.parse(JSON.stringify(x)) as T;
 
 async function main() {
-  console.log('# TSK PR2b-2 receiver-B stage/replay/verify + atomic finalize drill (real A-PG + B-PG)');
+  console.log('# TSK PR2b-2 receiver-B persistent-staging + atomic finalize drill (real A-PG + B-PG)');
   const aPool = new pg.Pool({ connectionString: A_URL, max: 4 }); aPool.on('error', () => {});
   const bPool = new pg.Pool({ connectionString: B_URL, max: 4 }); bPool.on('error', () => {});
   const aTx = new NodePostgresTransactor(aPool as never) as unknown as PgTransactor;
@@ -54,13 +56,17 @@ async function main() {
   const READY = await provisionSchemaVersion(aTx, SCHEMA);
   await bPool.query(`DROP TABLE IF EXISTS ${TSK_RECEIVER_TABLES.join(', ')} CASCADE`);
   for (const s of TSK_RECEIVER_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await bPool.query(s);
+  // also install the receiver catalog on A-PG so we can exercise the SIGNED-source-id distinctness check
+  await aPool.query(`DROP TABLE IF EXISTS ${TSK_RECEIVER_TABLES.join(', ')} CASCADE`);
+  for (const s of TSK_RECEIVER_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await aPool.query(s);
 
   const aSysId = String((await aPool.query('SELECT system_identifier::text AS s FROM pg_control_system()')).rows[0].s);
   const bSysId = String((await bPool.query('SELECT system_identifier::text AS s FROM pg_control_system()')).rows[0].s);
   assert.notEqual(aSysId, bSysId, 'A and B must be independent instances');
+  const bReady = await assertReceiverReady(bTx, SCHEMA);
+  const aReady = await assertReceiverReady(aTx, SCHEMA);
   const nowMs = async () => Number((await aPool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
 
-  // A: grow a stream to N=6 (T1=3, T2=6, T3=9), revoke, freeze, export, guard-countersign
   const SID = 'tsk:pair:recv/v1';
   await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [SID]);
   await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [SID, 'e1']);
@@ -73,45 +79,91 @@ async function main() {
   await aTx.transaction((exec) => installLeaseGrant(exec, resolver, rev));
   const frozen = await emitSourceFrozenReceipt(aTx, SCHEMA, { sourceKeyId: SOURCE_KEY, sourcePrivateKey: sourceSecret, leaseResolver: resolver, headResolver: resolver }, { streamId: SID, commandId: 'promote-1', epoch: 0, sourceNodeId: 'A' });
   const built = await buildSourceExportManifest(aTx, SCHEMA, { streamId: SID, epoch: 0, commandId: 'promote-1', sourceNodeId: 'A' }, { sourceKeyId: SOURCE_KEY, sourcePrivateKey: sourceSecret, sanitizer, leaseResolver: resolver, headResolver: resolver, frozenReceipt: frozen, maxChunkItems: 4 });
+  assert.equal(built.manifest.sourceSystemId, aSysId, 'manifest binds A real system_identifier');
   const bundle: SourceExportBundle = built.bundle;
   const dual: GuardCountersignedExport = guardCountersignSourceExport(bundle, built.manifest, { guardKeyId: GUARD_KEY, guardPrivateKey: guardSecret, sanitizer, sourceManifestResolver: resolver, headResolver: resolver, frozenResolver: resolver, frozenReceipt: frozen, expectedCommandId: 'promote-1' });
 
-  const ropts = { sanitizer, sourceResolver: resolver, guardResolver: resolver, headResolver: resolver, frozenResolver: resolver, bVerifyResolver: resolver, frozenReceipt: frozen, expectedCommandId: 'promote-1', bKeyId: B_KEY, bPrivateKey: bSecret, distinctFromSystemIds: [aSysId] };
+  const CONTROL = ['control-sysid-1'];
+  const ropts = { sanitizer, sourceResolver: resolver, guardResolver: resolver, headResolver: resolver, frozenResolver: resolver, bVerifyResolver: resolver, frozenReceipt: frozen, expectedCommandId: 'promote-1', bKeyId: B_KEY, bPrivateKey: bSecret, controlSystemIds: CONTROL };
 
-  await check('B stages + INDEPENDENTLY replays + atomically finalizes; BFinalizedReceipt binds the manifest', async () => {
-    const receipt = await stageAndFinalizeReceiverGeneration(bTx, SCHEMA, 'gen-1', bundle, dual, ropts);
+  await check('B stage+finalize; BFinalizedReceipt binds the manifest + A/B system_identifiers', async () => {
+    const receipt = await stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-1', bundle, dual, ropts);
     verifyBFinalizedReceipt(resolver, receipt);
-    assert.equal(receipt.n, 6); assert.equal(receipt.generationId, 'gen-1'); assert.equal(receipt.bSystemId, bSysId);
-    assert.equal(receipt.manifestDigest, dual.canonicalDigest); assert.equal(receipt.manifestRoot, dual.manifestRoot);
-    assert.equal(receipt.signedHeadDigestAtN, frozen.signedHeadDigestAtN); assert.equal(receipt.sourceStateDigestAtN, frozen.sourceStateDigestAtN);
+    assert.equal(receipt.n, 6); assert.equal(receipt.generationId, 'gen-1'); assert.equal(receipt.bSystemId, bSysId); assert.equal(receipt.sourceSystemId, aSysId);
+    assert.equal(receipt.manifestDigest, dual.canonicalDigest); assert.equal(receipt.signedHeadDigestAtN, frozen.signedHeadDigestAtN);
   });
 
-  await check('the installed pointer + materialized state@N are readable and verified', async () => {
-    const ptr = await bTx.transaction((exec) => readReceiverPointer(exec, resolver, SID));
-    assert.ok(ptr); assert.equal(ptr!.checkpointSeq, 6); assert.equal(ptr!.headDigest, frozen.signedHeadDigestAtN);
+  await check('(H4) OWNED read: pointer + materialized state@N are verified + bound to the stored receipt', async () => {
+    const ptr = await readReceiverPointer(bTx, SCHEMA, bReady, resolver, SID);
+    assert.ok(ptr); assert.equal(ptr!.checkpointSeq, 6); assert.equal(ptr!.headDigest, frozen.signedHeadDigestAtN); assert.equal(ptr!.receipt.generationId, 'gen-1');
     const st = (await bPool.query('SELECT tumbler_id, hotp_counter FROM tsk_receiver_state WHERE stream_id=$1 AND generation_id=$2 ORDER BY tumbler_id', [SID, 'gen-1'])).rows;
     assert.deepEqual(st.map((r) => [String(r.tumbler_id), Number(r.hotp_counter)]), [['T1', 3], ['T2', 6], ['T3', 9]]);
   });
 
-  await check('re-finalize the SAME generation is idempotent (returns the stored receipt; no double-flip)', async () => {
-    const again = await stageAndFinalizeReceiverGeneration(bTx, SCHEMA, 'gen-1', bundle, dual, ropts);
+  await check('re-finalize the SAME generation is idempotent (stored receipt; no double install)', async () => {
+    const again = await stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-1', bundle, dual, ropts);
     verifyBFinalizedReceipt(resolver, again);
-    const cnt = Number((await bPool.query('SELECT count(*)::int n FROM tsk_receiver_generation WHERE stream_id=$1', [SID])).rows[0].n);
-    assert.equal(cnt, 1, 'no duplicate generation installed');
+    assert.equal(Number((await bPool.query('SELECT count(*)::int n FROM tsk_receiver_generation WHERE stream_id=$1', [SID])).rows[0].n), 1);
   });
 
   await check('B REFUSES to flip a DIFFERENT generation once a stream is installed', async () => {
-    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, 'gen-2', bundle, dual, ropts), /already at a DIFFERENT generation|refusing to re-flip/);
+    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-2', bundle, dual, ropts), /already at a DIFFERENT generation|refusing to re-flip/);
   });
 
-  await check('B REJECTS a bundle whose system_identifier is NOT distinct from A/control', async () => {
-    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, 'gen-x', bundle, dual, { ...ropts, distinctFromSystemIds: [aSysId, bSysId] }), /NOT distinct/);
+  await check('(H2) STAGE then FINALIZE are separate durable steps (crash-resume: finalize rebuilds from persisted staging)', async () => {
+    const S2 = 'tsk:pair:recv2/v1';
+    await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [S2]);
+    await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [S2, 'e1']);
+    const g2 = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: S2, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'g2', leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 1, prevGrantDigest: null });
+    await aTx.transaction((exec) => installLeaseGrant(exec, resolver, g2));
+    const rdy2 = await assertSourceFenceReady(aTx, SCHEMA, resolver, { streamId: S2, holderNodeId: 'A', leaseId: 'l1', grantDigest: g2.grantDigest });
+    const ob2 = new PgTskDurableOutbox(aTx, READY, { streamId: S2, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready: rdy2 });
+    await ob2.withOutboxTx((tx) => ob2.appendInTx(tx, { streamId: S2, rawMutation: { tumblerId: 'X', counter: 7 }, fenceToken: 0n }));
+    const rev2 = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: S2, leaseEpoch: 0, leaseStatus: 'revoked', holderNodeId: 'A', leaseId: 'l1', commandId: 'promote-2', leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 2, prevGrantDigest: g2.grantDigest });
+    await aTx.transaction((exec) => installLeaseGrant(exec, resolver, rev2));
+    const fr2 = await emitSourceFrozenReceipt(aTx, SCHEMA, { sourceKeyId: SOURCE_KEY, sourcePrivateKey: sourceSecret, leaseResolver: resolver, headResolver: resolver }, { streamId: S2, commandId: 'promote-2', epoch: 0, sourceNodeId: 'A' });
+    const b2 = await buildSourceExportManifest(aTx, SCHEMA, { streamId: S2, epoch: 0, commandId: 'promote-2', sourceNodeId: 'A' }, { sourceKeyId: SOURCE_KEY, sourcePrivateKey: sourceSecret, sanitizer, leaseResolver: resolver, headResolver: resolver, frozenReceipt: fr2 });
+    const d2 = guardCountersignSourceExport(b2.bundle, b2.manifest, { guardKeyId: GUARD_KEY, guardPrivateKey: guardSecret, sanitizer, sourceManifestResolver: resolver, headResolver: resolver, frozenResolver: resolver, frozenReceipt: fr2, expectedCommandId: 'promote-2' });
+    const r2 = { ...ropts, frozenReceipt: fr2, expectedCommandId: 'promote-2' };
+    await stageReceiverExport(bTx, SCHEMA, bReady, 'gen-s2', b2.bundle, d2, r2);
+    // staged but not installed: no pointer yet
+    assert.equal((await readReceiverPointer(bTx, SCHEMA, bReady, resolver, S2)), null);
+    await stageReceiverExport(bTx, SCHEMA, bReady, 'gen-s2', b2.bundle, d2, r2); // idempotent re-stage (exact duplicate ok)
+    const rec = await finalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-s2', r2); // finalize rebuilds FROM STAGING
+    verifyBFinalizedReceipt(resolver, rec); assert.equal(rec.n, 1);
+    const staged = (await bPool.query("SELECT status FROM tsk_receiver_stage WHERE stream_id=$1 AND generation_id=$2", [S2, 'gen-s2'])).rows[0];
+    assert.equal(String(staged.status), 'installed', 'generation sealed after finalize');
+  });
+
+  await check('(H2) staging CONFLICT: re-staging a generation with a DIFFERENT manifest / chunk digest is rejected', async () => {
+    const badBundle = clone(bundle); badBundle.historyChunks[0].byteDigest = 'a'.repeat(64); // tamper a chunk digest
+    // re-stage gen-1 (already staged with the real digest) with a conflicting chunk digest
+    await assert.rejects(() => stageReceiverExport(bTx, SCHEMA, bReady, 'gen-1', badBundle, dual, ropts), /re-stage chunk .* digest conflict|declared byteDigest != recomputed/);
+  });
+
+  await check('(H3) B system_identifier NOT distinct — from the SIGNED source id (finalize on A-PG) or the control set', async () => {
+    // running finalize where B's PG IS A's PG → bSystemId == manifest.sourceSystemId (signed) → rejected
+    await assert.rejects(() => stageAndFinalizeReceiverGeneration(aTx, SCHEMA, aReady, 'gen-onA', bundle, dual, ropts), /== the signed source system_identifier|NOT distinct/);
+    // B in the control set → rejected
+    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-ctl', bundle, dual, { ...ropts, controlSystemIds: [bSysId] }), /in the control set|NOT distinct/);
+    // empty / duplicate control authorities → rejected
+    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-empty', bundle, dual, { ...ropts, controlSystemIds: [] }), /empty/);
+    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-dup', bundle, dual, { ...ropts, controlSystemIds: ['x', 'x'] }), /duplicates/);
   });
 
   await check('B REJECTS a tampered GUARD signature and a wrong expected command', async () => {
     const badGuard = clone(dual); badGuard.guardSignature = 'AAAA';
-    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, 'gen-y', bundle, badGuard, ropts), /invalid signature|guard/);
-    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, 'gen-z', bundle, dual, { ...ropts, expectedCommandId: 'other' }), /!= caller-expected command/);
+    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-badsig', bundle, badGuard, ropts), /invalid signature|guard/);
+    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-badcmd', bundle, dual, { ...ropts, expectedCommandId: 'other' }), /!= caller-expected command/);
+  });
+
+  await check('(H1) the installed state is decoupled from caller memory — mutating the caller bundle/manifest after finalize does not change the stored receipt', async () => {
+    const before = await readReceiverPointer(bTx, SCHEMA, bReady, resolver, SID);
+    // caller mutates its own objects AFTER the finalize snapshot — the stored, verified receipt is unaffected
+    (bundle.historyChunks[0].records[0] as { payload: string }).payload = '{"tumblerId":"EVIL","counter":9999}';
+    (dual as { signedHeadDigestAtN: string }).signedHeadDigestAtN = 'f'.repeat(64);
+    const after = await readReceiverPointer(bTx, SCHEMA, bReady, resolver, SID);
+    assert.deepEqual(after!.receipt, before!.receipt, 'stored receipt unchanged by post-hoc caller mutation');
   });
 
   console.log(`\n# ${passed} PR2b-2 receiver checks passed`);
