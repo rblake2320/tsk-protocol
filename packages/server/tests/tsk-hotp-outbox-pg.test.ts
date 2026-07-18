@@ -16,7 +16,7 @@ import {
   GENESIS_HEAD,
   PgTskReceiverCheckpoint,
   StreamHeadVerificationUnavailableError,
-  __unsafeMintReadyTokenForTests,
+  __internalUnsafeMintReadyToken,
   type HotpApplier,
   type PgExecutor,
   type PgTransactor,
@@ -100,7 +100,7 @@ describe('PgTskReceiverCheckpoint — HOTP exactly-once + signed hash-linked hea
   const apply = (r: { record: OutboxRecord<TskHotpMutation>; head: SignedStreamHead }) => rcv.verifyAndApplyTumblerDelivered(r.record, r.head);
   beforeEach(() => {
     db = new MemoryTskPg(); db.provision(SID); applied.length = 0;
-    rcv = new PgTskReceiverCheckpoint(db, SID, sanitizer, headVerifier, applier, __unsafeMintReadyTokenForTests(db, 'public'));
+    rcv = new PgTskReceiverCheckpoint(db, SID, sanitizer, headVerifier, applier, __internalUnsafeMintReadyToken(db, 'public'));
   });
 
   it('applies a fresh in-order record; advances checkpoint (seq+head) and consumes the HOTP counter', async () => {
@@ -121,7 +121,7 @@ describe('PgTskReceiverCheckpoint — HOTP exactly-once + signed hash-linked hea
 
   it('signed head: a TYPED unavailability error retries (re-thrown), does NOT apply/ack/quarantine', async () => {
     const flaky: StreamHeadVerifier = { async verify() { throw new StreamHeadVerificationUnavailableError('HSM offline'); } };
-    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, flaky, applier, __unsafeMintReadyTokenForTests(db, 'public'));
+    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, flaky, applier, __internalUnsafeMintReadyToken(db, 'public'));
     const r = mkRecordHead(1, { tumblerId: 'T1', counter: 1 }, GENESIS_HEAD);
     await expect(r2.verifyAndApplyTumblerDelivered(r.record, r.head)).rejects.toBeInstanceOf(StreamHeadVerificationUnavailableError);
     expect(db.rcvOf(SID).seq).toBe(0); // not applied, not rejected — retry
@@ -130,7 +130,7 @@ describe('PgTskReceiverCheckpoint — HOTP exactly-once + signed hash-linked hea
 
   it('signed head: an UNKNOWN/untyped verifier exception FAILS CLOSED (reject-fork, no ack, no retry loop)', async () => {
     const chaos: StreamHeadVerifier = { async verify() { throw new TypeError('unexpected boom'); } };
-    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, chaos, applier, __unsafeMintReadyTokenForTests(db, 'public'));
+    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, chaos, applier, __internalUnsafeMintReadyToken(db, 'public'));
     const r = mkRecordHead(1, { tumblerId: 'T1', counter: 1 }, GENESIS_HEAD);
     expect(await r2.verifyAndApplyTumblerDelivered(r.record, r.head)).toBe('reject-fork');
     expect(db.rcvOf(SID).seq).toBe(0);
@@ -204,5 +204,25 @@ describe('PgTskReceiverCheckpoint — HOTP exactly-once + signed hash-linked hea
     const olderFork = mkRecordHead(1, { tumblerId: 'T1', counter: 99 }, GENESIS_HEAD);
     // seq1 already applied with a different opDigest (different counter) -> fork
     expect(await apply(olderFork)).toBe('reject-fork');
+  });
+
+  it('(TOCTOU) mutating the caller record DURING headVerifier.verify does NOT change what is applied/consumed', async () => {
+    const r = mkRecordHead(1, { tumblerId: 'T1', counter: 5 }, GENESIS_HEAD);
+    // an attacker mutates the caller-owned record object mid-verification, then the
+    // (unchanged) head signature still verifies. The receiver must apply/consume the
+    // ORIGINAL snapshot value (5/T1), never the mutated evil value.
+    const mutatingVerifier: StreamHeadVerifier = {
+      async verify(head) {
+        (r.record.mutation as { counter: number; tumblerId: string }).counter = 999;
+        (r.record.mutation as { counter: number; tumblerId: string }).tumblerId = 'EVIL';
+        const ok = edVerify(null, Buffer.from(head.headDigest, 'utf8'), publicKey as KeyObject, Buffer.from(head.signature, 'base64url'));
+        if (!ok) throw new ContractValidationError('bad');
+      },
+    };
+    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, mutatingVerifier, applier, __internalUnsafeMintReadyToken(db, 'public'));
+    expect(await r2.verifyAndApplyTumblerDelivered(r.record, r.head)).toBe('applied');
+    expect(applied).toEqual(['1:T1:5']);          // ORIGINAL applied, not 999/EVIL
+    expect(db.hotpOf(SID, 'T1')).toBe(5);          // ORIGINAL counter consumed
+    expect(db.hotpOf(SID, 'EVIL')).toBeUndefined();
   });
 });

@@ -108,6 +108,7 @@ const ackVerifier: TskAckReceiptVerifier = { async verify(receipt, record) { if 
 
 async function applyDDL() { for (const s of TSK_OUTBOX_PG_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s); }
 async function resetSchema() {
+  await pool.query('DROP SCHEMA IF EXISTS tsk_alt CASCADE');
   await pool.query('DROP TABLE IF EXISTS tsk_outbox_rows, tsk_outbox_applied, tsk_outbox_fence, tsk_outbox_source_checkpoint, tsk_outbox_receiver_checkpoint, tsk_outbox_publisher_lease, tsk_outbox_quarantine, tsk_hotp_consumed, tsk_outbox_meta CASCADE');
   await applyDDL();
   READY = await provisionSchemaVersion(serial, SCHEMA);
@@ -252,6 +253,58 @@ async function main() {
     const other = new RealPg('SERIALIZABLE');
     assert.throws(() => new PgTskDurableOutbox(other, READY, { streamId: 's/v1', sanitizer, signer, maxPendingRows: 1, backpressure: 'quarantine' }), /different PgTransactor/);
     assert.throws(() => new PgTskDurableOutbox(serial, {} as SchemaReadyToken, { streamId: 's/v1', sanitizer, signer, maxPendingRows: 1, backpressure: 'quarantine' }), /forged or foreign/);
+  });
+
+  await check('(TOCTOU) append: mutating the raw mutation during signer.sign does not change stored/digested/signed bytes', async () => {
+    const sid = 'tsk:toctou-append/v1'; await provision(sid);
+    const raw = { tumblerId: 'T1', counter: 5 };
+    const mutatingSigner: StreamHeadSigner = { keyId: KEY_ID, alg: 'ed25519', async sign(hd) { raw.tumblerId = 'EVIL'; raw.counter = 999; return edSign(null, Buffer.from(hd, 'utf8'), privateKey).toString('base64url'); } };
+    const ob = new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mutatingSigner, maxPendingRows: 100, backpressure: 'quarantine' });
+    const { head } = await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: raw, fenceToken: 0n }));
+    const row = (await pool.query('SELECT tumbler_id, hotp_counter, mutation, op_digest FROM tsk_outbox_rows WHERE stream_id=$1', [sid])).rows[0];
+    assert.equal(row.tumbler_id, 'T1'); assert.equal(Number(row.hotp_counter), 5);
+    assert.deepEqual(row.mutation, { tumblerId: 'T1', counter: 5 }); // ORIGINAL, not EVIL/999
+    assert.equal(head.opDigest, row.op_digest);
+  });
+
+  await check('(TOCTOU) publisher: mutating the ACK receipt during ackVerifier.verify cannot flip the decision to acked', async () => {
+    const sid = 'tsk:toctou-ack/v1'; await provision(sid);
+    const ob = mkOutbox(serial, sid);
+    await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 1 }, fenceToken: 0n }));
+    let original: TskAckReceipt;
+    const transport: TskOutboxTransport = { async deliverAndAwaitAck(record) { original = { streamId: record.streamId, sourceEpoch: record.sourceEpoch, sequence: record.sequence, opDigest: record.opDigest, decision: 'reject-fork', receiverId: RID, keyId: KEY_ID, issuedAt: 'now', signature: ackSign(record, 'reject-fork') }; return original; } };
+    const flippingVerifier: TskAckReceiptVerifier = { async verify(receipt, record) { original.decision = 'applied'; if (receipt.signature !== ackSign(record, receipt.decision)) throw new ContractValidationError('bad'); } };
+    const res = await new PgTskPublisher(serial, sid, transport, 'quarantine', sanitizer, flippingVerifier, READY, { leaseMs: 30_000 }).drainOnce();
+    assert.equal(res.acked, 0); assert.equal(res.quarantined, 1); assert.equal(res.halted, true); // acted on the frozen reject-fork snapshot
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM tsk_outbox_rows WHERE stream_id=$1 AND acked_at IS NOT NULL', [sid])).rows[0].n), 0);
+  });
+
+  await check('(MED) durable stream halt: terminal quarantine halts the stream; drain refuses (no spin); operator clears to recover', async () => {
+    const sid = 'tsk:halt/v1'; await provision(sid);
+    const ob = mkOutbox(serial, sid);
+    for (const cnt of [1, 2]) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: cnt }, fenceToken: 0n }));
+    const forkTransport: TskOutboxTransport = { async deliverAndAwaitAck(record) { return { streamId: record.streamId, sourceEpoch: record.sourceEpoch, sequence: record.sequence, opDigest: record.opDigest, decision: 'reject-fork', receiverId: RID, keyId: KEY_ID, issuedAt: 'now', signature: ackSign(record, 'reject-fork') }; } };
+    const pub = new PgTskPublisher(serial, sid, forkTransport, 'quarantine', sanitizer, ackVerifier, READY, { leaseMs: 30_000 });
+    const r1 = await pub.drainOnce();
+    assert.equal(r1.quarantined, 1); assert.equal(r1.halted, true);
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM tsk_outbox_stream_halted WHERE stream_id=$1', [sid])).rows[0].n), 1);
+    const r2 = await pub.drainOnce(); // refuses — no spin, no reject-gap
+    assert.deepEqual(r2, { published: 0, acked: 0, quarantined: 0, retriable: false, halted: true });
+    await pool.query('DELETE FROM tsk_outbox_stream_halted WHERE stream_id=$1', [sid]); // operator recovery
+    const r3 = await new PgTskPublisher(serial, sid, receiverTransport(sid, []), 'quarantine', sanitizer, ackVerifier, READY, { leaseMs: 30_000 }).drainOnce();
+    assert.equal(r3.halted, false); // gate cleared
+  });
+
+  await check('(MED) schema grammar: a valid lowercase non-public schema attests; invalid identifiers are rejected', async () => {
+    await assert.rejects(() => assertSchemaReady(serial, 'Bad$Schema'), /invalid schema identifier/);
+    await assert.rejects(() => assertSchemaReady(serial, '1abc'), /invalid schema identifier/);
+    const c = await pool.connect();
+    await c.query('DROP SCHEMA IF EXISTS tsk_alt CASCADE'); await c.query('CREATE SCHEMA tsk_alt'); await c.query('SET search_path=tsk_alt');
+    for (const s of TSK_OUTBOX_PG_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await c.query(s);
+    await c.query('RESET search_path'); c.release();
+    const readyAlt = await provisionSchemaVersion(serial, 'tsk_alt'); // attests tsk_alt -> stripSchema must handle 'tsk_alt.'
+    assert.ok(readyAlt);
+    await pool.query('DROP SCHEMA IF EXISTS tsk_alt CASCADE');
   });
 
   console.log(`\n# ${passed} checks passed`);

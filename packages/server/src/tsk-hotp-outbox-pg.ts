@@ -129,14 +129,58 @@ function affectedOne(res: { rowCount: number }, label: string): void {
   if (res.rowCount !== 1) throw new ContractValidationError(`${label}: expected exactly 1 affected row, got ${res.rowCount}`);
 }
 
+// ── (TOCTOU) immutable canonical snapshots of UNTRUSTED, caller-owned objects ──
+// A verified digest/signature is meaningless if the object it covers can be
+// mutated across a later `await`. Every method that verifies-then-uses an object
+// takes a deep-cloned, field-restricted, DEEP-FROZEN snapshot SYNCHRONOUSLY at
+// entry (before its first await) and uses ONLY the snapshot afterward.
+
+function deepFreeze<T>(o: T): T {
+  if (o && typeof o === 'object') { for (const v of Object.values(o as Record<string, unknown>)) deepFreeze(v); Object.freeze(o); }
+  return o;
+}
+/** Frozen snapshot of an OutboxRecord — copies ONLY the known fields (no extra /
+ *  prototype-inherited props), asserts shape, and deep-freezes. */
+function snapshotRecord(r: OutboxRecord<TskHotpMutation>): OutboxRecord<TskHotpMutation> {
+  if (!r || typeof r !== 'object') throw new ContractValidationError('record is not an object');
+  const m = r.mutation as unknown as { tumblerId?: unknown; counter?: unknown } | null;
+  if (!m || typeof m !== 'object') throw new ContractValidationError('record.mutation is not an object');
+  return deepFreeze({
+    contractVersion: r.contractVersion, streamId: r.streamId, sourceEpoch: r.sourceEpoch,
+    sequence: r.sequence, fenceToken: r.fenceToken, opDigest: r.opDigest,
+    mutation: { tumblerId: m.tumblerId, counter: m.counter } as SanitizedMutation<TskHotpMutation>,
+  }) as OutboxRecord<TskHotpMutation>;
+}
+function snapshotHead(h: SignedStreamHead): SignedStreamHead {
+  if (!h || typeof h !== 'object') throw new ContractValidationError('head is not an object');
+  return deepFreeze({
+    streamId: h.streamId, sequence: h.sequence, prevHeadDigest: h.prevHeadDigest, opDigest: h.opDigest,
+    keyId: h.keyId, alg: h.alg, headDigest: h.headDigest, signature: h.signature,
+  }) as SignedStreamHead;
+}
+function snapshotAckReceipt(r: TskAckReceipt): TskAckReceipt {
+  if (!r || typeof r !== 'object') throw new ContractValidationError('ack receipt is not an object');
+  for (const k of ['streamId', 'sourceEpoch', 'opDigest', 'decision', 'receiverId', 'keyId', 'issuedAt', 'signature'] as const) {
+    if (typeof (r as unknown as Record<string, unknown>)[k] !== 'string') throw new ContractValidationError(`ack receipt field ${k} invalid`);
+  }
+  if (!Number.isInteger(r.sequence)) throw new ContractValidationError('ack receipt sequence invalid');
+  return deepFreeze({
+    streamId: r.streamId, sourceEpoch: r.sourceEpoch, sequence: r.sequence, opDigest: r.opDigest,
+    decision: r.decision, receiverId: r.receiverId, keyId: r.keyId, issuedAt: r.issuedAt, signature: r.signature,
+  }) as TskAckReceipt;
+}
+
 async function assertSerializable(exec: PgExecutor): Promise<void> {
   const rows = (await exec.query('SHOW transaction_isolation')).rows;
   const level = String(rows[0]?.transaction_isolation ?? '').toLowerCase();
   if (level !== 'serializable') throw new ContractValidationError(`critical tx requires SERIALIZABLE isolation; got '${level}'`);
 }
 
+/** (MED) NARROWED to lowercase unquoted-identifier chars only, so it matches
+ *  both current_schema() (PostgreSQL folds unquoted identifiers to lowercase) AND
+ *  the manifest index-def schema-strip (`\w+`) — no `$`/uppercase mismatch. */
 function assertSchemaIdentifier(schema: string): void {
-  if (!/^[A-Za-z_][A-Za-z0-9_$]{0,62}$/.test(schema)) throw new ContractValidationError(`invalid schema identifier: ${schema}`);
+  if (!/^[a-z_][a-z0-9_]{0,62}$/.test(schema)) throw new ContractValidationError(`invalid schema identifier (lowercase unquoted only): ${schema}`);
 }
 
 /** PIN the schema for THIS tx: SET LOCAL search_path (parameterized) then assert
@@ -301,6 +345,20 @@ CREATE TABLE IF NOT EXISTS tsk_hotp_consumed (
   last_counter  bigint NOT NULL CHECK (last_counter >= 1 AND last_counter <= 2147483647),
   PRIMARY KEY (stream_id, tumbler_id)
 );
+-- DURABLE stream-halt marker: a terminal (fork/stale/unsanitized/epoch) rejection
+-- is a divergence that cannot be auto-recovered — the quarantined sequence would
+-- otherwise leave every later sequence a permanent reject-gap. Writing this row in
+-- the same tx as the quarantine makes the halt DURABLE and EXPLICIT: the publisher
+-- refuses to drain a halted stream (no spin) until an operator investigates and
+-- deletes this row (recovery is a governed, out-of-band operator action).
+CREATE TABLE IF NOT EXISTS tsk_outbox_stream_halted (
+  stream_id     text PRIMARY KEY CHECK (length(stream_id) BETWEEN 1 AND 512),
+  source_epoch  text NOT NULL CHECK (length(source_epoch) BETWEEN 1 AND 512),
+  sequence      bigint NOT NULL CHECK (sequence >= 1 AND sequence <= 9007199254740991),
+  op_digest     text NOT NULL CHECK (op_digest ~ '^[0-9a-f]{64}$'),
+  decision      text NOT NULL,
+  halted_at     timestamptz NOT NULL DEFAULT now()
+);
 `;
 
 /** Tables in the attestation scope. */
@@ -308,11 +366,12 @@ const TSK_OUTBOX_TABLES = [
   'tsk_outbox_meta', 'tsk_outbox_fence', 'tsk_outbox_source_checkpoint',
   'tsk_outbox_receiver_checkpoint', 'tsk_outbox_rows', 'tsk_outbox_publisher_lease',
   'tsk_outbox_quarantine', 'tsk_outbox_applied', 'tsk_hotp_consumed',
+  'tsk_outbox_stream_halted',
 ] as const;
 
 /** Pinned catalog manifest — recompute via schemaManifest() on a PG-major bump.
  *  (Placeholder; the real-PG manifest-pin test asserts and reports the value.) */
-export const TSK_OUTBOX_SCHEMA_MANIFEST = 'cacfbe6d29dee67c87df244d3041df72096e2d069427911df62dc3b5572b50b6';
+export const TSK_OUTBOX_SCHEMA_MANIFEST = 'c1972f05a816b44127b365e138753aeef3afe2ed4f8d53cd1d0070ee46311f0d';
 
 export async function schemaManifest(exec: PgExecutor): Promise<string> {
   const tables = TSK_OUTBOX_TABLES as unknown as string[];
@@ -378,8 +437,15 @@ function requireReady(token: SchemaReadyToken, db?: PgTransactor): string {
   if (st.manifest !== TSK_OUTBOX_SCHEMA_MANIFEST || st.version !== TSK_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError('schema-readiness token attests a different manifest/version');
   return st.schema;
 }
-/** TEST-ONLY: mint a readiness token WITHOUT a live attestation (hermetic fakes). */
-export function __unsafeMintReadyTokenForTests(db: PgTransactor, schema: string): SchemaReadyToken {
+/**
+ * @internal — NOT part of the public package API. It is deliberately EXCLUDED
+ * from the package index (`index.ts` uses explicit named exports and omits this),
+ * so `import { ... } from '@tsk/server'` cannot mint an unattested token. It is
+ * imported test-only via the module path by the hermetic suite, which uses an
+ * in-memory fake transactor that cannot perform a real catalog attestation.
+ * NEVER call this in production — it bypasses the attestation the real gate does.
+ */
+export function __internalUnsafeMintReadyToken(db: PgTransactor, schema: string): SchemaReadyToken {
   assertSchemaIdentifier(schema);
   return mintReadyToken({ db, schema, manifest: TSK_OUTBOX_SCHEMA_MANIFEST, version: TSK_OUTBOX_SCHEMA_VERSION });
 }
@@ -391,8 +457,17 @@ async function assertVersionInTx(exec: PgExecutor): Promise<void> {
   if (found !== TSK_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError(`tsk_outbox schema version mismatch: db=${found} expected=${TSK_OUTBOX_SCHEMA_VERSION}`);
 }
 
-/** RUNTIME READINESS GATE: full manifest attestation + version, in the pinned
- *  schema, minting a transactor+schema-bound unforgeable token. */
+/**
+ * RUNTIME READINESS GATE: full manifest attestation + version, in the pinned
+ * schema, minting a transactor+schema-bound unforgeable token.
+ *
+ * (MED) Readiness is POINT-IN-TIME. The token attests the schema at mint time; it
+ * cannot prevent a later DDL change. Preserving it at runtime is a database
+ * privilege-separation responsibility: the runtime DB role used by the transactor
+ * MUST NOT hold DDL/migration rights (no CREATE/ALTER/DROP/INDEX) on this schema,
+ * so the attested structure cannot be mutated under the operating identity.
+ * Provisioning/migration run under a SEPARATE privileged role, offline from serving.
+ */
 export async function assertSchemaReady(db: PgTransactor, schema: string): Promise<SchemaReadyToken> {
   await db.transaction(async (exec) => { await enterCriticalTx(exec, schema); await attestSchema(exec); await assertVersionInTx(exec); });
   return mintReadyToken({ db, schema, manifest: TSK_OUTBOX_SCHEMA_MANIFEST, version: TSK_OUTBOX_SCHEMA_VERSION });
@@ -527,13 +602,19 @@ export class PgTskDurableOutbox {
     const nextSeq = cur + 1;
     const prevHeadDigest = String(cpRows[0].head_digest) || GENESIS_HEAD;
 
-    const mutation = this.sanitizer.sanitize(input.rawMutation);
-    const counter = (mutation as unknown as TskHotpMutation).counter;
+    // (TOCTOU) snapshot the sanitized mutation into a frozen local and FIX the
+    // digested/serialized bytes BEFORE the signer.sign await, so what is stored
+    // exactly equals what was digested and signed even if the caller's object is
+    // mutated during the await.
+    const sanitized = this.sanitizer.sanitize(input.rawMutation);
+    const counter = (sanitized as unknown as TskHotpMutation).counter;
     if (!Number.isSafeInteger(counter) || counter < 1 || counter > TSK_HOTP_MAX_COUNTER) throw new ContractValidationError('HOTP counter out of range [1, 2^31-1]');
-    const tumblerId = (mutation as unknown as TskHotpMutation).tumblerId;
+    const tumblerId = (sanitized as unknown as TskHotpMutation).tumblerId;
     if (typeof tumblerId !== 'string' || tumblerId.length < 1 || tumblerId.length > 512) throw new ContractValidationError('tumblerId invalid');
+    const mutation = deepFreeze({ tumblerId, counter }) as SanitizedMutation<TskHotpMutation>;
 
     const opDigest = canonicalOpDigest<TskHotpMutation>({ streamId, sourceEpoch, sequence: nextSeq, fenceToken: fenceDecimal, mutation });
+    const mutationJson = JSON.stringify(mutation); // serialize BEFORE any await
     const headDigest = streamHeadDigest({ streamId, sequence: nextSeq, prevHeadDigest, opDigest, keyId: this.opts.signer.keyId, alg: this.opts.signer.alg });
     const signature = await this.opts.signer.sign(headDigest);
     const head: SignedStreamHead = { streamId, sequence: nextSeq, prevHeadDigest, opDigest, keyId: this.opts.signer.keyId, alg: this.opts.signer.alg, headDigest, signature };
@@ -544,7 +625,7 @@ export class PgTskDurableOutbox {
     affectedOne(await exec.query(
       `INSERT INTO tsk_outbox_rows (stream_id, source_epoch, sequence, fence_token, op_digest, tumbler_id, hotp_counter, mutation, head_prev, head_digest, head_key_id, head_alg, head_sig)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-      [streamId, sourceEpoch, nextSeq, fenceDecimal, opDigest, tumblerId, counter, JSON.stringify(mutation), prevHeadDigest, headDigest, this.opts.signer.keyId, this.opts.signer.alg, signature],
+      [streamId, sourceEpoch, nextSeq, fenceDecimal, opDigest, tumblerId, counter, mutationJson, prevHeadDigest, headDigest, this.opts.signer.keyId, this.opts.signer.alg, signature],
     ), 'outbox row insert');
     affectedOne(await exec.query('UPDATE tsk_outbox_source_checkpoint SET sequence = $2, head_digest = $3 WHERE stream_id = $1', [streamId, nextSeq, headDigest]), 'source checkpoint advance');
     return { header, head };
@@ -552,7 +633,7 @@ export class PgTskDurableOutbox {
 }
 
 export interface PgTskPublisherOptions { leaseMs: number; scopeDeadlineMs?: number }
-export interface TskDrainResult { published: number; acked: number; quarantined: number; retriable: boolean }
+export interface TskDrainResult { published: number; acked: number; quarantined: number; retriable: boolean; halted: boolean }
 
 /**
  * Per-stream ORDERED single-active publisher (H1/H2). One publisher delivers a
@@ -608,10 +689,17 @@ export class PgTskPublisher {
     });
   }
 
+  private async isHalted(): Promise<boolean> {
+    return this.tx(async (exec) => (await exec.query('SELECT 1 FROM tsk_outbox_stream_halted WHERE stream_id = $1', [this.streamId])).rows.length > 0);
+  }
+
   async drainOnce(): Promise<TskDrainResult> {
+    // (MED) refuse a durably-halted stream up front — no spin, no permanent
+    // reject-gap loop. Recovery is an operator action (delete the halted row).
+    if (await this.isHalted()) return { published: 0, acked: 0, quarantined: 0, retriable: false, halted: true };
     const leaseToken = randomUUID();
-    if (!(await this.acquireLease(leaseToken))) return { published: 0, acked: 0, quarantined: 0, retriable: true };
-    let published = 0, acked = 0, quarantined = 0, retriable = false;
+    if (!(await this.acquireLease(leaseToken))) return { published: 0, acked: 0, quarantined: 0, retriable: true, halted: false };
+    let published = 0, acked = 0, quarantined = 0, retriable = false, halted = false;
     try {
       for (;;) {
         const r = await this.nextDeliverable(leaseToken);
@@ -629,8 +717,12 @@ export class PgTskPublisher {
         // fail closed on a corrupted stored head
         assertStreamHeadBinds({ contractVersion: '1', streamId: this.streamId, sourceEpoch, sequence, fenceToken: String(r.fence_token), opDigest: storedDigest }, head);
 
-        const receipt = await this.transport.deliverAndAwaitAck(record, head);
+        const rawReceipt = await this.transport.deliverAndAwaitAck(record, head);
         published++;
+        // (TOCTOU) snapshot + strict-validate + FREEZE the FULL receipt BEFORE the
+        // verify await, and use ONLY the snapshot afterward — the transport cannot
+        // mutate the signed decision (e.g. reject-fork -> applied) after verification.
+        const receipt = snapshotAckReceipt(rawReceipt);
         await this.ackVerifier.verify(receipt, record);
         if (receipt.streamId !== this.streamId || receipt.sourceEpoch !== sourceEpoch || receipt.sequence !== sequence || !digestEquals(receipt.opDigest, storedDigest)) {
           throw new ContractValidationError('ACK receipt does not match the delivered record — not acking');
@@ -657,13 +749,16 @@ export class PgTskPublisher {
             if (!digestEquals(String(ex[0].op_digest), storedDigest) || String(ex[0].decision) !== receipt.decision) throw new ContractValidationError('quarantine record conflict: existing digest/decision differ from this record');
           } else if (ins.rowCount !== 1) throw new ContractValidationError('quarantine insert affected unexpected row count');
           affectedOne(await exec.query('UPDATE tsk_outbox_rows SET quarantined_at = now() WHERE stream_id = $1 AND source_epoch = $2 AND sequence = $3 AND acked_at IS NULL AND quarantined_at IS NULL', [this.streamId, sourceEpoch, sequence]), 'quarantine mark');
+          // (MED) DURABLY halt the stream in the SAME tx as the quarantine so the
+          // divergence cannot silently become a permanent reject-gap spin. Idempotent.
+          await exec.query('INSERT INTO tsk_outbox_stream_halted (stream_id, source_epoch, sequence, op_digest, decision) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (stream_id) DO NOTHING', [this.streamId, sourceEpoch, sequence, storedDigest, receipt.decision]);
         });
-        quarantined++; break;
+        quarantined++; halted = true; break;
       }
     } finally {
       await this.releaseLease(leaseToken);
     }
-    return { published, acked, quarantined, retriable };
+    return { published, acked, quarantined, retriable, halted };
   }
 }
 
@@ -672,8 +767,8 @@ export class PgTskPublisher {
  * verifyAndApplyTumblerInTx, in ONE serializable tx:
  *   1) re-sanitize + recompute the op digest (tamper → reject-fork);
  *   2) bind the signed head to the record + VERIFY its signature (forged → reject-fork);
- *      a StreamHeadVerifier may throw an error marked `.transient=true` for a key-
- *      store outage → re-thrown for retry (never silently rejected);
+ *      a StreamHeadVerifier that throws `StreamHeadVerificationUnavailableError`
+ *      (only) is re-thrown for retry — every other throw is a permanent reject-fork;
  *   3) head hash-chain continuity: head.prevHeadDigest == the receiver's last head
  *      (or genesis) → else reject-fork;
  *   4) record-bound fence exact equality vs persisted → reject-fence;
@@ -709,7 +804,13 @@ export class PgTskReceiverCheckpoint implements TskReceiverCheckpoint<TskPgBacke
     return runScoped(this.scopeDeadlineMs, (signal) => this.db.transaction((exec) => withBoundTx(exec, this.db, this.schema, (tx) => this.verifyAndApplyTumblerInTx(tx, record, head)), { signal }));
   }
 
-  async verifyAndApplyTumblerInTx(tx: PgTx, record: OutboxRecord<TskHotpMutation>, head: SignedStreamHead): Promise<ReceiverDecision> {
+  async verifyAndApplyTumblerInTx(tx: PgTx, recordUntrusted: OutboxRecord<TskHotpMutation>, headUntrusted: SignedStreamHead): Promise<ReceiverDecision> {
+    // (TOCTOU) Snapshot the ENTIRE untrusted record + head SYNCHRONOUSLY, before
+    // the first await, and use ONLY the frozen snapshots afterward. A caller can
+    // no longer mutate the applied/consumed value across the headVerifier await
+    // under a valid signed digest.
+    const record = snapshotRecord(recordUntrusted);
+    const head = snapshotHead(headUntrusted);
     const exec = execOfBound(tx, this.db, this.schema);
     await enterCriticalTx(exec, this.schema);
     if (record.streamId !== this.streamId) throw new ContractValidationError('streamId mismatch for this receiver');
@@ -719,9 +820,7 @@ export class PgTskReceiverCheckpoint implements TskReceiverCheckpoint<TskPgBacke
     const recomputed = canonicalOpDigest<TskHotpMutation>({ streamId: record.streamId, sourceEpoch: record.sourceEpoch, sequence: record.sequence, fenceToken: record.fenceToken, mutation: record.mutation });
     if (!digestEquals(recomputed, record.opDigest)) return 'reject-fork';
 
-    // (2) signed head: bind to record + verify signature. A transient key-store
-    // outage (err.transient===true) is re-thrown for retry; any other failure is
-    // an unverifiable head → reject-fork (never applied).
+    // (2) signed head bound to the record + signature verified (over the snapshot).
     try { assertStreamHeadBinds(record, head); } catch { return 'reject-fork'; }
     try { await this.headVerifier.verify(head); }
     catch (err) {
@@ -767,6 +866,7 @@ export class PgTskReceiverCheckpoint implements TskReceiverCheckpoint<TskPgBacke
     }
 
     // (7) apply + consume + advance checkpoint(seq+head) + applied-history, atomic.
+    // Everything below uses the frozen snapshot exclusively.
     await this.applier.applyInTx(exec, record);
     affectedOne(await exec.query(
       `INSERT INTO tsk_hotp_consumed (stream_id, tumbler_id, last_counter) VALUES ($1,$2,$3)
