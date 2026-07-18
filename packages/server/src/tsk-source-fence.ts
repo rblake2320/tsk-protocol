@@ -981,9 +981,11 @@ export function replaySourceExport<Clean>(sanitizer: Pick<MutationSanitizer<unkn
     let parsed: unknown;
     try { parsed = JSON.parse(r.payload); } catch { throw new SourceFenceQuarantineError(`export record @${r.sequence} payload is not valid JSON`); }
     const mutation = sanitizer.sanitize(parsed) as SanitizedMutation<Clean>; // recompute FROM the payload
-    // (R5-H payload exactness) the raw payload MUST canonicalize to EXACTLY the sanitized output — a
-    // payload carrying extra/secret fields the sanitizer silently drops (unchanged opDigest) is rejected.
-    if (canonicalize(parsed) !== canonicalize(mutation)) throw new SourceFenceQuarantineError(`export record @${r.sequence} payload has non-canonical or extra fields the sanitizer drops — substitution; quarantine`);
+    // (R8 EXACT-BYTE payload) the raw payload bytes MUST EQUAL the canonical serialization of the
+    // sanitized output — so a byte-modified but semantically-equivalent payload (leading whitespace,
+    // reordered/duplicate keys, or an extra field the sanitizer drops) is rejected, not merely a
+    // semantic mismatch. Legit exports carry the canonical form (see exportSourceHistory).
+    if (r.payload !== canonicalize(mutation)) throw new SourceFenceQuarantineError(`export record @${r.sequence} payload bytes != canonical sanitized form — substitution/whitespace/key-order/dup-key; quarantine`);
     const opDigest = canonicalOpDigest<Clean>({ streamId: s, sourceEpoch: r.sourceEpoch, sequence: r.sequence, fenceToken: r.fenceToken, mutation });
     if (opDigest !== r.opDigest) throw new SourceFenceQuarantineError(`export record @${r.sequence} opDigest does not match the payload — substitution; quarantine`);
     const alg = String(r.alg) as StreamHeadAlg;
@@ -1040,7 +1042,7 @@ function assertExportInventory(inventory: ExportChunkInventoryEntry[], n: number
 /** Read the committed 1..N history from the SIGNED ledger + the sorted state-at-N, packed into bounded
  *  chunks. The history records carry the FULL payload + signed-head fields; the state chunk is the
  *  sorted (tumblerId -> latest counter) map. (Export only — the REPLAY re-verifies everything.) */
-export async function exportSourceHistory(exec: PgExecutor, streamId: string, epoch: string, n: number, opts?: { maxChunkItems?: number }): Promise<SourceExportBundle> {
+export async function exportSourceHistory<Clean>(exec: PgExecutor, sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'sanitize'>, streamId: string, epoch: string, n: number, opts?: { maxChunkItems?: number }): Promise<SourceExportBundle> {
   const s = vId(streamId, STREAM_ID_RE, 'streamId');
   const N = vInt(n, 'n', 1, MAX_SEQ);
   const maxItems = vInt(opts?.maxChunkItems ?? DEFAULT_MAX_CHUNK_ITEMS, 'maxChunkItems', 1, 100_000);
@@ -1050,11 +1052,17 @@ export async function exportSourceHistory(exec: PgExecutor, streamId: string, ep
     const to = Math.min(from + maxItems - 1, N);
     const rows = (await exec.query(`SELECT sequence, source_epoch, fence_token, op_digest, head_prev, head_digest, head_key_id, head_alg, head_sig, mutation FROM tsk_outbox_rows WHERE stream_id=$1 AND source_epoch=$2 AND sequence >= $3 AND sequence <= $4 ORDER BY sequence ASC`, [s, epoch, from, to])).rows;
     if (rows.length !== to - from + 1) throw new SourceFenceQuarantineError(`export gap in [${from},${to}] — expected ${to - from + 1} rows, got ${rows.length}`);
-    const records: ExportedSourceRecord[] = rows.map((r) => ({
-      sequence: vInt(r.sequence, 'sequence', 1, MAX_SEQ), sourceEpoch: String(r.source_epoch), fenceToken: String(r.fence_token),
-      opDigest: vHeadDigest(r.op_digest, 'op_digest'), prevHeadDigest: vHeadDigest(r.head_prev, 'head_prev'), headDigest: vHeadDigest(r.head_digest, 'head_digest'),
-      keyId: String(r.head_key_id), alg: String(r.head_alg), signature: String(r.head_sig), payload: typeof r.mutation === 'string' ? r.mutation : JSON.stringify(r.mutation),
-    }));
+    const records: ExportedSourceRecord[] = rows.map((r) => {
+      // (R8) emit the payload in EXACT CANONICAL form (canonicalize(sanitized)) so the exported bytes,
+      // the byteDigest, and the replay's exact-byte check all agree — no whitespace/key-order/dup-key slack.
+      const stored = typeof r.mutation === 'string' ? r.mutation : JSON.stringify(r.mutation);
+      const payload = canonicalize(sanitizer.sanitize(JSON.parse(stored)));
+      return {
+        sequence: vInt(r.sequence, 'sequence', 1, MAX_SEQ), sourceEpoch: String(r.source_epoch), fenceToken: String(r.fence_token),
+        opDigest: vHeadDigest(r.op_digest, 'op_digest'), prevHeadDigest: vHeadDigest(r.head_prev, 'head_prev'), headDigest: vHeadDigest(r.head_digest, 'head_digest'),
+        keyId: String(r.head_key_id), alg: String(r.head_alg), signature: String(r.head_sig), payload,
+      };
+    });
     historyChunks.push({ kind: 'history', ordinal: ordinal++, seqFrom: from, seqTo: to, records, byteDigest: historyChunkByteDigest(records) });
   }
   const pairs = await readSourceStatePairs(exec, s, N, epoch); // (M2) epoch-scoped state (already sorted)
@@ -1062,9 +1070,18 @@ export async function exportSourceHistory(exec: PgExecutor, streamId: string, ep
   return { historyChunks, stateChunk };
 }
 
+/** (R8) Build the inventory by RECOMPUTING every chunk's byteDigest from the EXACT records/pairs — never
+ *  trust the chunk's caller-supplied `byteDigest`. The declared field is also asserted to equal the
+ *  recomputed one, so a byte-modified record kept under a stale declared digest fails BEFORE the root. */
 function bundleInventory(bundle: SourceExportBundle): ExportChunkInventoryEntry[] {
-  const inv: ExportChunkInventoryEntry[] = bundle.historyChunks.map((c) => ({ kind: 'history' as const, ordinal: c.ordinal, seqFrom: c.seqFrom, seqTo: c.seqTo, itemCount: c.records.length, byteDigest: c.byteDigest }));
-  inv.push({ kind: 'state', ordinal: bundle.stateChunk.ordinal, seqFrom: 0, seqTo: 0, itemCount: bundle.stateChunk.itemCount, byteDigest: bundle.stateChunk.byteDigest });
+  const inv: ExportChunkInventoryEntry[] = bundle.historyChunks.map((c) => {
+    const byteDigest = historyChunkByteDigest(c.records); // recompute from the exact records
+    if (c.byteDigest !== byteDigest) throw new SourceFenceQuarantineError(`history chunk ${c.ordinal} declared byteDigest != recomputed — stale/tampered records; quarantine`);
+    return { kind: 'history' as const, ordinal: c.ordinal, seqFrom: c.seqFrom, seqTo: c.seqTo, itemCount: c.records.length, byteDigest };
+  });
+  const stateByteDigest = stateChunkByteDigest(bundle.stateChunk.pairs); // recompute from the exact pairs
+  if (bundle.stateChunk.byteDigest !== stateByteDigest) throw new SourceFenceQuarantineError('state chunk declared byteDigest != recomputed — stale/tampered pairs; quarantine');
+  inv.push({ kind: 'state', ordinal: bundle.stateChunk.ordinal, seqFrom: 0, seqTo: 0, itemCount: bundle.stateChunk.itemCount, byteDigest: stateByteDigest });
   return inv;
 }
 function allRecords(bundle: SourceExportBundle): ExportedSourceRecord[] {
@@ -1098,7 +1115,7 @@ export async function buildSourceExportManifest<Clean>(db: PgTransactor, schema:
     const n = vInt(cp.sequence, 'N', 1, MAX_SEQ);
     if (n !== fr.n) throw new SourceFenceQuarantineError(`checkpoint N ${n} != frozen receipt N ${fr.n} — quarantine`);
     const sourceEpoch = String(cp.source_epoch);
-    const bundle = await exportSourceHistory(exec, s, sourceEpoch, n, { maxChunkItems: opts.maxChunkItems });
+    const bundle = await exportSourceHistory(exec, opts.sanitizer, s, sourceEpoch, n, { maxChunkItems: opts.maxChunkItems });
     // REPLAY is the authority — head/state @N are OUTPUTS, cross-checked to the frozen receipt
     const replay = replaySourceExport(opts.sanitizer, opts.headResolver, s, sourceEpoch, allRecords(bundle));
     if (replay.n !== n) throw new SourceFenceQuarantineError(`replay N ${replay.n} != N ${n}`);

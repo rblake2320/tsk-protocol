@@ -89,25 +89,41 @@ async function main() {
     assert.equal(dual.guardKeyId, GUARD_KEY); assert.equal(dual.sourceEpoch, 'e1');
   });
 
-  await check('a PAYLOAD substitution fails the replay (opDigest recomputed from the payload)', async () => {
+  await check('a PAYLOAD substitution fails (byteDigest recomputed from the exact records)', async () => {
     const bad = clone(bundle); bad.historyChunks[0].records[0].payload = JSON.stringify({ tumblerId: 'T1', counter: 999 });
-    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /chunk tamper|opDigest does not match|does not chain/);
+    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /declared byteDigest != recomputed|chunk tamper|opDigest does not match/);
   });
 
   await check('(H2 payload exactness) an EXTRA field the sanitizer drops (unchanged opDigest) is rejected', async () => {
     const bad = clone(bundle); const r0 = bad.historyChunks[0].records[0];
     r0.payload = JSON.stringify({ ...JSON.parse(r0.payload), secret: 'leak' }); // sanitizes away → same opDigest
-    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /chunk tamper|non-canonical or extra fields/);
+    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /declared byteDigest != recomputed|payload bytes != canonical|non-canonical or extra/);
   });
 
-  await check('(M2 epoch) a CROSS-EPOCH record is rejected by the replay', async () => {
+  await check('(R8 stale-digest) a byte-modified but semantically-equal payload (whitespace / key-order / duplicate-key) with a KEPT chunk byteDigest is rejected by the recomputed digest', async () => {
+    const canon = bundle.historyChunks[0].records[0].payload; // exact canonical form emitted by the export
+    for (const variant of [' ' + canon, '{"tumblerId":"T1","counter":1}', '{"tumblerId":"T1","tumblerId":"T1","counter":1}']) {
+      const bad = clone(bundle); bad.historyChunks[0].records[0].payload = variant; // keep the stale chunk byteDigest
+      await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /declared byteDigest != recomputed/);
+    }
+  });
+
+  await check('(R8 root binds bytes) a tampered payload with an UPDATED chunk byteDigest still fails the manifestRoot / inventory bind', async () => {
+    // recompute the chunk digest so the stale-digest guard passes, then the root no longer matches the signed manifest
+    const bad = clone(bundle); bad.historyChunks[0].records[0].payload = ' ' + bad.historyChunks[0].records[0].payload;
+    // emulate an attacker who also rewrites the chunk digest to match the tampered records (still fails the root)
+    bad.historyChunks[0].byteDigest = 'deadbeef'.repeat(8);
+    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /declared byteDigest != recomputed|root|inventory entry|manifestRoot/);
+  });
+
+  await check('(M2 epoch) a CROSS-EPOCH record is rejected (recomputed digest / replay epoch check)', async () => {
     const bad = clone(bundle); bad.historyChunks[0].records[1].sourceEpoch = 'e2';
-    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /chunk tamper|cross-epoch/);
+    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /declared byteDigest != recomputed|cross-epoch/);
   });
 
   await check('(H1 state binding) a tampered state chunk pair is rejected (bound to the replay-derived state)', async () => {
     const bad = clone(bundle); bad.stateChunk.pairs[0][1] = 4242; // T*=4242 disagrees with 1..N
-    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /chunk .* mismatch|state chunk|inventory entry/);
+    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /declared byteDigest != recomputed|state chunk|inventory entry|state pair/);
   });
 
   await check('(M1 strict inventory) reorder / duplicate / non-adjacent boundaries are rejected', async () => {
