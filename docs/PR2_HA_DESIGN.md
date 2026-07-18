@@ -86,7 +86,22 @@ CREATE TABLE tsk_ha_provisioning (
   created_at        timestamptz NOT NULL DEFAULT now(),
   provisioned_at    timestamptz
 );
--- each provisioning transition: UPDATE ... WHERE stream_id=$1 AND state_digest=$prev (affect 1).
+-- append-only provisioning history (symmetry with lease/cutover), keyed (stream_id, state_seq)
+CREATE TABLE tsk_ha_provisioning_history (
+  stream_id         text        NOT NULL,
+  genesis_marker    text        NOT NULL,
+  state             text        NOT NULL CHECK (state IN ('intent','incomplete','provisioned')),
+  state_seq         bigint      NOT NULL,
+  prev_state_digest text,
+  state_digest      text        NOT NULL,
+  guard_key_id      text        NOT NULL,
+  guard_signature   text        NOT NULL,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (stream_id, state_seq),
+  UNIQUE (stream_id, state_digest)
+);
+-- each provisioning transition, in one tx: INSERT the signed history row, then
+--   UPDATE tsk_ha_provisioning SET ... WHERE stream_id=$1 AND state_digest=$prev (affect 1).
 
 -- external monotonic epoch witness (authoritative floor; distinct failure domain from Redis)
 CREATE TABLE tsk_ha_epoch_witness (
@@ -116,9 +131,27 @@ CREATE TABLE tsk_ha_lease_head (
   guard_key_id       text        NOT NULL,     -- rotation via a signed key registry; a revoked keyId is rejected
   guard_signature    text        NOT NULL      -- signs (stream_id,lease_id,holder,epoch,grant_seq,status,granted_max_expiry,prev_grant_digest,grant_digest)
 );
-CREATE TABLE tsk_ha_lease_history (LIKE tsk_ha_lease_head INCLUDING ALL, created_at timestamptz NOT NULL DEFAULT now());
--- every grant/revoke: append the signed history row, then UPDATE tsk_ha_lease_head
---   WHERE stream_id=$1 AND grant_digest=$prev (affected-row=1 forward CAS, strictly-increasing grant_seq).
+-- explicit history (NOT LIKE ... INCLUDING ALL — that would copy the head PK and permit only
+-- one row per stream). Append-only, keyed by (stream_id, grant_seq).
+CREATE TABLE tsk_ha_lease_history (
+  stream_id          text        NOT NULL,
+  lease_id           text        NOT NULL,
+  holder_node_id     text        NOT NULL,
+  epoch              bigint      NOT NULL,
+  grant_seq          bigint      NOT NULL,
+  status             text        NOT NULL CHECK (status IN ('active','revoked')),
+  granted_max_expiry timestamptz NOT NULL,
+  prev_grant_digest  text,
+  grant_digest       text        NOT NULL,
+  guard_key_id       text        NOT NULL,
+  guard_signature    text        NOT NULL,
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (stream_id, grant_seq),
+  UNIQUE (stream_id, grant_digest)
+);
+-- every grant/revoke, in one control-DB tx: INSERT the signed history row, then
+--   UPDATE tsk_ha_lease_head SET ... WHERE stream_id=$1 AND grant_digest=$prev
+--   (affected-row=1 forward CAS, strictly-increasing grant_seq).
 ```
 The A-PG grant applier is a **separate role** from the runtime (write) role; it installs a grant
 only with strictly-increasing `lease_grant_seq` — a replayed older still-valid signed grant
