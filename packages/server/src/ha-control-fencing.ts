@@ -18,8 +18,9 @@ import type { FencingStore, FenceRecord } from './promotion.js';
  *
  * BOUNDED / MECHANISM-ONLY: this makes NO split-brain, HA, or uptime claim. The
  * control-DB witness is the authoritative epoch FLOOR; Redis is the cross-node claim
- * coordinator, cross-checked (never trusted alone). A `MemoryFencingStore` in a drill
- * is NOT a real fault-tolerant Redis. "A proven fenced" here means the old lease is
+ * coordinator, cross-checked (never trusted alone). A SINGLE Redis (the drill uses the
+ * production RedisFencingStore against one instance) is mechanism-only, NOT a fault-tolerant
+ * topology. "A proven fenced" here means the old lease is
  * revoked AND its control-DB-recorded, MONOTONIC max grant-expiry (+ a bounded safety
  * margin) has elapsed on the CONTROL clock (clock_timestamp() read in-tx) — it does
  * NOT by itself STONITH the old backend; binding a reaper/source-applier fence is
@@ -300,6 +301,9 @@ export const HA_CONTROL_TABLES = [
   'tsk_ha_lease_history', 'tsk_ha_cutover_head', 'tsk_ha_cutover_history',
 ] as const;
 const MANIFEST_TABLES = [...HA_CONTROL_TABLES]; // attest the FULL set incl tsk_ha_schema (R4-H3)
+// (R8-HIGH) governed tables locked ACCESS SHARE per critical tx to freeze the catalog against a
+// concurrent ALTER/DROP between attest and mutation. Names are compile-time constants (not input).
+const GOVERNED_LOCK_LIST = HA_CONTROL_TABLES.join(', ');
 
 // ── exact-session critical tx: SERIALIZABLE + pinned search_path ─────────────
 
@@ -381,6 +385,15 @@ async function attestControlSchema(exec: PgExecutor): Promise<string> {
     throw new ContractValidationError(`control schema attestation failed: live catalog digest ${digest} != pinned ${HA_CONTROL_MANIFEST_DIGEST}`);
   }
   return digest;
+}
+
+/** (R8) Revalidate the singleton tsk_ha_schema authority stamp per op — a post-mint mutation of the
+ *  version or stored catalog_manifest fails the op closed even if the live catalog still matches. */
+async function revalidateAuthorityRow(exec: PgExecutor): Promise<void> {
+  const rows = (await exec.query('SELECT version, catalog_manifest FROM tsk_ha_schema WHERE id = 1')).rows;
+  if (!rows.length) throw new ContractValidationError('control schema authority row is missing');
+  if (vInt(rows[0].version, 'schema version', 1, MAX_EPOCH) !== CONTROL_SCHEMA_VERSION) throw new ContractValidationError('control schema authority version mismatch');
+  if (String(rows[0].catalog_manifest) !== HA_CONTROL_MANIFEST_DIGEST) throw new ContractValidationError('control schema authority stamp (catalog_manifest) does not match the compiled pinned digest');
 }
 
 const READY_BRAND: unique symbol = Symbol('tsk_ha_control_schema_ready');
@@ -530,7 +543,13 @@ export class HaControlFencing {
     const sid = vId(streamId, STREAM_ID_RE, 'streamId');
     return this.db.transaction(async (exec) => {
       await enterCriticalTx(exec, this.schema);
-      if (this.attestEveryTx) await attestControlSchema(exec); // live catalog === compiled pinned digest
+      if (this.attestEveryTx) {
+        // (R8-HIGH) freeze the governed catalog for THIS tx BEFORE attesting: ACCESS SHARE blocks a
+        // concurrent ALTER/DROP (ACCESS EXCLUSIVE) until commit, closing the attest→mutate TOCTOU.
+        await exec.query(`LOCK TABLE ${GOVERNED_LOCK_LIST} IN ACCESS SHARE MODE`);
+        await attestControlSchema(exec);    // live catalog === compiled pinned digest (now frozen)
+        await revalidateAuthorityRow(exec); // singleton version + catalog_manifest authority stamp
+      }
       await exec.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [sid]);
       return fn(exec);
     });

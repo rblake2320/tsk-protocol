@@ -655,8 +655,9 @@ Redis Sentinel/quorum + persistence/replication + failover/rollback + measured R
 ### Fence-TTL note (mechanism scope)
 
 `advanceEpoch` requires the Redis claim TTL to still cover a **configured worst-case
-final-tx + commit + clock-skew budget** (`FenceProof.minClaimRemainingMs`), validated against the
-control-DB clock **inside the final FENCED transaction**. This is **mechanism evidence** that the
+final-tx + commit + clock-skew budget** (`HaControlPolicy.minClaimRemainingMs` — a strictly-positive
+deployment policy bound to the authority, not a per-call value), validated against the control-DB
+clock **inside the final FENCED transaction**. This is **mechanism evidence** that the
 claim is not about to expire at commit — it is **not** a universal commit-time guarantee nor a
 source-side pre-commit fence. The non-bypassable in-transaction **source** fence/lease (a stale
 writer loses in its own commit even after passing a Redis pre-check) is a subsequent PR2a milestone.

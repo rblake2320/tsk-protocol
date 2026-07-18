@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import pg from 'pg';
 import { Redis } from 'ioredis';
 import {
-  HA_CONTROL_PG_SCHEMA, HA_CONTROL_TABLES, HaControlFencing, GuardSigner,
+  HA_CONTROL_PG_SCHEMA, HA_CONTROL_TABLES, HA_CONTROL_MANIFEST_DIGEST, HaControlFencing, GuardSigner,
   NodePostgresTransactor, RedisFencingStore, FenceAuthorityQuarantineError,
   provisionControlSchema, assertControlSchemaReady, assertRedisAuthority, reconcileFencedRedis,
   type GuardKeyResolver, type FenceProof, type ControlSchemaReadyToken, type FenceEvidence, type HaControlPolicy,
@@ -151,6 +151,28 @@ async function main() {
     await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: dn + 1000, grantCommandId: 'drx' }), /attestation failed/);
     await pool.query('ALTER TABLE tsk_ha_provisioning DROP COLUMN drift2');
     assert.equal((await ctl.provision('tsk:drift/v1', 'g-drift')).state, 'provisioned'); // clean again -> succeeds
+  });
+  await check('R8-HIGH: governed-table ACCESS SHARE blocks a concurrent ALTER (attest->use is atomic, no intra-tx DDL TOCTOU)', async () => {
+    const holder = await pool.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT set_config($1,$2,true)', ['search_path', 'public']);
+    await holder.query(`LOCK TABLE ${HA_CONTROL_TABLES.join(', ')} IN ACCESS SHARE MODE`); // same lock criticalTx takes
+    const altering = pool.query('ALTER TABLE tsk_ha_lease_head ADD COLUMN r8drift int').catch(() => {}); // will block on ACCESS EXCLUSIVE
+    let blocked = false;
+    for (let i = 0; i < 100 && !blocked; i++) {
+      blocked = Number((await pool.query("SELECT count(*)::int AS n FROM pg_locks WHERE mode='AccessExclusiveLock' AND NOT granted AND relation IS NOT NULL")).rows[0].n) >= 1;
+      if (!blocked) await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(blocked, 'a concurrent ALTER is an ungranted AccessExclusiveLock while ACCESS SHARE is held');
+    await holder.query('COMMIT'); holder.release(); // release ACCESS SHARE -> ALTER proceeds
+    await altering;
+    await pool.query('ALTER TABLE tsk_ha_lease_head DROP COLUMN IF EXISTS r8drift'); // cleanup
+  });
+  await check('R8: per-op revalidation of the tsk_ha_schema authority stamp (post-mint mutation fails closed)', async () => {
+    await pool.query("UPDATE tsk_ha_schema SET catalog_manifest='tampered-stamp' WHERE id=1");
+    await assert.rejects(() => ctl.provision('tsk:stamp/v1', 'g-stamp'), /authority stamp/);
+    await pool.query('UPDATE tsk_ha_schema SET catalog_manifest=$1 WHERE id=1', [HA_CONTROL_MANIFEST_DIGEST]); // restore
+    assert.equal((await ctl.provision('tsk:stamp/v1', 'g-stamp')).state, 'provisioned');
   });
 
   // ── control-clock fence-advance with REAL Redis (null/W0 allowed end-to-end) ─
