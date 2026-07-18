@@ -238,9 +238,12 @@ describe('HttpOutboxTransport <-> createHttpOutboxReceiver (authenticated, decis
     })).toThrow(/retention/);
   });
 
-  it('(deterministic Pg DB-clock swing) a nonce survives (retention - 2*skew) of real time under worst-case drift', async () => {
-    // fake Pg modeling DB-clock-driven expiry: SELECT now() -> dbClock; DELETE prunes
-    // expires_at < dbClock; INSERT sets expires_at = dbClock + retention (ON CONFLICT NOTHING).
+  it('(deterministic MODEL of PgReplayNonceStore clock behavior) a nonce survives (retention - 2*skew) under worst-case drift', async () => {
+    // NOTE: this is a deterministic MODEL of the store's now()-driven expiry via a fake
+    // QueryFn — NOT real PostgreSQL DB-clock manipulation (a real DB clock cannot be
+    // deterministically swung in a unit test). It exercises the exact retention math the
+    // store relies on: SELECT now() -> dbClock; DELETE prunes expires_at < dbClock; INSERT
+    // sets expires_at = dbClock + retention (ON CONFLICT DO NOTHING).
     const dbClock = { v: 0 };
     const table = new Map<string, number>();
     const fakePg = async (sql: string, params?: unknown[]) => {
