@@ -146,6 +146,11 @@ jobs:
       - run: npm run test:source-export
         env:
           TSK_TEST_SOURCE_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+      # (PR2b-2) receiver B — isolated staging + strict replay/verify + atomic finalize (independent B @5434).
+      - run: npm run test:receiver
+        env:
+          TSK_TEST_SOURCE_PG_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+          TSK_TEST_RECEIVER_PG_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
       - run: npm run test:pack
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:

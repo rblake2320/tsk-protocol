@@ -114,6 +114,14 @@ export {
   verifySourceExportManifest,
   guardCountersignSourceExport,
   verifyGuardCountersignedExport,
+  assertExportBundleBinds,
+  TSK_RECEIVER_SCHEMA,
+  TSK_RECEIVER_TABLES,
+  RECEIVER_MANIFEST_DIGEST,
+  attestReceiver,
+  verifyBFinalizedReceipt,
+  stageAndFinalizeReceiverGeneration,
+  readReceiverPointer,
 } from './tsk-source-fence.js';
 export type {
   SourceFenceReadyToken,
@@ -135,6 +143,8 @@ export type {
   GuardCountersignedExport,
   SourceExportOptions,
   GuardCountersignOptions,
+  BFinalizedReceipt,
+  ReceiverFinalizeOptions,
   SourceLiveState,
   WitnessState as SourceWitnessState,
 } from './tsk-source-fence.js';
