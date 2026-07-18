@@ -90,6 +90,22 @@ async function main() {
     await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, SID2, 0, 0)), SourceFenceQuarantineError);
   });
 
+  await check('H2 install: terminal revoke (no same-epoch reactivation), holder/leaseId immutability, epoch monotonicity', async () => {
+    const S3 = 'tsk:pair:pr2b0-h2/v1'; const now = await nowMs();
+    const mk = (over: Partial<BareLeaseGrant>): LeaseGrant => signLeaseGrant(GUARD_KEY, guardSecret, { streamId: S3, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'x', leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 1, prevGrantDigest: null, ...over });
+    const g1 = mk({ commandId: 'h2-g1' }); await tx.transaction((exec) => installLeaseGrant(exec, resolver, g1));
+    // holder/leaseId immutable within the epoch
+    await assert.rejects(() => tx.transaction((exec) => installLeaseGrant(exec, resolver, mk({ holderNodeId: 'B', commandId: 'h2-b', leaseGrantSeq: 2, prevGrantDigest: g1.grantDigest }))), /holder\/leaseId is immutable/);
+    // revoke → terminal for the epoch; a new active grant at the same epoch is refused
+    const rev = mk({ leaseStatus: 'revoked', commandId: 'h2-rev', leaseGrantSeq: 2, prevGrantDigest: g1.grantDigest });
+    await tx.transaction((exec) => installLeaseGrant(exec, resolver, rev));
+    await assert.rejects(() => tx.transaction((exec) => installLeaseGrant(exec, resolver, mk({ commandId: 'h2-react', leaseGrantSeq: 3, prevGrantDigest: rev.grantDigest }))), /terminally revoked/);
+    // epoch cannot regress (a grant at epoch 1 is fine to advance; epoch 0 after is a regression on a higher-epoch head)
+    const e1 = mk({ leaseEpoch: 1, commandId: 'h2-e1', leaseGrantSeq: 3, prevGrantDigest: rev.grantDigest });
+    await tx.transaction((exec) => installLeaseGrant(exec, resolver, e1));
+    await assert.rejects(() => tx.transaction((exec) => installLeaseGrant(exec, resolver, mk({ leaseEpoch: 0, commandId: 'h2-regress', leaseGrantSeq: 4, prevGrantDigest: e1.grantDigest }))), /regresses/);
+  });
+
   // ── M4: external restore/fork witness ──
   const H = (x: string) => x.repeat(64).slice(0, 64);
   const WSID = 'tsk:pair:witness/v1';

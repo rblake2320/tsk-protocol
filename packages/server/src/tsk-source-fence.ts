@@ -200,7 +200,14 @@ const affectedOne = (res: { rowCount: number }, what: string): void => {
  */
 export async function installLeaseGrant(exec: PgExecutor, resolver: SourceVerifyKeyResolver, g: LeaseGrant): Promise<LeaseState> {
   verifyLeaseGrant(resolver, g);
+  // (H2) serialize installs per stream so concurrent grants/revokes cannot interleave.
+  await exec.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))', [g.streamId]);
   const cur = await readSourceLease(exec, resolver, g.streamId);
+  // (H2) the head MUST be the latest history row (no replay of an older validly-signed head).
+  if (cur) {
+    const maxSeq = vInt((await exec.query('SELECT COALESCE(max(lease_grant_seq), 0) AS m FROM tsk_source_lease_history WHERE stream_id=$1', [g.streamId])).rows[0].m, 'max lease seq', 0, MAX_SEQ);
+    if (cur.leaseGrantSeq !== maxSeq) throw new SourceFenceQuarantineError('lease head is not the latest history row (replay/rollback) — quarantine');
+  }
   // idempotent: this exact grant already installed (by grant_seq + digest) → no-op
   if (cur && cur.leaseGrantSeq === g.leaseGrantSeq && cur.grantDigest === g.grantDigest) return cur;
   // command idempotency: same command already installed with the SAME tuple → return it; different → reject
@@ -208,6 +215,19 @@ export async function installLeaseGrant(exec: PgExecutor, resolver: SourceVerify
   if (byCmd) {
     if (String(byCmd.grant_digest) !== g.grantDigest) throw new SourceFenceQuarantineError('lease command_id reused with a different grant tuple — quarantine');
     return (await readSourceLeaseAtSeq(exec, resolver, g.streamId, vInt(byCmd.lease_grant_seq, 'lease_grant_seq', 1, MAX_SEQ)))!;
+  }
+  // (H2) epoch monotonicity: a grant cannot regress the lease epoch.
+  if (cur && g.leaseEpoch < cur.leaseEpoch) throw new SourceFenceQuarantineError(`lease epoch ${g.leaseEpoch} regresses the current ${cur.leaseEpoch} — quarantine`);
+  // (H2) holder/leaseId are IMMUTABLE within an epoch — the first grant fixes the writer identity.
+  const firstAtEpoch = (await exec.query('SELECT holder_node_id, lease_id FROM tsk_source_lease_history WHERE stream_id=$1 AND lease_epoch=$2 ORDER BY lease_grant_seq ASC LIMIT 1', [g.streamId, g.leaseEpoch])).rows[0];
+  if (firstAtEpoch && (String(firstAtEpoch.holder_node_id) !== g.holderNodeId || String(firstAtEpoch.lease_id) !== g.leaseId)) {
+    throw new SourceFenceQuarantineError('lease holder/leaseId is immutable within an epoch — advance the epoch to change the writer');
+  }
+  // (C4/H2) TERMINAL revoke: once revoked at an epoch, no new ACTIVE grant at that epoch — the freeze
+  // is terminal; a new writer requires an epoch advance (prevents same-epoch reactivation of A).
+  if (g.leaseStatus === 'active') {
+    const revoked = (await exec.query("SELECT 1 FROM tsk_source_lease_history WHERE stream_id=$1 AND lease_epoch=$2 AND lease_status='revoked' LIMIT 1", [g.streamId, g.leaseEpoch])).rows[0];
+    if (revoked) throw new SourceFenceQuarantineError('epoch is terminally revoked — no same-epoch reactivation; advance the epoch');
   }
   const expectedSeq = (cur?.leaseGrantSeq ?? 0) + 1;
   if (g.leaseGrantSeq !== expectedSeq) throw new SourceFenceQuarantineError(`lease_grant_seq ${g.leaseGrantSeq} is not strictly-increasing (expected ${expectedSeq})`);
