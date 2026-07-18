@@ -17,7 +17,7 @@ import {
   TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_WITNESS_SCHEMA, TSK_SOURCE_WITNESS_TABLES,
   provisionSchemaVersion, PgTskDurableOutbox, NodePostgresTransactor, RedisFencingStore, ContractValidationError,
   signLeaseGrant, installLeaseGrant, readSourceLease, emitSourceFrozenReceipt, verifySourceFrozenReceipt,
-  advanceSourceWitness, readSourceWitness, signSourceCheckpointReceipt, SourceFenceQuarantineError, assertSourceFenceReady,
+  advanceSourceWitness, advanceSourceWitnessInTx, assertSourceWitnessReady, readSourceWitness, signSourceCheckpointReceipt, SourceFenceQuarantineError, assertSourceFenceReady,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation, type TskHotpMutation, type SourceVerifyKeyResolver, type LeaseGrant,
 } from './packages/server/dist/index.js';
 
@@ -64,7 +64,7 @@ async function main() {
   // tables attested on A, where the gate reads them in the append tx).
   const mkOutbox = async (sid: string, g: LeaseGrant) => {
     const ready = await assertSourceFenceReady(aTx, 'public', { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest });
-    return new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { resolver, controlToASkewBoundMs: 0, ready } });
+    return new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { mode: 'fenced', resolver, controlToASkewBoundMs: 0, ready } });
   };
   async function provision(sid: string) { await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [sid]); await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [sid, 'e1']); }
 
@@ -107,11 +107,15 @@ async function main() {
 
   await check('CRASH witness advance: mid-tx crash rolls back (witness unchanged); retry advances; re-advance same high-water is idempotent', async () => {
     const sid = 'tsk:crash:witness/v1';
+    const wReady = await assertSourceWitnessReady(cTx, 'public'); // (H3) db/schema-bound witness capability
+    // (witness-side crash semantics) a synthetic SOURCE-signed receipt — this test exercises the witness
+    // rollback/idempotency, not ledger derivation (that is the H3 real end-to-end drill via the issuer).
     const cr = signSourceCheckpointReceipt(SOURCE_KEY, source.privateKey, { streamId: sid, sourceSystemId: 'sysA', sourceSeq: 3, sourceHeadDigest: 'a'.repeat(64), grantSeq: 1, priorSeq: 0, priorHeadDigest: '0'.repeat(64) });
-    await assert.rejects(() => cTx.transaction(async (exec) => { await advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, cr); throw new Crash('mid-advance'); }), Crash);
+    // mid-tx crash via the in-tx primitive (so we can throw inside the same tx and prove rollback)
+    await assert.rejects(() => cTx.transaction(async (exec) => { await advanceSourceWitnessInTx(exec, resolver, GUARD_KEY, guardSecret, cr); throw new Crash('mid-advance'); }), Crash);
     assert.equal(await cTx.transaction((exec) => readSourceWitness(exec, resolver, sid)), null, 'no partial witness after crash');
-    await cTx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, cr)); // resume
-    await cTx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, cr)); // idempotent re-advance
+    await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, cr); // resume (owned serializable tx)
+    await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, cr); // idempotent re-advance
     const w = await cTx.transaction((exec) => readSourceWitness(exec, resolver, sid));
     assert.equal(w?.witnessSeq, 1, 'no duplicate witness seq on idempotent re-advance');
   });

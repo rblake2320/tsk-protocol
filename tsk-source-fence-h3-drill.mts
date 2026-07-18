@@ -1,16 +1,18 @@
 /**
- * PR2b-0 (H3) — REAL concurrency + REAL restore/fork drills (not simulation).
+ * PR2b-0 (H3) — REAL concurrency + LOGICAL restore/fork drills.
  *  (1) Barrier-controlled concurrent append-vs-revoke on two live connections: while an append holds
  *      the lease FOR SHARE mid-tx, a conflicting revoke UPDATE genuinely BLOCKS (proven via pg_locks),
  *      commits only AFTER the in-flight append commits, then new appends fail closed. The lock-based
  *      revoke is the freeze authority — it cannot jump ahead of in-flight writers.
- *  (2) Real source-snapshot → restore → divergent-write FORK: the source tables are physically
- *      snapshotted, grown + witnessed, then physically restored to the snapshot and re-grown with
- *      DIFFERENT content (real head digests). The witness quarantines the fork via C5 continuity.
+ *  (2) LOGICAL source rollback → divergent-write FORK: the committed source tables are snapshotted
+ *      (CTAS), grown + witnessed via the ledger-derived issuer, then LOGICALLY rolled back to the
+ *      snapshot (DELETE + UPDATE) and re-grown with DIFFERENT content (real head digests). The witness
+ *      quarantines the fork via C5 continuity. NB: this is a LOGICAL point-in-time rollback, NOT a
+ *      physical PITR / pg_basebackup restore — a physical-restore matrix is a later gate.
  *
  * Env: TSK_TEST_SOURCE_PG_URL_A (source A), TSK_TEST_CONTROL_PG_URL (control/witness).
- * REAL — this is genuine PG16 concurrency + physical table restore, NOT a tx-throw simulation.
- * #10 stays OPEN. Child-process SIGKILL matrix remains PR2c.
+ * REAL PG16 concurrency (part 1) + a real LOGICAL rollback (part 2), NOT a tx-throw simulation.
+ * #10 stays OPEN. Child-process SIGKILL matrix + physical PITR restore remain PR2c.
  */
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign as edSign } from 'node:crypto';
@@ -18,10 +20,10 @@ import pg from 'pg';
 import {
   TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_WITNESS_SCHEMA, TSK_SOURCE_WITNESS_TABLES,
   provisionSchemaVersion, PgTskDurableOutbox, NodePostgresTransactor, ContractValidationError,
-  signLeaseGrant, installLeaseGrant, assertSourceFenceReady, advanceSourceWitness, readSourceWitness,
-  signSourceCheckpointReceipt, SourceFenceQuarantineError,
+  signLeaseGrant, installLeaseGrant, assertSourceFenceReady, advanceSourceWitness, assertSourceWitnessReady,
+  readSourceWitness, issueSourceCheckpointReceipt, SourceFenceQuarantineError,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation,
-  type TskHotpMutation, type SourceVerifyKeyResolver, type LeaseGrant, type SourceCheckpointReceipt,
+  type TskHotpMutation, type SourceVerifyKeyResolver, type LeaseGrant, type SourceGateConfig,
 } from './packages/server/dist/index.js';
 
 const A_URL = process.env['TSK_TEST_SOURCE_PG_URL_A'] ?? process.env['TSK_TEST_SOURCE_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -66,14 +68,13 @@ async function main() {
   const aSysId = String((await aPool.query('SELECT system_identifier::text AS s FROM pg_control_system()')).rows[0].s);
   async function provision(sid: string) { await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [sid]); await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [sid, 'e1']); }
   const grant = async (sid: string, over: Record<string, unknown> = {}): Promise<LeaseGrant> => signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'g1', leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 1, prevGrantDigest: null, ...over } as never);
-  const mkGate = async (sid: string, g: LeaseGrant) => ({ resolver, controlToASkewBoundMs: 0, ready: await assertSourceFenceReady(aTx, 'public', { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest }) });
+  const mkGate = async (sid: string, g: LeaseGrant): Promise<SourceGateConfig> => ({ mode: 'fenced', resolver, controlToASkewBoundMs: 0, ready: await assertSourceFenceReady(aTx, 'public', { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest }) });
   const append = (ob: PgTskDurableOutbox, sid: string, counter: number) => ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter }, fenceToken: 0n }));
-  // real head at a given committed source height, straight from the row chain
+  // real head at a given committed source height, straight from the row chain (for assertions only)
   const headAt = async (sid: string, seq: number): Promise<string> => seq <= 0 ? GEN : String((await aPool.query('SELECT head_digest FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=$2', [sid, seq])).rows[0].head_digest);
-  // a SOURCE-signed checkpoint receipt derived from the REAL committed source state at `seq`
-  const receiptAt = async (sid: string, seq: number, grantSeq = 1): Promise<SourceCheckpointReceipt> => signSourceCheckpointReceipt(SOURCE_KEY, sourceSecret, {
-    streamId: sid, sourceSystemId: aSysId, sourceSeq: seq, sourceHeadDigest: await headAt(sid, seq), grantSeq, priorSeq: seq - 1, priorHeadDigest: await headAt(sid, seq - 1),
-  });
+  // (H5) a checkpoint receipt DERIVED from the committed ledger at the CURRENT height by the atomic,
+  // schema-pinned, FOR SHARE-locked issuer (not hand-built from unlocked queries).
+  const issue = (sid: string) => issueSourceCheckpointReceipt(aTx, 'public', sid, SOURCE_KEY, sourceSecret);
 
   await check('REAL barrier: while an append holds the lease FOR SHARE, a revoke UPDATE blocks (pg_locks), commits only after the append, then new appends fail closed', async () => {
     const sid = 'tsk:h3:barrier/v1'; await provision(sid); const g = await grant(sid);
@@ -104,36 +105,36 @@ async function main() {
     assert.equal(await seqOf(sid), at, 'nothing committed after the authoritative freeze');
   });
 
-  await check('REAL restore+FORK: physically restore the source to an earlier snapshot, re-grow with different content, witness quarantines the fork', async () => {
+  await check('REAL restore+FORK: logically roll the source back to an earlier snapshot, re-grow with different content, witness quarantines the fork', async () => {
     const sid = 'tsk:h3:fork/v1'; await provision(sid); const g = await grant(sid);
     await aTx.transaction((exec) => installLeaseGrant(exec, resolver, g));
+    const wReady = await assertSourceWitnessReady(cTx, 'public'); // (H3) db/schema-bound witness capability
     const ob = new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer: plainSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: await mkGate(sid, g) });
-    // grow to height 2, then SNAPSHOT the real committed source tables at height 2
+    // grow to height 2, SNAPSHOT the real committed source tables, then ISSUE + WITNESS the ledger-derived receipt@2
     await append(ob, sid, 10); await append(ob, sid, 20);
     await aPool.query('CREATE TABLE snap_rows AS SELECT * FROM tsk_outbox_rows WHERE stream_id=$1', [sid]);
     await aPool.query('CREATE TABLE snap_cp AS SELECT * FROM tsk_outbox_source_checkpoint WHERE stream_id=$1', [sid]);
-    const headAt2 = await headAt(sid, 2);
-    // grow to height 3 (the ORIGINAL timeline) and WITNESS the real head@3
+    await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, await issue(sid)); // witness@2 (issuer derives height 2)
+    // grow to height 3 (ORIGINAL timeline) and WITNESS the real ledger-derived head@3
     await append(ob, sid, 30);
     const headAt3orig = await headAt(sid, 3);
-    assert.notEqual(headAt3orig, headAt2);
-    const r2 = await receiptAt(sid, 2); await cTx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, r2));
-    const r3 = await receiptAt(sid, 3); await cTx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, r3));
+    await advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, await issue(sid)); // witness@3 (issuer derives height 3)
     const wBefore = await cTx.transaction((exec) => readSourceWitness(exec, resolver, sid));
     assert.equal(wBefore?.maxSourceSeq, 3); assert.equal(wBefore?.headDigest, headAt3orig, 'witness pinned the real head@3');
-    // PHYSICAL RESTORE to the height-2 snapshot (real DELETE + reinsert of committed rows)
+    // LOGICAL ROLLBACK to the height-2 snapshot (real DELETE + reinsert of the committed rows — a logical
+    // point-in-time rollback via CTAS+DELETE/UPDATE, NOT a physical PITR/pg_basebackup restore).
     await aPool.query('DELETE FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence >= 3', [sid]);
     await aPool.query('UPDATE tsk_outbox_source_checkpoint c SET sequence = s.sequence, head_digest = s.head_digest, source_epoch = s.source_epoch FROM snap_cp s WHERE c.stream_id=$1 AND s.stream_id=$1', [sid]);
-    assert.equal(await seqOf(sid), 2, 'source physically restored to height 2');
+    assert.equal(await seqOf(sid), 2, 'source logically rolled back to height 2');
     // DIVERGENT re-growth with DIFFERENT content → real fork heads (Hfork3 != Horig3), grown BEYOND the witnessed height
     await append(ob, sid, 777); await append(ob, sid, 888); // seq 3,4 on the forked timeline
     const headAt3fork = await headAt(sid, 3);
     assert.notEqual(headAt3fork, headAt3orig, 'the fork produced a genuinely different head@3');
-    // the witness is at height 3 (Horig3); a receipt derived from the forked height-4 state presents
+    // the witness is at height 3 (Horig3); the issuer-derived receipt from the forked height-4 state carries
     // priorHead@3 = Hfork3 (real, != Horig3), so C5 continuity at the witnessed height quarantines it.
-    const receiptFork = await receiptAt(sid, 4);
+    const receiptFork = await issue(sid);
     await assert.rejects(
-      () => cTx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, receiptFork)),
+      () => advanceSourceWitness(cTx, wReady, resolver, GUARD_KEY, guardSecret, receiptFork),
       /diverges from the witness|restore\/FORK/,
     );
     // sanity: the witness state is unchanged (the fork was rejected, not absorbed)

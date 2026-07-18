@@ -597,16 +597,21 @@ export interface PgTskOutboxOptions {
   maxPendingRows: number;
   backpressure: PublisherBackpressure;
   scopeDeadlineMs?: number;
-  /** (PR2b-0) Non-bypassable source lease gate. When set, EVERY append additionally asserts a
-   *  control-issued, guard-signed lease (active + exact fence epoch + signed deadline vs A's own
-   *  clock + bounded skew) in the SAME tx, holding the lease row FOR SHARE to commit — so a revoke
-   *  UPDATE cannot commit until in-flight appends finish, then new appends fail closed. A fencible
-   *  source MUST configure this. `ready` is an unforgeable capability (minted only by
-   *  `assertSourceFenceReady` after a real full-catalog attestation) that binds the AUTHORIZED writer
-   *  identity (holder + leaseId + grant digest) into the gate — so a different writer that is
-   *  legitimately leased at the same epoch fails closed rather than silently writing. */
-  sourceLeaseGate?: { resolver: SourceVerifyKeyResolver; controlToASkewBoundMs: number; ready: SourceFenceReadyToken };
+  /** (H1) Source gate — a MANDATORY, EXPLICIT choice (no optional bypass). A fencible source declares
+   *  `{ mode: 'fenced', ... }`: EVERY append then asserts a control-issued, guard-signed lease (active +
+   *  exact fence epoch + signed deadline vs A's own clock + bounded skew) in the SAME tx, holding the
+   *  lease row FOR SHARE to commit — a revoke UPDATE cannot commit until in-flight appends finish, then
+   *  new appends fail closed. `ready` is an unforgeable capability (minted only by
+   *  `assertSourceFenceReady` after a real full-catalog attestation) binding the AUTHORIZED writer
+   *  identity (holder + leaseId + grant digest). A non-HA single-node deployment must DELIBERATELY opt
+   *  out with `{ mode: 'unfenced-single-node' }` — bypass cannot happen by omission. */
+  sourceLeaseGate: SourceGateConfig;
 }
+
+/** (H1) Explicit source-gate discriminant — a fencible outbox cannot be constructed without choosing. */
+export type SourceGateConfig =
+  | { mode: 'fenced'; resolver: SourceVerifyKeyResolver; controlToASkewBoundMs: number; ready: SourceFenceReadyToken }
+  | { mode: 'unfenced-single-node' };
 
 // ── Source-side durable outbox (append builds + signs the head chain) ────────
 
@@ -621,10 +626,14 @@ export class PgTskDurableOutbox {
     if (!Number.isSafeInteger(opts.maxPendingRows) || opts.maxPendingRows <= 0) throw new ContractValidationError('maxPendingRows must be a positive safe integer');
     this.scopeDeadlineMs = validateDeadlineMs(opts.scopeDeadlineMs ?? DEFAULT_SCOPE_DEADLINE_MS, 'scopeDeadlineMs');
     this.schema = requireReady(ready, db);
-    if (opts.sourceLeaseGate) {
+    const gate = opts.sourceLeaseGate;
+    if (!gate || (gate.mode !== 'fenced' && gate.mode !== 'unfenced-single-node')) {
+      throw new ContractValidationError('sourceLeaseGate is required — choose { mode: "fenced", ... } or { mode: "unfenced-single-node" } (no implicit bypass)');
+    }
+    if (gate.mode === 'fenced') {
       // Validate the capability is real + bound to THIS transactor/schema/stream, and lift the
       // authorized identity. A forged/foreign token or a schema/stream mismatch fails construction.
-      const b = requireSourceFenceReady(opts.sourceLeaseGate.ready, { db, schema: this.schema, streamId: opts.streamId });
+      const b = requireSourceFenceReady(gate.ready, { db, schema: this.schema, streamId: opts.streamId });
       this.sourceBound = { holderNodeId: b.holderNodeId, leaseId: b.leaseId, grantDigest: b.grantDigest };
     }
     this.sanitizer = opts.sanitizer;
@@ -642,10 +651,10 @@ export class PgTskDurableOutbox {
       // catching a tx that passed the per-append gate then stalled past expiry. FOR SHARE is already
       // held from the append; this re-affirms it. NOTE (per design §A.2): this does NOT guarantee the
       // COMMIT lands before the deadline — the lock-based revoke is the freeze authority.
-      onBeforeCommit: gate ? async (exec) => {
+      onBeforeCommit: gate.mode === 'fenced' ? async (exec) => {
         const fenceRows = (await exec.query('SELECT fence_token FROM tsk_outbox_fence WHERE stream_id = $1 FOR SHARE', [this.opts.streamId])).rows;
         if (!fenceRows.length) throw new ContractValidationError('no authoritative fence row at pre-commit re-check');
-        await assertSourceLeaseWritable(exec, gate.resolver, this.opts.streamId, Number(BigInt(String(fenceRows[0].fence_token))), gate.controlToASkewBoundMs, this.sourceBound);
+        await assertSourceLeaseWritable(exec, gate.resolver, this.opts.streamId, Number(BigInt(String(fenceRows[0].fence_token))), gate.controlToASkewBoundMs, this.sourceBound!);
       } : undefined,
     }));
   }
@@ -667,8 +676,9 @@ export class PgTskDurableOutbox {
     // (PR2b-0) non-bypassable source lease gate: in the SAME append tx, assert the control-issued
     // guard-signed lease is active at THIS fence epoch and not past its signed deadline (A's own
     // clock + bounded skew); FOR SHARE is held to commit so a revoke UPDATE freezes new appends.
-    if (this.opts.sourceLeaseGate) {
-      await assertSourceLeaseWritable(exec, this.opts.sourceLeaseGate.resolver, streamId, Number(persistedFence), this.opts.sourceLeaseGate.controlToASkewBoundMs, this.sourceBound);
+    const gate = this.opts.sourceLeaseGate;
+    if (gate.mode === 'fenced') {
+      await assertSourceLeaseWritable(exec, gate.resolver, streamId, Number(persistedFence), gate.controlToASkewBoundMs, this.sourceBound!);
     }
 
     const pending = safeSeq((await exec.query('SELECT count(*)::bigint AS n FROM tsk_outbox_rows WHERE stream_id = $1 AND acked_at IS NULL AND quarantined_at IS NULL', [streamId])).rows[0].n, 'pending-count');

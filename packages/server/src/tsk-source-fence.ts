@@ -15,7 +15,7 @@
  * append-tx wiring, the transactor pre-commit recheck, the SourceFrozenReceipt, and the external
  * restore/fork witness land in subsequent PR2b-0 commits.
  */
-import { createHash, sign as edSign, verify as edVerify, createPublicKey, createPrivateKey, type KeyObject } from 'node:crypto';
+import { createHash, sign as edSign, verify as edVerify, createPrivateKey, type KeyObject } from 'node:crypto';
 
 import { ContractValidationError } from './ha-outbox-contract.js';
 import type { PgExecutor, PgTransactor } from './tsk-hotp-outbox-pg.js';
@@ -51,15 +51,22 @@ function vNullableDigest(v: unknown, label: string): string | null {
 
 // ── asymmetric ed25519 signing (C1: verifiers hold PUBLIC keys ONLY, never signer material) ──
 
-/** Resolves a keyId to its ed25519 PUBLIC verify key (KeyObject or PEM/DER), or null if
- *  unknown/revoked. Verifiers (source, receiver B, control) hold ONLY public keys — so a verifier
- *  can NEVER forge a signature (unlike symmetric HMAC, where the verifier holds the signer secret). */
-export interface SourceVerifyKeyResolver { resolve(keyId: string): KeyObject | string | null; }
+/** Resolves a keyId to its ed25519 PUBLIC verify `KeyObject`, or null if unknown/revoked. Verifiers
+ *  (source, receiver B, control) hold ONLY public keys — so a verifier can NEVER forge a signature.
+ *  (H2) The resolver returns a `KeyObject` ONLY — never a PEM/DER string. A string public key would let
+ *  `createPublicKey(<PRIVATE PKCS8 PEM>)` silently DERIVE a public key from private material handed to
+ *  the verifier, so the verifier's config could hold the signer's private key while appearing
+ *  "public-only". A public `KeyObject` provably carries no private bytes; a private/secret `KeyObject`
+ *  is rejected at the boundary below. */
+export interface SourceVerifyKeyResolver { resolve(keyId: string): KeyObject | null; }
 
-function toPublicKey(k: KeyObject | string): KeyObject {
-  const key = typeof k === 'string' ? createPublicKey(k) : k;
-  if (key.type !== 'public' || key.asymmetricKeyType !== 'ed25519') throw new ContractValidationError('verify key must be an ed25519 public key');
-  return key;
+function toPublicKey(k: KeyObject): KeyObject {
+  // (H2) accept ONLY a public ed25519 KeyObject — reject strings/PEM/DER and any private/secret material.
+  if (k === null || typeof k !== 'object' || typeof (k as KeyObject).asymmetricKeyType === 'undefined') {
+    throw new ContractValidationError('verify key must be a public ed25519 KeyObject (no PEM/DER/private material)');
+  }
+  if (k.type !== 'public' || k.asymmetricKeyType !== 'ed25519') throw new ContractValidationError('verify key must be an ed25519 PUBLIC key (private/secret material rejected)');
+  return k;
 }
 function toPrivateKey(k: KeyObject | string): KeyObject {
   const key = typeof k === 'string' ? createPrivateKey(k) : k;
@@ -202,12 +209,9 @@ export async function installLeaseGrant(exec: PgExecutor, resolver: SourceVerify
   verifyLeaseGrant(resolver, g);
   // (H2) serialize installs per stream so concurrent grants/revokes cannot interleave.
   await exec.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))', [g.streamId]);
-  const cur = await readSourceLease(exec, resolver, g.streamId);
-  // (H2) the head MUST be the latest history row (no replay of an older validly-signed head).
-  if (cur) {
-    const maxSeq = vInt((await exec.query('SELECT COALESCE(max(lease_grant_seq), 0) AS m FROM tsk_source_lease_history WHERE stream_id=$1', [g.streamId])).rows[0].m, 'max lease seq', 0, MAX_SEQ);
-    if (cur.leaseGrantSeq !== maxSeq) throw new SourceFenceQuarantineError('lease head is not the latest history row (replay/rollback) — quarantine');
-  }
+  // (H4) the head must be the EXACT latest row of a contiguous signed chain from genesis (no replay of
+  // an older validly-signed head, no same-seq fork/relabel).
+  const cur = await assertLeaseChained(exec, resolver, g.streamId);
   // idempotent: this exact grant already installed (by grant_seq + digest) → no-op
   if (cur && cur.leaseGrantSeq === g.leaseGrantSeq && cur.grantDigest === g.grantDigest) return cur;
   // command idempotency: same command already installed with the SAME tuple → return it; different → reject
@@ -277,6 +281,36 @@ async function readSourceLeaseAtSeq(exec: PgExecutor, resolver: SourceVerifyKeyR
   return m.state;
 }
 
+/** (H4) Verify the FULL lease chain under the per-stream lock: every history row is signed + digest-
+ *  valid, the seq is contiguous 1..N from genesis, each `prev_grant_digest` chains the prior row, and
+ *  the head is EXACTLY the latest history row (same seq AND digest). A same-seq fork, a relabelled
+ *  head, a broken chain, or a head that is not the latest history row → quarantine. Returns the
+ *  verified head (or null if there is provably no lease). Call only inside the advisory-locked tx. */
+async function assertLeaseChained(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<LeaseState | null> {
+  const s = vId(streamId, STREAM_ID_RE, 'streamId');
+  const head = await readSourceLease(exec, resolver, s); // verifies head signature + digest
+  const rows = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease_history WHERE stream_id=$1 ORDER BY lease_grant_seq ASC', [s])).rows;
+  if (rows.length === 0) {
+    if (head !== null) throw new SourceFenceQuarantineError('lease head present with no history — fork/relabel; quarantine');
+    return null;
+  }
+  let prev: string | null = null;
+  let last: LeaseState | null = null;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i] as Record<string, unknown>;
+    const m = rowToLease(s, row);
+    if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease history digest mismatch');
+    verifySig(resolver, m.keyId, m.sigMsg, m.sig);
+    if (m.state.leaseGrantSeq !== i + 1) throw new SourceFenceQuarantineError(`lease history seq ${m.state.leaseGrantSeq} is not contiguous from genesis (expected ${i + 1}) — quarantine`);
+    if (vNullableDigest(row.prev_grant_digest, 'prev_grant_digest') !== prev) throw new SourceFenceQuarantineError('lease history prev_grant_digest chain broken — fork/relabel; quarantine');
+    prev = m.digest; last = m.state;
+  }
+  if (head === null || last === null || head.leaseGrantSeq !== last.leaseGrantSeq || head.grantDigest !== last.grantDigest) {
+    throw new SourceFenceQuarantineError('lease head is not the exact latest history row (fork/relabel/rollback) — quarantine');
+  }
+  return head;
+}
+
 /**
  * (§A.2) THE GATE — assert the source is writable at `expectedEpoch` within the append tx.
  * Takes `FOR SHARE` on the lease head (held to commit); requires an active lease at the expected
@@ -284,29 +318,37 @@ async function readSourceLeaseAtSeq(exec: PgExecutor, resolver: SourceVerifyKeyR
  * conflicting revoke UPDATE cannot commit until in-flight FOR SHARE appends finish, then new appends
  * fail here. Missing lease → fail closed.
  */
-export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string, expectedEpoch: number, controlToASkewBoundMs: number, bound?: { holderNodeId: string; leaseId: string; grantDigest: string }): Promise<LeaseState> {
+export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string, expectedEpoch: number, controlToASkewBoundMs: number, bound: { holderNodeId: string; leaseId: string; grantDigest: string }): Promise<LeaseState> {
   const s = vId(streamId, STREAM_ID_RE, 'streamId');
   const epoch = vInt(expectedEpoch, 'expectedEpoch', 0, MAX_EPOCH);
   const skew = vInt(controlToASkewBoundMs, 'controlToASkewBoundMs', 0, MAX_SKEW_MS);
+  // (H1) identity binding is MANDATORY — the caller MUST pass the authorized writer identity.
+  if (!bound || typeof bound !== 'object') throw new ContractValidationError('assertSourceLeaseWritable requires an authorized {holderNodeId, leaseId, grantDigest} binding');
+  vId(bound.holderNodeId, ID_RE, 'bound.holderNodeId'); vId(bound.leaseId, ID_RE, 'bound.leaseId');
+  if (!DIGEST_RE.test(bound.grantDigest)) throw new ContractValidationError('invalid bound.grantDigest');
   const r = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
   if (!r) throw new SourceFenceQuarantineError('no source lease — writer is not leased; fail closed');
   const m = rowToLease(s, r);
   if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease head digest mismatch');
   verifySig(resolver, m.keyId, m.sigMsg, m.sig);
   const st = m.state;
+  // (H4) the head (locked FOR SHARE) must be the EXACT latest history row — a same-seq fork or a
+  // relabelled head fails closed even though the head signature alone verifies.
+  const latest = (await exec.query('SELECT lease_grant_seq, grant_digest FROM tsk_source_lease_history WHERE stream_id=$1 ORDER BY lease_grant_seq DESC LIMIT 1', [s])).rows[0];
+  if (!latest || vInt(latest.lease_grant_seq, 'latest lease_grant_seq', 1, MAX_SEQ) !== st.leaseGrantSeq || String(latest.grant_digest) !== st.grantDigest) {
+    throw new SourceFenceQuarantineError('source lease head is not the latest history row (fork/relabel/rollback) — fail closed');
+  }
   if (st.leaseStatus !== 'active') throw new SourceFenceQuarantineError(`source lease is ${st.leaseStatus} — fenced; fail closed`);
   if (st.leaseEpoch !== epoch) throw new SourceFenceQuarantineError(`source lease epoch ${st.leaseEpoch} != expected ${epoch} — stale writer; fail closed`);
   // A's own clock; the signed deadline is on the control clock, bounded by the measured skew.
   const nowMs = vInt((await exec.query("SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS ms")).rows[0]?.ms, 'A clock now', 0, MAX_MS);
   if (nowMs >= st.leaseExpiresAtMs - skew) throw new SourceFenceQuarantineError('source lease deadline elapsed on A clock (+skew) — fail closed');
-  // (C2/H1) identity binding: the live lease must be the SAME holder+leaseId+grant this writer was
-  // authorized for. A different writer that is legitimately leased at the same epoch (holder pivot or a
-  // renewed grant this writer was not authorized for) fails closed here rather than silently writing.
-  if (bound) {
-    if (st.holderNodeId !== bound.holderNodeId) throw new SourceFenceQuarantineError(`source lease holder ${st.holderNodeId} != authorized ${bound.holderNodeId} — fail closed`);
-    if (st.leaseId !== bound.leaseId) throw new SourceFenceQuarantineError(`source lease id ${st.leaseId} != authorized ${bound.leaseId} — fail closed`);
-    if (st.grantDigest !== bound.grantDigest) throw new SourceFenceQuarantineError('source lease grant digest != authorized grant — fail closed');
-  }
+  // (C2/H1) identity binding (MANDATORY): the live lease must be the SAME holder+leaseId+grant this
+  // writer was authorized for. A different writer that is legitimately leased at the same epoch (holder
+  // pivot or a renewed grant this writer was not authorized for) fails closed rather than silently writing.
+  if (st.holderNodeId !== bound.holderNodeId) throw new SourceFenceQuarantineError(`source lease holder ${st.holderNodeId} != authorized ${bound.holderNodeId} — fail closed`);
+  if (st.leaseId !== bound.leaseId) throw new SourceFenceQuarantineError(`source lease id ${st.leaseId} != authorized ${bound.leaseId} — fail closed`);
+  if (st.grantDigest !== bound.grantDigest) throw new SourceFenceQuarantineError('source lease grant digest != authorized grant — fail closed');
   return st;
 }
 
@@ -443,7 +485,10 @@ type BareCheckpointReceipt = Omit<SourceCheckpointReceipt, 'receiptDigest' | 'so
 function checkpointReceiptMsg(b: BareCheckpointReceipt, digest: string): Buffer {
   return frame('tsk_source_checkpoint/v1', b.streamId, b.sourceSystemId, b.sourceSeq, b.sourceHeadDigest, b.grantSeq, b.priorSeq, b.priorHeadDigest, digest);
 }
-/** SOURCE issuer: sign a checkpoint receipt over the exact canonical tuple (source custody). */
+/** LOW-LEVEL signer over the exact canonical tuple (source custody). NB: this signs whatever caller
+ *  state it is given — it does NOT derive from the committed ledger. The runtime/production path MUST
+ *  use `issueSourceCheckpointReceipt` (atomic, schema-pinned, locked DB derivation); this primitive is
+ *  retained only for protocol/continuity unit tests and internal use by the issuer. */
 export function signSourceCheckpointReceipt(sourceKeyId: string, sourcePrivateKey: KeyObject | string, b: BareCheckpointReceipt): SourceCheckpointReceipt {
   vId(b.streamId, STREAM_ID_RE, 'streamId'); vId(b.sourceSystemId, ID_RE, 'sourceSystemId');
   vInt(b.sourceSeq, 'sourceSeq', 0, MAX_SEQ); vInt(b.grantSeq, 'grantSeq', 0, MAX_SEQ); vInt(b.priorSeq, 'priorSeq', 0, MAX_SEQ);
@@ -481,6 +526,37 @@ export async function readSourceWitness(exec: PgExecutor, resolver: SourceVerify
   return { streamId: s, sourceSystemId: sysId, maxGrantSeq: gs, maxSourceSeq: ss, headDigest: head, witnessSeq: wseq, witnessDigest: digest };
 }
 
+/** (H4) Verify the FULL witness chain under the per-stream lock: every witness_history row is signed +
+ *  digest-valid, `witness_seq` is contiguous 1..N from genesis, each `prev_witness_digest` chains the
+ *  prior row, and the head is EXACTLY the latest history row. A same-seq witness fork, a relabelled
+ *  head, or a broken chain → quarantine. Returns the verified head (or null if none). */
+async function assertWitnessChained(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<WitnessState | null> {
+  const s = vId(streamId, STREAM_ID_RE, 'streamId');
+  const head = await readSourceWitness(exec, resolver, s); // verifies head signature + digest
+  const rows = (await exec.query('SELECT source_system_id, max_grant_seq, max_source_seq, source_head_digest, witness_seq, prev_witness_digest, witness_digest, guard_key_id, guard_signature FROM tsk_source_witness_history WHERE stream_id=$1 ORDER BY witness_seq ASC', [s])).rows;
+  if (rows.length === 0) {
+    if (head !== null) throw new SourceFenceQuarantineError('witness head present with no history — fork/relabel; quarantine');
+    return null;
+  }
+  let prev: string | null = null;
+  let lastSeq = 0, lastDigest = '';
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i] as Record<string, unknown>;
+    const sysId = String(r.source_system_id), gs = vInt(r.max_grant_seq, 'max_grant_seq', 0, MAX_SEQ), ss = vInt(r.max_source_seq, 'max_source_seq', 0, MAX_SEQ);
+    const hd = vHeadDigest(r.source_head_digest, 'source_head_digest'), wseq = vInt(r.witness_seq, 'witness_seq', 1, MAX_SEQ);
+    const pv = vNullableDigest(r.prev_witness_digest, 'prev_witness_digest'), dg = vHeadDigest(r.witness_digest, 'witness_digest');
+    if (sha256hex(witnessMsg(s, sysId, gs, ss, hd, wseq, pv, '')) !== dg) throw new ContractValidationError('witness history digest mismatch');
+    verifySig(resolver, String(r.guard_key_id), witnessMsg(s, sysId, gs, ss, hd, wseq, pv, dg), String(r.guard_signature));
+    if (wseq !== i + 1) throw new SourceFenceQuarantineError(`witness history seq ${wseq} is not contiguous from genesis (expected ${i + 1}) — quarantine`);
+    if ((pv ?? null) !== prev) throw new SourceFenceQuarantineError('witness history prev_witness_digest chain broken — fork/relabel; quarantine');
+    prev = dg; lastSeq = wseq; lastDigest = dg;
+  }
+  if (head === null || head.witnessSeq !== lastSeq || head.witnessDigest !== lastDigest) {
+    throw new SourceFenceQuarantineError('witness head is not the exact latest history row (fork/relabel/rollback) — quarantine');
+  }
+  return head;
+}
+
 /** (§A.3) Assert the live source high-water state is consistent with the external witness. A regression
  *  (grant_seq / source seq below the witness = restore/rollback), a divergent head at the witness seq
  *  (= same-height fork), or a changed system_identifier → QUARANTINE. No witness yet → genesis (ok). */
@@ -494,19 +570,20 @@ export function assertSourceWitnessConsistent(witness: WitnessState | null, live
   }
 }
 
-/** (C5) Advance the external witness from a SOURCE-SIGNED checkpoint receipt (never caller-supplied
- *  state). Verifies the source signature; enforces system_id + grant/seq monotonicity; and a
- *  CONTINUITY proof at the last-witnessed height — the receipt's `priorSeq`/`priorHeadDigest` must
- *  equal the witness's `(maxSourceSeq, headDigest)`, so a restore+fork that grew BEYOND the witnessed
- *  height is caught. Then guard-signed forward-CAS. Per-stream advisory-locked. */
-export async function advanceSourceWitness(exec: PgExecutor, resolver: SourceVerifyKeyResolver, guardKeyId: string, guardPrivateKey: KeyObject | string, receipt: SourceCheckpointReceipt): Promise<WitnessState> {
+/** (C5) In-tx primitive: advance the external witness from a SOURCE-SIGNED checkpoint receipt (never
+ *  caller-supplied state). Verifies the source signature; enforces system_id + grant/seq monotonicity;
+ *  a CONTINUITY proof at the last-witnessed height (receipt.priorSeq/priorHeadDigest must equal the
+ *  witness's (maxSourceSeq, headDigest), catching a restore+fork that grew BEYOND that height); and
+ *  the FULL witness chain (H4). Then guard-signed forward-CAS. Per-stream advisory-locked. The caller
+ *  must already be in the control tx (the owned-tx `advanceSourceWitness` pins schema + attests). */
+export async function advanceSourceWitnessInTx(exec: PgExecutor, resolver: SourceVerifyKeyResolver, guardKeyId: string, guardPrivateKey: KeyObject | string, receipt: SourceCheckpointReceipt): Promise<WitnessState> {
   if (!KEY_ID_RE.test(guardKeyId)) throw new ContractValidationError('invalid guard keyId');
   verifySourceCheckpointReceipt(resolver, receipt); // SOURCE-signed, not caller-supplied state
   const s = vId(receipt.streamId, STREAM_ID_RE, 'streamId');
   const sysId = receipt.sourceSystemId, gs = receipt.grantSeq, ss = receipt.sourceSeq, head = receipt.sourceHeadDigest;
   await exec.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))', [s]);
-  await attestSourceWitness(exec); // (H1) the witness catalog must match its compiled pin before we mutate it
-  const cur = await readSourceWitness(exec, resolver, s);
+  await attestSourceWitness(exec); // (H3) the witness catalog must match its compiled pin before we mutate it
+  const cur = await assertWitnessChained(exec, resolver, s); // (H4) head == latest of a contiguous signed chain
   // idempotent re-advance (crash-resume): an identical high-water is a no-op, not a new witness seq.
   if (cur && cur.sourceSystemId === sysId && cur.maxGrantSeq === gs && cur.maxSourceSeq === ss && cur.headDigest === head) return cur;
   if (cur) {
@@ -556,6 +633,13 @@ async function sourceFenceManifest(exec: PgExecutor, tables: readonly string[], 
   // NB: do NOT rely on SQL `ORDER BY <text>` — the default collation differs across builds (glibc on
   // Debian vs musl on Alpine sort punctuation differently), so the same catalog would hash to different
   // digests. Fetch unordered and sort the emitted lines byte-canonically in application code instead.
+  // (H3) attest the FULL catalog like the hardened control manifest: exact table presence (relkind /
+  // persistence / RLS enable+force), columns, constraints, indexes, triggers (+enabled), and policies —
+  // so an UNLOGGED flip, an added trigger, an RLS toggle, or a new policy cannot drift past the pin.
+  const rel = (await exec.query(
+    `SELECT rel.relname AS t, rel.relkind, rel.relpersistence, rel.relrowsecurity, rel.relforcerowsecurity
+     FROM pg_catalog.pg_class rel JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace
+     WHERE ns.nspname = pg_catalog.current_schema() AND rel.relname = ANY($1)`, [t])).rows;
   const cols = (await exec.query(
     `SELECT table_name, ordinal_position, column_name, data_type, is_nullable, COALESCE(column_default,'') AS d
      FROM information_schema.columns WHERE table_schema = pg_catalog.current_schema() AND table_name = ANY($1)`, [t])).rows;
@@ -567,10 +651,25 @@ async function sourceFenceManifest(exec: PgExecutor, tables: readonly string[], 
   const idx = (await exec.query(
     `SELECT tablename AS t, indexname AS n, indexdef AS def FROM pg_catalog.pg_indexes
      WHERE schemaname = pg_catalog.current_schema() AND tablename = ANY($1)`, [t])).rows;
+  const trg = (await exec.query(
+    `SELECT rel.relname AS t, tg.tgname AS n, pg_catalog.pg_get_triggerdef(tg.oid) AS def, tg.tgenabled
+     FROM pg_catalog.pg_trigger tg JOIN pg_catalog.pg_class rel ON rel.oid = tg.tgrelid
+     JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace
+     WHERE ns.nspname = pg_catalog.current_schema() AND rel.relname = ANY($1) AND NOT tg.tgisinternal`, [t])).rows;
+  const pol = (await exec.query(
+    `SELECT tablename AS t, policyname AS n, permissive, roles::text AS roles, cmd, COALESCE(qual,'') AS qual, COALESCE(with_check,'') AS wc
+     FROM pg_catalog.pg_policies WHERE schemaname = pg_catalog.current_schema() AND tablename = ANY($1)`, [t])).rows;
+  // exact table-presence assertion: the manifest carries the SORTED set of tables actually present, so
+  // a missing OR extra governed table changes the digest (and a fully-absent table set fails closed).
+  const present = rel.map((r) => String(r.t)).sort();
   const lines = [
+    `PRESENT|${present.join(',')}|n=${present.length}`,
+    ...rel.map((r) => `R|${r.t}|${r.relkind}|${r.relpersistence}|${r.relrowsecurity}|${r.relforcerowsecurity}`),
     ...cols.map((r) => `C|${r.table_name}|${r.ordinal_position}|${r.column_name}|${r.data_type}|${r.is_nullable}|${r.d}`),
     ...cons.map((r) => `K|${r.t}|${r.contype}|${r.def}`),
     ...idx.map((r) => `I|${r.t}|${r.n}|${r.def}`),
+    ...trg.map((r) => `T|${r.t}|${r.n}|${r.tgenabled}|${r.def}`),
+    ...pol.map((r) => `P|${r.t}|${r.n}|${r.permissive}|${r.roles}|${r.cmd}|${r.qual}|${r.wc}`),
   ];
   lines.sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))); // collation-independent
   return [ver, ...lines].join('\n');
@@ -579,8 +678,8 @@ async function sourceFenceManifest(exec: PgExecutor, tables: readonly string[], 
 /** COMPILED expected catalog digests (pinned in source; computed on PG16). Re-pin only via an offline
  *  code-reviewed step; there is deliberately NO runtime override (R5-H1). The lease digest gates the
  *  outbox (on A); the witness digest gates witness advances (on control). */
-export const SOURCE_LEASE_MANIFEST_DIGEST = '7ff3783cbd37512140c34bb29ea755934f3a37f400f6fbb9ac4c540adca0c0c6';
-export const SOURCE_WITNESS_MANIFEST_DIGEST = '5a1071edc5996ac01696dd4cc2ac7955ca261c846f36226e7aa0f4b0c183de1a';
+export const SOURCE_LEASE_MANIFEST_DIGEST = '548ad3d75a8d9dc612afe2f6e3734d5660fb79ce768a011d5a2de3cfca4c04f3';
+export const SOURCE_WITNESS_MANIFEST_DIGEST = 'ec71067986cb82d06fc8fa3e4e9f934b4a961b0759a92199789de33c19ce0a82';
 
 async function attestSourceLease(exec: PgExecutor): Promise<void> {
   const digest = sha256hex(Buffer.from(await sourceFenceManifest(exec, TSK_SOURCE_LEASE_TABLES, 'Vsource_lease/1'), 'utf8'));
@@ -622,4 +721,67 @@ export async function assertSourceFenceReady(db: PgTransactor, schema: string, b
   if (!DIGEST_RE.test(binding.grantDigest)) throw new ContractValidationError('invalid grantDigest');
   await db.transaction(async (exec) => { await enterSourceTx(exec, schema); await attestSourceLease(exec); });
   return mintReady({ db, schema, streamId, holderNodeId, leaseId, grantDigest: binding.grantDigest });
+}
+
+// ── (H3) control-side witness readiness + owned serializable advance; (H5) atomic checkpoint issuer ──
+
+const WITNESS_READY_BRAND: unique symbol = Symbol('tsk_source_witness_ready');
+export interface SourceWitnessReadyToken { readonly [WITNESS_READY_BRAND]: true }
+interface WitnessBinding { db: PgTransactor; schema: string; }
+const WITNESS_READY_STATE = new WeakMap<object, WitnessBinding>();
+function mintWitnessReady(b: WitnessBinding): SourceWitnessReadyToken {
+  const token = Object.freeze({ [WITNESS_READY_BRAND]: true as const });
+  WITNESS_READY_STATE.set(token, b);
+  return token as SourceWitnessReadyToken;
+}
+/** Validate an unforgeable witness capability + that it is bound to this control transactor. */
+export function requireSourceWitnessReady(token: SourceWitnessReadyToken, ctx: { db: PgTransactor }): WitnessBinding {
+  const st = WITNESS_READY_STATE.get(token as unknown as object);
+  if (!st) throw new ContractValidationError('invalid source-witness capability (forged or foreign token)');
+  if (st.db !== ctx.db) throw new ContractValidationError('source-witness capability bound to a different transactor');
+  return st;
+}
+/** Attest the compiled witness catalog in the pinned schema (control transactor) + mint a db/schema-
+ *  bound witness capability. The owned-tx `advanceSourceWitness` REQUIRES this token. */
+export async function assertSourceWitnessReady(db: PgTransactor, schema: string): Promise<SourceWitnessReadyToken> {
+  await db.transaction(async (exec) => { await enterSourceTx(exec, schema); await attestSourceWitness(exec); });
+  return mintWitnessReady({ db, schema });
+}
+/** (H3) Owned, SERIALIZABLE, schema-pinned witness advance (production path): validate the db/schema-
+ *  bound capability, open the control tx, pin the schema, then run the in-tx primitive (attest + full
+ *  chain + continuity + guard-signed CAS). Never takes a raw caller exec/current_schema. */
+export async function advanceSourceWitness(db: PgTransactor, ready: SourceWitnessReadyToken, resolver: SourceVerifyKeyResolver, guardKeyId: string, guardPrivateKey: KeyObject | string, receipt: SourceCheckpointReceipt): Promise<WitnessState> {
+  const { schema } = requireSourceWitnessReady(ready, { db });
+  return db.transaction(async (exec) => {
+    await enterSourceTx(exec, schema);
+    return advanceSourceWitnessInTx(exec, resolver, guardKeyId, guardPrivateKey, receipt);
+  });
+}
+
+/** (H5) The ONLY runtime path that produces a checkpoint receipt: a source-transactor-owned,
+ *  SERIALIZABLE, schema-pinned derivation. Attests the lease catalog, LOCKS the source lease +
+ *  checkpoint FOR SHARE, DERIVES the committed (system_identifier, grantSeq, head@N, head@N-1)
+ *  straight from the ledger, then source-signs. The low-level `signSourceCheckpointReceipt` accepts
+ *  arbitrary caller state and MUST NOT attest live source state on the runtime path — use this. */
+export async function issueSourceCheckpointReceipt(db: PgTransactor, schema: string, streamId: string, sourceKeyId: string, sourcePrivateKey: KeyObject | string): Promise<SourceCheckpointReceipt> {
+  const s = vId(streamId, STREAM_ID_RE, 'streamId');
+  return db.transaction(async (exec) => {
+    await enterSourceTx(exec, schema);
+    await attestSourceLease(exec);
+    const sysId = String((await exec.query('SELECT system_identifier::text AS s FROM pg_catalog.pg_control_system()')).rows[0]?.s);
+    // lock the lease head + source checkpoint FOR SHARE so no concurrent revoke/append moves them under us
+    const lease = (await exec.query('SELECT lease_grant_seq FROM tsk_source_lease WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
+    if (!lease) throw new SourceFenceQuarantineError('no source lease — cannot issue a checkpoint for an unleased stream');
+    const grantSeq = vInt(lease.lease_grant_seq, 'lease_grant_seq', 1, MAX_SEQ);
+    const cp = (await exec.query('SELECT sequence, head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
+    if (!cp) throw new SourceFenceQuarantineError('no source checkpoint — stream not provisioned');
+    const n = vInt(cp.sequence, 'source sequence', 0, MAX_SEQ);
+    if (n < 1) throw new SourceFenceQuarantineError('source checkpoint at genesis (N=0) — nothing to witness');
+    const headN = vHeadDigest(cp.head_digest, 'source head@N');
+    const priorSeq = n - 1;
+    const priorHeadDigest = priorSeq === 0
+      ? '0'.repeat(64)
+      : vHeadDigest((await exec.query('SELECT head_digest FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=$2', [s, priorSeq])).rows[0]?.head_digest, 'source head@N-1');
+    return signSourceCheckpointReceipt(sourceKeyId, sourcePrivateKey, { streamId: s, sourceSystemId: sysId, sourceSeq: n, sourceHeadDigest: headN, grantSeq, priorSeq, priorHeadDigest });
+  });
 }
