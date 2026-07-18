@@ -325,6 +325,29 @@ async function main() {
     assert.equal(await unacked(sid), 1); // nothing acked; the row is untouched
   });
 
+  await check('(MED) transparent Proxy receipt: a Proxy-presented ACK is snapshotted; mutating the target mid-verify cannot flip the acked decision', async () => {
+    const sid = 'tsk:receipt-proxy/v1'; await provision(sid);
+    const ob = mkOutbox(serial, sid);
+    await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 1 }, fenceToken: 0n }));
+    let target: Record<string, unknown> | null = null;
+    const proxyTransport: TskOutboxTransport = {
+      async deliverAndAwaitAck(record) {
+        target = { streamId: record.streamId, sourceEpoch: record.sourceEpoch, sequence: record.sequence, opDigest: record.opDigest, decision: 'applied', receiverId: RID, keyId: KEY_ID, issuedAt: 'now', signature: ackSign(record, 'applied') };
+        return new Proxy(target, {}) as unknown as TskAckReceipt; // transparent — passes every structural check
+      },
+    };
+    const mutatingVerifier: TskAckReceiptVerifier = {
+      async verify(receipt, record) {
+        // flip the underlying target AFTER the snapshot was taken; the frozen snapshot must win
+        if (target) { (target as { decision: string }).decision = 'reject-fork'; (target as { signature: string }).signature = ackSign(record, 'reject-fork'); }
+        if (receipt.receiverId !== RID || receipt.signature !== ackSign(record, receipt.decision)) throw new ContractValidationError('bad ACK');
+      },
+    };
+    const res = await new PgTskPublisher(serial, sid, proxyTransport, 'quarantine', sanitizer, mutatingVerifier, READY, { leaseMs: 30_000 }).drainOnce();
+    assert.equal(res.acked, 1); assert.equal(res.quarantined, 0); // acted on the frozen 'applied' snapshot, not the mutated target
+    assert.equal(await unacked(sid), 0);
+  });
+
   await check('(MED) schema grammar: a valid lowercase non-public schema attests; invalid identifiers are rejected', async () => {
     await assert.rejects(() => assertSchemaReady(serial, 'Bad$Schema'), /invalid schema identifier/);
     await assert.rejects(() => assertSchemaReady(serial, '1abc'), /invalid schema identifier/);

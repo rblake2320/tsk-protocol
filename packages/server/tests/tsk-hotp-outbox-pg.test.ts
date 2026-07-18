@@ -288,6 +288,63 @@ describe('PgTskReceiverCheckpoint — HOTP exactly-once + signed hash-linked hea
     expect(applied).toEqual(['1:T1:8']);
   });
 
+  describe('(MED) transparent Proxy is ACCEPTED (not rejected) but snapshotted to a stable frozen copy', () => {
+    // A faithful Proxy over exact plain data passes getPrototypeOf/ownKeys/
+    // getOwnPropertyDescriptor, so it is NOT rejected — by design. The safety
+    // property is STABILITY: each descriptor value is read once and frozen before
+    // any await, so neither the Proxy nor a later target mutation can change what
+    // is applied/consumed/persisted.
+    it('record + head presented as transparent Proxies are accepted and applied from the frozen snapshot', async () => {
+      const r = mkRecordHead(1, { tumblerId: 'T1', counter: 5 }, GENESIS_HEAD);
+      const recProxy = new Proxy({ ...r.record, mutation: { ...r.record.mutation } }, {});
+      const headProxy = new Proxy({ ...r.head }, {});
+      expect(await rcv.verifyAndApplyTumblerDelivered(recProxy as OutboxRecord<TskHotpMutation>, headProxy as SignedStreamHead)).toBe('applied');
+      expect(db.rcvOf(SID).seq).toBe(1);
+      expect(db.rcvOf(SID).head).toBe(r.head.headDigest);
+      expect(applied).toEqual(['1:T1:5']);
+    });
+
+    it('mutating a Proxy target (record tuple + nested mutation) mid-verify does not change what is applied/consumed', async () => {
+      const r = mkRecordHead(1, { tumblerId: 'T1', counter: 5 }, GENESIS_HEAD);
+      const target = { ...r.record, mutation: { ...r.record.mutation } };
+      const recProxy = new Proxy(target, {}); // faithful forwarding — passes every structural check
+      const evil: StreamHeadVerifier = {
+        async verify(head) {
+          (target as { sequence: number }).sequence = 999;
+          (target.mutation as { counter: number }).counter = 999;
+          (target.mutation as { tumblerId: string }).tumblerId = 'EVIL';
+          const ok = edVerify(null, Buffer.from(head.headDigest, 'utf8'), publicKey as KeyObject, Buffer.from(head.signature, 'base64url'));
+          if (!ok) throw new ContractValidationError('bad');
+        },
+      };
+      const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, evil, applier, ready);
+      expect(await r2.verifyAndApplyTumblerDelivered(recProxy as OutboxRecord<TskHotpMutation>, r.head)).toBe('applied');
+      expect(db.rcvOf(SID).seq).toBe(1);            // frozen snapshot seq, not 999
+      expect(applied).toEqual(['1:T1:5']);          // ORIGINAL applied
+      expect(db.hotpOf(SID, 'T1')).toBe(5);
+      expect(db.hotpOf(SID, 'EVIL')).toBeUndefined();
+    });
+
+    it('mutating a Proxy target head mid-verify does not change the persisted checkpoint head', async () => {
+      const r = mkRecordHead(1, { tumblerId: 'T1', counter: 6 }, GENESIS_HEAD);
+      const original = r.head.headDigest;
+      const target = { ...r.head };
+      const headProxy = new Proxy(target, {});
+      const evil: StreamHeadVerifier = {
+        async verify(head) {
+          (target as { headDigest: string }).headDigest = 'c'.repeat(64);
+          (target as { opDigest: string }).opDigest = 'd'.repeat(64);
+          const ok = edVerify(null, Buffer.from(head.headDigest, 'utf8'), publicKey as KeyObject, Buffer.from(head.signature, 'base64url'));
+          if (!ok) throw new ContractValidationError('bad');
+        },
+      };
+      const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, evil, applier, ready);
+      expect(await r2.verifyAndApplyTumblerDelivered(r.record, headProxy as SignedStreamHead)).toBe('applied');
+      expect(db.rcvOf(SID).head).toBe(original);    // ORIGINAL head digest persisted, not 'cccc…'
+      expect(applied).toEqual(['1:T1:6']);
+    });
+  });
+
   describe('(MED) strict snapshot validator rejects non-plain / accessor / symbol / extra-key shapes', () => {
     const valid = () => mkRecordHead(1, { tumblerId: 'T1', counter: 5 }, GENESIS_HEAD);
     const rejects = (record: OutboxRecord<TskHotpMutation>, head: SignedStreamHead) =>

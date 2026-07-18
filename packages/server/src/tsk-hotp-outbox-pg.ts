@@ -140,12 +140,21 @@ function deepFreeze<T>(o: T): T {
   return o;
 }
 /**
- * (MED) STRICT structural gate for an untrusted object: it MUST be a plain object
- * (Object.prototype or null prototype), have EXACTLY the expected own-enumerable
- * DATA keys (no missing/extra), no symbol keys, and no accessor (get/set)
- * properties. This prevents a caller from laundering an inherited value, an
- * accessor that changes across reads, a Proxy, or extra symbol/non-enumerable
- * shape past the snapshot. Returns the validated own-data values.
+ * (MED) STRICT structural gate for an untrusted object: it MUST present a plain
+ * (Object.prototype or null) prototype, EXACTLY the expected own-enumerable DATA
+ * keys (no missing/extra), no symbol keys, and no accessor (get/set) descriptors.
+ * This blocks laundering an inherited value, an accessor that changes across
+ * reads, or extra symbol/non-enumerable shape past the snapshot.
+ *
+ * NOTE ON PROXIES: this does NOT reject a transparent Proxy — a Proxy that
+ * faithfully forwards getPrototypeOf/ownKeys/getOwnPropertyDescriptor over an
+ * exact plain target passes every check here, by design. Rejection is not the
+ * safety property; STABILITY is. Each field's descriptor `value` is read ONCE via
+ * getOwnPropertyDescriptor and copied out synchronously (and the caller deep-
+ * freezes the result) BEFORE any await, so a Proxy — or a later mutation of the
+ * target — cannot change what was validated, applied, consumed, or persisted. The
+ * accessor ban is what makes that single synchronous read authoritative: a data
+ * descriptor cannot re-run trap logic on read. Returns the copied own-data values.
  */
 function assertPlainData(o: unknown, keys: readonly string[], label: string): Record<string, unknown> {
   if (o === null || typeof o !== 'object') throw new ContractValidationError(`${label} must be a plain object`);
