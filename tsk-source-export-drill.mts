@@ -81,26 +81,46 @@ async function main() {
     verifySourceExportManifest(resolver, manifest); // source signature verifies
   });
 
-  await check('GUARD verifies active command + frozen receipt, INDEPENDENTLY replays, and counter-signs (dual custody)', async () => {
-    const dual = guardCountersignSourceExport(bundle, manifest, { guardKeyId: GUARD_KEY, guardPrivateKey: guardSecret, sanitizer, sourceManifestResolver: resolver, headResolver: resolver, frozenResolver: resolver, frozenReceipt: frozen, activeCommandId: 'promote-1' });
+  const gopts = { guardKeyId: GUARD_KEY, guardPrivateKey: guardSecret, sanitizer, sourceManifestResolver: resolver, headResolver: resolver, frozenResolver: resolver, frozenReceipt: frozen, expectedCommandId: 'promote-1' };
+
+  await check('GUARD verifies expected command + full frozen binding, INDEPENDENTLY replays, and counter-signs (dual custody)', async () => {
+    const dual = guardCountersignSourceExport(bundle, manifest, gopts);
     verifyGuardCountersignedExport(resolver, resolver, dual); // both signatures verify
-    assert.equal(dual.guardKeyId, GUARD_KEY);
+    assert.equal(dual.guardKeyId, GUARD_KEY); assert.equal(dual.sourceEpoch, 'e1');
   });
 
-  await check('a PAYLOAD substitution in a chunk fails the replay (opDigest recomputed from the payload)', async () => {
+  await check('a PAYLOAD substitution fails the replay (opDigest recomputed from the payload)', async () => {
     const bad = clone(bundle); bad.historyChunks[0].records[0].payload = JSON.stringify({ tumblerId: 'T1', counter: 999 });
-    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, { guardKeyId: GUARD_KEY, guardPrivateKey: guardSecret, sanitizer, sourceManifestResolver: resolver, headResolver: resolver, frozenResolver: resolver, frozenReceipt: frozen, activeCommandId: 'promote-1' }), /chunk tamper|opDigest does not match|does not chain/);
+    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /chunk tamper|opDigest does not match|does not chain/);
   });
 
-  await check('a REORDERED / TRUNCATED chunk inventory breaks the manifestRoot', async () => {
-    const bad = clone(manifest); [bad.inventory[0], bad.inventory[1]] = [bad.inventory[1], bad.inventory[0]];
-    assert.throws(() => verifySourceExportManifest(resolver, bad), /manifestRoot != inventory/);
+  await check('(H2 payload exactness) an EXTRA field the sanitizer drops (unchanged opDigest) is rejected', async () => {
+    const bad = clone(bundle); const r0 = bad.historyChunks[0].records[0];
+    r0.payload = JSON.stringify({ ...JSON.parse(r0.payload), secret: 'leak' }); // sanitizes away → same opDigest
+    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /chunk tamper|non-canonical or extra fields/);
+  });
+
+  await check('(M2 epoch) a CROSS-EPOCH record is rejected by the replay', async () => {
+    const bad = clone(bundle); bad.historyChunks[0].records[1].sourceEpoch = 'e2';
+    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /chunk tamper|cross-epoch/);
+  });
+
+  await check('(H1 state binding) a tampered state chunk pair is rejected (bound to the replay-derived state)', async () => {
+    const bad = clone(bundle); bad.stateChunk.pairs[0][1] = 4242; // T*=4242 disagrees with 1..N
+    await assert.rejects(async () => guardCountersignSourceExport(bad, manifest, gopts), /chunk .* mismatch|state chunk|inventory entry/);
+  });
+
+  await check('(M1 strict inventory) reorder / duplicate / non-adjacent boundaries are rejected', async () => {
+    const rev = clone(manifest); [rev.inventory[0], rev.inventory[1]] = [rev.inventory[1], rev.inventory[0]];
+    assert.throws(() => verifySourceExportManifest(resolver, rev), /must be a history chunk|ordinal|seqFrom|manifestRoot/);
+    const dup = clone(manifest); dup.inventory.splice(1, 0, clone(dup.inventory[0])); dup.chunkCount += 1;
+    assert.throws(() => verifySourceExportManifest(resolver, dup), /ordinal|seqFrom|gap\/overlap|manifestRoot/);
     const trunc = clone(manifest); trunc.inventory.pop(); trunc.chunkCount -= 1;
-    assert.throws(() => verifySourceExportManifest(resolver, trunc), /manifestRoot != inventory|canonicalDigest/);
+    assert.throws(() => verifySourceExportManifest(resolver, trunc), /state chunk|history chunks cover|manifestRoot/);
   });
 
-  await check('the GUARD rejects a manifest whose commandId != the active cutover command', async () => {
-    await assert.rejects(async () => guardCountersignSourceExport(bundle, manifest, { guardKeyId: GUARD_KEY, guardPrivateKey: guardSecret, sanitizer, sourceManifestResolver: resolver, headResolver: resolver, frozenResolver: resolver, frozenReceipt: frozen, activeCommandId: 'other-cmd' }), /!= active cutover command/);
+  await check('the GUARD rejects a manifest whose commandId != the caller-expected command', async () => {
+    await assert.rejects(async () => guardCountersignSourceExport(bundle, manifest, { ...gopts, expectedCommandId: 'other-cmd' }), /!= caller-expected command/);
   });
 
   await check('a FORGED source signature (unknown key) fails verification', async () => {
