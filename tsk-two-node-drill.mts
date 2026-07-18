@@ -147,7 +147,7 @@ async function main() {
   const bPort = (bServer.address() as AddressInfo).port;
   const proxy = await startProxy(bPort);
   const transportUrl = `http://127.0.0.1:${proxy.port}/ingest`;
-  const transport = new HttpOutboxTransport({ url: transportUrl, fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: reqSecret, responseKeyId: RESP_KEY, responseSecret: respSecret, ackVerifier, timeoutMs: 3_000 });
+  const transport = new HttpOutboxTransport({ url: transportUrl, fetch: fetch as never, requestKeyId: REQ_KEY, requestSecret: reqSecret, resolveResponseKey: (kid) => (kid === RESP_KEY ? respSecret : null), ackVerifier, timeoutMs: 3_000 });
 
   const outbox = new PgTskDurableOutbox(txA, READY_A, { streamId: SID, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' });
   const mkPublisher = () => new PgTskPublisher(txA, SID, transport, 'quarantine', sanitizer, ackVerifier, READY_A, { leaseMs: 30_000 });
