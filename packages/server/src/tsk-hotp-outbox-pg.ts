@@ -48,8 +48,8 @@ import {
   type TskHotpMutation,
   type TskReceiverCheckpoint,
 } from './ha-outbox-contract.js';
-import { assertSourceLeaseWritable } from './tsk-source-fence.js';
-import type { SourceVerifyKeyResolver } from './tsk-source-fence.js';
+import { assertSourceLeaseWritable, requireSourceFenceReady } from './tsk-source-fence.js';
+import type { SourceVerifyKeyResolver, SourceFenceReadyToken } from './tsk-source-fence.js';
 
 /** Contract HOTP counter bound (mirrors the TSK segment counter ceiling). */
 export const TSK_HOTP_MAX_COUNTER = 2_147_483_647;
@@ -601,8 +601,11 @@ export interface PgTskOutboxOptions {
    *  control-issued, guard-signed lease (active + exact fence epoch + signed deadline vs A's own
    *  clock + bounded skew) in the SAME tx, holding the lease row FOR SHARE to commit — so a revoke
    *  UPDATE cannot commit until in-flight appends finish, then new appends fail closed. A fencible
-   *  source MUST configure this. */
-  sourceLeaseGate?: { resolver: SourceVerifyKeyResolver; controlToASkewBoundMs: number };
+   *  source MUST configure this. `ready` is an unforgeable capability (minted only by
+   *  `assertSourceFenceReady` after a real full-catalog attestation) that binds the AUTHORIZED writer
+   *  identity (holder + leaseId + grant digest) into the gate — so a different writer that is
+   *  legitimately leased at the same epoch fails closed rather than silently writing. */
+  sourceLeaseGate?: { resolver: SourceVerifyKeyResolver; controlToASkewBoundMs: number; ready: SourceFenceReadyToken };
 }
 
 // ── Source-side durable outbox (append builds + signs the head chain) ────────
@@ -611,10 +614,19 @@ export class PgTskDurableOutbox {
   readonly sanitizer: HotpMutationSanitizer;
   private readonly schema: string;
   private readonly scopeDeadlineMs: number;
+  /** (C2/H1) authorized writer identity bound out of the source-fence readiness capability; passed to
+   *  the gate so the live lease must be the SAME holder+leaseId+grant this writer was authorized for. */
+  private readonly sourceBound?: { holderNodeId: string; leaseId: string; grantDigest: string };
   constructor(private readonly db: PgTransactor, ready: SchemaReadyToken, private readonly opts: PgTskOutboxOptions) {
     if (!Number.isSafeInteger(opts.maxPendingRows) || opts.maxPendingRows <= 0) throw new ContractValidationError('maxPendingRows must be a positive safe integer');
     this.scopeDeadlineMs = validateDeadlineMs(opts.scopeDeadlineMs ?? DEFAULT_SCOPE_DEADLINE_MS, 'scopeDeadlineMs');
     this.schema = requireReady(ready, db);
+    if (opts.sourceLeaseGate) {
+      // Validate the capability is real + bound to THIS transactor/schema/stream, and lift the
+      // authorized identity. A forged/foreign token or a schema/stream mismatch fails construction.
+      const b = requireSourceFenceReady(opts.sourceLeaseGate.ready, { db, schema: this.schema, streamId: opts.streamId });
+      this.sourceBound = { holderNodeId: b.holderNodeId, leaseId: b.leaseId, grantDigest: b.grantDigest };
+    }
     this.sanitizer = opts.sanitizer;
   }
 
@@ -633,7 +645,7 @@ export class PgTskDurableOutbox {
       onBeforeCommit: gate ? async (exec) => {
         const fenceRows = (await exec.query('SELECT fence_token FROM tsk_outbox_fence WHERE stream_id = $1 FOR SHARE', [this.opts.streamId])).rows;
         if (!fenceRows.length) throw new ContractValidationError('no authoritative fence row at pre-commit re-check');
-        await assertSourceLeaseWritable(exec, gate.resolver, this.opts.streamId, Number(BigInt(String(fenceRows[0].fence_token))), gate.controlToASkewBoundMs);
+        await assertSourceLeaseWritable(exec, gate.resolver, this.opts.streamId, Number(BigInt(String(fenceRows[0].fence_token))), gate.controlToASkewBoundMs, this.sourceBound);
       } : undefined,
     }));
   }
@@ -656,7 +668,7 @@ export class PgTskDurableOutbox {
     // guard-signed lease is active at THIS fence epoch and not past its signed deadline (A's own
     // clock + bounded skew); FOR SHARE is held to commit so a revoke UPDATE freezes new appends.
     if (this.opts.sourceLeaseGate) {
-      await assertSourceLeaseWritable(exec, this.opts.sourceLeaseGate.resolver, streamId, Number(persistedFence), this.opts.sourceLeaseGate.controlToASkewBoundMs);
+      await assertSourceLeaseWritable(exec, this.opts.sourceLeaseGate.resolver, streamId, Number(persistedFence), this.opts.sourceLeaseGate.controlToASkewBoundMs, this.sourceBound);
     }
 
     const pending = safeSeq((await exec.query('SELECT count(*)::bigint AS n FROM tsk_outbox_rows WHERE stream_id = $1 AND acked_at IS NULL AND quarantined_at IS NULL', [streamId])).rows[0].n, 'pending-count');

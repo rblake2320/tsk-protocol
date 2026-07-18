@@ -100,8 +100,14 @@ export {
   signSourceCheckpointReceipt,
   verifySourceCheckpointReceipt,
   SourceFenceQuarantineError,
+  SOURCE_LEASE_MANIFEST_DIGEST,
+  SOURCE_WITNESS_MANIFEST_DIGEST,
+  attestSourceWitness,
+  assertSourceFenceReady,
+  requireSourceFenceReady,
 } from './tsk-source-fence.js';
 export type {
+  SourceFenceReadyToken,
   SourceVerifyKeyResolver,
   LeaseGrant,
   BareLeaseGrant,

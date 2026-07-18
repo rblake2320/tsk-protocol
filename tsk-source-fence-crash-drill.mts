@@ -17,8 +17,8 @@ import {
   TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_WITNESS_SCHEMA, TSK_SOURCE_WITNESS_TABLES,
   provisionSchemaVersion, PgTskDurableOutbox, NodePostgresTransactor, RedisFencingStore, ContractValidationError,
   signLeaseGrant, installLeaseGrant, readSourceLease, emitSourceFrozenReceipt, verifySourceFrozenReceipt,
-  advanceSourceWitness, readSourceWitness, signSourceCheckpointReceipt, SourceFenceQuarantineError,
-  type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation, type TskHotpMutation, type SourceVerifyKeyResolver,
+  advanceSourceWitness, readSourceWitness, signSourceCheckpointReceipt, SourceFenceQuarantineError, assertSourceFenceReady,
+  type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation, type TskHotpMutation, type SourceVerifyKeyResolver, type LeaseGrant,
 } from './packages/server/dist/index.js';
 
 const A_URL = process.env['TSK_TEST_SOURCE_PG_URL_A'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -60,8 +60,12 @@ async function main() {
   const nowMs = async () => Number((await aPool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
   const seqOf = async (sid: string) => Number((await aPool.query('SELECT sequence FROM tsk_outbox_source_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence);
   const grant = async (sid: string, over: Record<string, unknown> = {}) => signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'g1', leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 1, prevGrantDigest: null, ...over } as never);
-  const gate = { resolver, controlToASkewBoundMs: 0 };
-  const mkOutbox = (sid: string) => new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: gate });
+  // (C2/H1) mint the mandatory, identity-bound readiness capability from the installed grant (lease
+  // tables attested on A, where the gate reads them in the append tx).
+  const mkOutbox = async (sid: string, g: LeaseGrant) => {
+    const ready = await assertSourceFenceReady(aTx, 'public', { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest });
+    return new PgTskDurableOutbox(aTx, READY, { streamId: sid, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { resolver, controlToASkewBoundMs: 0, ready } });
+  };
   async function provision(sid: string) { await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [sid]); await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [sid, 'e1']); }
 
   await check('topology: A-PG and control-PG are independent instances (distinct system_identifier); B declared @5433', async () => {
@@ -82,7 +86,7 @@ async function main() {
 
   await check('CRASH append: mid-tx crash rolls back (seq unchanged); retry advances the seq', async () => {
     const sid = 'tsk:crash:append/v1'; await provision(sid); const gg = await grant(sid); await aTx.transaction((exec) => installLeaseGrant(exec, resolver, gg));
-    const ob = mkOutbox(sid);
+    const ob = await mkOutbox(sid, gg);
     await assert.rejects(() => ob.withOutboxTx(async (tx) => { await ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 1 }, fenceToken: 0n }); throw new Crash('mid-append'); }), Crash);
     assert.equal(await seqOf(sid), 0, 'no row committed after append crash');
     await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 1 }, fenceToken: 0n })); // resume
@@ -92,7 +96,7 @@ async function main() {
   await check('CRASH revoke→before receipt: revoke commits; receipt is re-emittable idempotently on resume', async () => {
     const sid = 'tsk:crash:freeze/v1'; await provision(sid);
     const g = await grant(sid); await aTx.transaction((exec) => installLeaseGrant(exec, resolver, g));
-    const ob = mkOutbox(sid); await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 9 }, fenceToken: 0n }));
+    const ob = await mkOutbox(sid, g); await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 9 }, fenceToken: 0n }));
     const rev = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'revoked', holderNodeId: 'A', leaseId: 'l1', commandId: 'r1', leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 2, prevGrantDigest: g.grantDigest });
     await aTx.transaction((exec) => installLeaseGrant(exec, resolver, rev)); // revoke commits; "crash" before receipt
     const r1 = await aTx.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 0, sourceNodeId: 'A' })); // resume
@@ -117,7 +121,7 @@ async function main() {
     const g = await grant(sid); await aTx.transaction((exec) => installLeaseGrant(exec, resolver, g));
     const store = new RedisFencingStore(redis, `tsk:fence:${sid}`);
     assert.equal(await store.claim({ nodeId: 'A', fenceEpoch: 1, expiresAt: (await nowMs()) + HOUR, commandId: 'c' }), true, 'Redis grants the claim');
-    const ob = mkOutbox(sid);
+    const ob = await mkOutbox(sid, g);
     await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 1 }, fenceToken: 0n })); // ok while lease active
     const rev = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'revoked', holderNodeId: 'A', leaseId: 'l1', commandId: 'r1', leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 2, prevGrantDigest: g.grantDigest });
     await aTx.transaction((exec) => installLeaseGrant(exec, resolver, rev));

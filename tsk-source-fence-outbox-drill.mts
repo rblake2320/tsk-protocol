@@ -13,12 +13,12 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign as edSign } from 'node:crypto';
 import pg from 'pg';
 import {
-  TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, provisionSchemaVersion,
+  TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_WITNESS_SCHEMA, provisionSchemaVersion,
   PgTskDurableOutbox, NodePostgresTransactor, ContractValidationError,
-  signLeaseGrant, installLeaseGrant, SourceFenceQuarantineError,
+  signLeaseGrant, installLeaseGrant, SourceFenceQuarantineError, assertSourceFenceReady,
   emitSourceFrozenReceipt, verifySourceFrozenReceipt, computeSourceStateDigest,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation,
-  type TskHotpMutation, type SourceVerifyKeyResolver, type BareLeaseGrant,
+  type TskHotpMutation, type SourceVerifyKeyResolver, type BareLeaseGrant, type LeaseGrant,
 } from './packages/server/dist/index.js';
 
 const URL = process.env['TSK_TEST_SOURCE_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -43,9 +43,10 @@ async function main() {
   console.log('# TSK PR2b-0 non-bypassable source-gate outbox drill (real PG16)');
   const pool = new pg.Pool({ connectionString: URL, max: 4 }); pool.on('error', () => {});
   const serial = new NodePostgresTransactor(pool as never) as unknown as PgTransactor;
-  await pool.query('DROP TABLE IF EXISTS tsk_outbox_rows, tsk_outbox_applied, tsk_outbox_fence, tsk_outbox_source_checkpoint, tsk_outbox_receiver_checkpoint, tsk_outbox_publisher_lease, tsk_outbox_quarantine, tsk_hotp_consumed, tsk_outbox_stream_halted, tsk_outbox_meta, tsk_source_lease, tsk_source_lease_history CASCADE');
+  await pool.query('DROP TABLE IF EXISTS tsk_outbox_rows, tsk_outbox_applied, tsk_outbox_fence, tsk_outbox_source_checkpoint, tsk_outbox_receiver_checkpoint, tsk_outbox_publisher_lease, tsk_outbox_quarantine, tsk_hotp_consumed, tsk_outbox_stream_halted, tsk_outbox_meta, tsk_source_lease, tsk_source_lease_history, tsk_source_witness, tsk_source_witness_history CASCADE');
   for (const s of TSK_OUTBOX_PG_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
   for (const s of TSK_SOURCE_LEASE_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
+  for (const s of TSK_SOURCE_WITNESS_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
   const READY = await provisionSchemaVersion(serial, SCHEMA);
 
   const nowMs = async () => Number((await pool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
@@ -60,20 +61,24 @@ async function main() {
     await serial.transaction((exec) => installLeaseGrant(exec, resolver, g));
     return g;
   }
-  const gate = { resolver, controlToASkewBoundMs: 0 };
-  const mkOutbox = (sid: string, delayMs = 0) => new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(delayMs), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: gate });
+  // (C2/H1) the gate is MANDATORY + identity-bound: mint an unforgeable readiness capability (real
+  // full-catalog attestation) bound to THIS stream's authorized holder+leaseId+grant.
+  const mkOutbox = async (sid: string, g: LeaseGrant, delayMs = 0) => {
+    const ready = await assertSourceFenceReady(serial, SCHEMA, { streamId: sid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest });
+    return new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(delayMs), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { resolver, controlToASkewBoundMs: 0, ready } });
+  };
   const append = (ob: PgTskDurableOutbox, sid: string, fence: bigint, counter: number) => ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter }, fenceToken: fence }));
 
   await check('append SUCCEEDS with an active lease at the fence epoch', async () => {
-    const sid = 'tsk:ob:ok/v1'; await provision(sid); await lease(sid, {});
-    const ob = mkOutbox(sid);
+    const sid = 'tsk:ob:ok/v1'; await provision(sid); const g = await lease(sid, {});
+    const ob = await mkOutbox(sid, g);
     await append(ob, sid, 0n, 10); await append(ob, sid, 0n, 11);
     assert.equal(await seqOf(sid), 2);
   });
 
   await check('append FAILS in-tx (nothing committed) when the lease is REVOKED', async () => {
     const sid = 'tsk:ob:revoked/v1'; await provision(sid); const g = await lease(sid, {});
-    const ob = mkOutbox(sid);
+    const ob = await mkOutbox(sid, g);
     await append(ob, sid, 0n, 1); // ok while active
     const rev = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'revoked', holderNodeId: 'A', leaseId: 'l1', commandId: cid('revoke', sid), leaseExpiresAtMs: (await nowMs()) + HOUR, leaseGrantSeq: 2, prevGrantDigest: g.grantDigest });
     await serial.transaction((exec) => installLeaseGrant(exec, resolver, rev));
@@ -83,23 +88,23 @@ async function main() {
   });
 
   await check('append FAILS when the lease epoch != the fence epoch (stale writer)', async () => {
-    const sid = 'tsk:ob:epoch/v1'; await provision(sid, 0); await lease(sid, { leaseEpoch: 1 }); // lease at epoch 1, fence at 0
-    const ob = mkOutbox(sid);
+    const sid = 'tsk:ob:epoch/v1'; await provision(sid, 0); const g = await lease(sid, { leaseEpoch: 1 }); // lease at epoch 1, fence at 0
+    const ob = await mkOutbox(sid, g);
     await assert.rejects(() => append(ob, sid, 0n, 1), /epoch .* != expected/);
     assert.equal(await seqOf(sid), 0);
   });
 
   await check('PRE-COMMIT re-check catches a tx that stalls past the signed deadline (slow signer) → rollback, no row', async () => {
     const sid = 'tsk:ob:stall/v1'; await provision(sid);
-    await lease(sid, { leaseExpiresAtMs: (await nowMs()) + 40 }); // deadline ~40ms out
-    const ob = mkOutbox(sid, 150); // signer stalls 150ms > 40ms deadline
+    const g = await lease(sid, { leaseExpiresAtMs: (await nowMs()) + 40 }); // deadline ~40ms out
+    const ob = await mkOutbox(sid, g, 150); // signer stalls 150ms > 40ms deadline
     await assert.rejects(() => append(ob, sid, 0n, 1), /deadline elapsed/);
     assert.equal(await seqOf(sid), 0, 'the stalled append was rolled back by the pre-commit re-check');
   });
 
   await check('SourceFrozenReceipt: emit after revoke binds N + head + state digest; verify; rejects if not revoked / wrong epoch', async () => {
     const sid = 'tsk:ob:frozen/v1'; await provision(sid); const g = await lease(sid, {});
-    const ob = mkOutbox(sid);
+    const ob = await mkOutbox(sid, g);
     await append(ob, sid, 0n, 5); await append(ob, sid, 0n, 6); await append(ob, sid, 0n, 7); // N=3
     // not-revoked → cannot freeze
     await assert.rejects(() => serial.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 0, sourceNodeId: 'A' })), /not revoked/);
@@ -121,6 +126,36 @@ async function main() {
     await assert.rejects(() => serial.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 0, sourceNodeId: 'EVIL' })), /!= fenced lease holder/);
     // wrong epoch → cannot freeze
     await assert.rejects(() => serial.transaction((exec) => emitSourceFrozenReceipt(exec, resolver, SOURCE_KEY, sourceSecret, { streamId: sid, commandId: 'promote-1', epoch: 1, sourceNodeId: 'A' })), /lease epoch/);
+  });
+
+  await check('(C2/H1) identity binding: a writer authorized for one identity/grant cannot ride a DIFFERENT live lease at the same epoch', async () => {
+    const sid = 'tsk:ob:bound/v1'; await provision(sid); const g = await lease(sid, {}); // live lease: holder A, leaseId l1, grant seq1
+    // (a) a capability that asserts a DIFFERENT holder than the live lease fails closed — even though the
+    // lease is active at the right epoch (this is the "another legitimately-leased writer at same epoch" case).
+    const wrongHolder = await assertSourceFenceReady(serial, SCHEMA, { streamId: sid, holderNodeId: 'B', leaseId: 'l1', grantDigest: g.grantDigest });
+    const obB = new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { resolver, controlToASkewBoundMs: 0, ready: wrongHolder } });
+    await assert.rejects(() => append(obB, sid, 0n, 1), /holder .* != authorized/);
+    assert.equal(await seqOf(sid), 0, 'nothing committed for the wrong-holder writer');
+    // (b) a capability bound to grant seq1 cannot ride a RENEWED grant (seq2, same holder/leaseId/epoch,
+    // new expiry → new grant digest): the writer must be re-authorized for the new grant.
+    const ob1 = await mkOutbox(sid, g); await append(ob1, sid, 0n, 2); // seq1 token works
+    const renew = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: cid('renew', sid), leaseExpiresAtMs: (await nowMs()) + 2 * HOUR, leaseGrantSeq: 2, prevGrantDigest: g.grantDigest });
+    await serial.transaction((exec) => installLeaseGrant(exec, resolver, renew));
+    const at = await seqOf(sid);
+    await assert.rejects(() => append(ob1, sid, 0n, 3), /grant digest != authorized/); // stale-grant token fails
+    assert.equal(await seqOf(sid), at, 'nothing committed for the stale-grant writer');
+    const ob2 = await mkOutbox(sid, renew); await append(ob2, sid, 0n, 4); // re-authorized for seq2 → works
+    assert.equal(await seqOf(sid), at + 1);
+  });
+
+  await check('(C2/H1) a forged/foreign readiness token cannot construct a fencible outbox', async () => {
+    const sid = 'tsk:ob:forge/v1'; await provision(sid); const g = await lease(sid, {});
+    const forged = Object.freeze({}) as never; // not minted by assertSourceFenceReady
+    assert.throws(() => new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { resolver, controlToASkewBoundMs: 0, ready: forged } }), /invalid source-fence capability/);
+    // a real token minted for a DIFFERENT stream is rejected too (bound to schema/stream)
+    const otherSid = 'tsk:ob:ok/v1';
+    const foreign = await assertSourceFenceReady(serial, SCHEMA, { streamId: otherSid, holderNodeId: g.holderNodeId, leaseId: g.leaseId, grantDigest: g.grantDigest });
+    assert.throws(() => new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mkSigner(), maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { resolver, controlToASkewBoundMs: 0, ready: foreign } }), /different schema\/stream/);
   });
 
   console.log(`\n# ${passed} PR2b-0 non-bypassable source-gate outbox checks passed`);

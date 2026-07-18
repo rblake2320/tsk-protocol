@@ -18,7 +18,7 @@
 import { createHash, sign as edSign, verify as edVerify, createPublicKey, createPrivateKey, type KeyObject } from 'node:crypto';
 
 import { ContractValidationError } from './ha-outbox-contract.js';
-import type { PgExecutor } from './tsk-hotp-outbox-pg.js';
+import type { PgExecutor, PgTransactor } from './tsk-hotp-outbox-pg.js';
 
 // ── bounds + grammar ─────────────────────────────────────────────────────────
 
@@ -284,7 +284,7 @@ async function readSourceLeaseAtSeq(exec: PgExecutor, resolver: SourceVerifyKeyR
  * conflicting revoke UPDATE cannot commit until in-flight FOR SHARE appends finish, then new appends
  * fail here. Missing lease → fail closed.
  */
-export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string, expectedEpoch: number, controlToASkewBoundMs: number): Promise<LeaseState> {
+export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string, expectedEpoch: number, controlToASkewBoundMs: number, bound?: { holderNodeId: string; leaseId: string; grantDigest: string }): Promise<LeaseState> {
   const s = vId(streamId, STREAM_ID_RE, 'streamId');
   const epoch = vInt(expectedEpoch, 'expectedEpoch', 0, MAX_EPOCH);
   const skew = vInt(controlToASkewBoundMs, 'controlToASkewBoundMs', 0, MAX_SKEW_MS);
@@ -299,6 +299,14 @@ export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: Sour
   // A's own clock; the signed deadline is on the control clock, bounded by the measured skew.
   const nowMs = vInt((await exec.query("SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS ms")).rows[0]?.ms, 'A clock now', 0, MAX_MS);
   if (nowMs >= st.leaseExpiresAtMs - skew) throw new SourceFenceQuarantineError('source lease deadline elapsed on A clock (+skew) — fail closed');
+  // (C2/H1) identity binding: the live lease must be the SAME holder+leaseId+grant this writer was
+  // authorized for. A different writer that is legitimately leased at the same epoch (holder pivot or a
+  // renewed grant this writer was not authorized for) fails closed here rather than silently writing.
+  if (bound) {
+    if (st.holderNodeId !== bound.holderNodeId) throw new SourceFenceQuarantineError(`source lease holder ${st.holderNodeId} != authorized ${bound.holderNodeId} — fail closed`);
+    if (st.leaseId !== bound.leaseId) throw new SourceFenceQuarantineError(`source lease id ${st.leaseId} != authorized ${bound.leaseId} — fail closed`);
+    if (st.grantDigest !== bound.grantDigest) throw new SourceFenceQuarantineError('source lease grant digest != authorized grant — fail closed');
+  }
   return st;
 }
 
@@ -497,6 +505,7 @@ export async function advanceSourceWitness(exec: PgExecutor, resolver: SourceVer
   const s = vId(receipt.streamId, STREAM_ID_RE, 'streamId');
   const sysId = receipt.sourceSystemId, gs = receipt.grantSeq, ss = receipt.sourceSeq, head = receipt.sourceHeadDigest;
   await exec.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))', [s]);
+  await attestSourceWitness(exec); // (H1) the witness catalog must match its compiled pin before we mutate it
   const cur = await readSourceWitness(exec, resolver, s);
   // idempotent re-advance (crash-resume): an identical high-water is a no-op, not a new witness seq.
   if (cur && cur.sourceSystemId === sysId && cur.maxGrantSeq === gs && cur.maxSourceSeq === ss && cur.headDigest === head) return cur;
@@ -521,4 +530,94 @@ export async function advanceSourceWitness(exec: PgExecutor, resolver: SourceVer
     affectedOne(await exec.query('UPDATE tsk_source_witness SET source_system_id=$2, max_grant_seq=$3, max_source_seq=$4, source_head_digest=$5, witness_seq=$6, prev_witness_digest=$7, witness_digest=$8, guard_key_id=$9, guard_signature=$10, updated_at=now() WHERE stream_id=$1 AND witness_digest=$11', [...vals, prev]), 'witness forward-CAS');
   }
   return { streamId: s, sourceSystemId: sysId, maxGrantSeq: gs, maxSourceSeq: ss, headDigest: head, witnessSeq: wseq, witnessDigest: digest };
+}
+
+// ── C2/H1: compiled full-catalog attestation + MANDATORY readiness capability ──
+
+const SCHEMA_RE = /^[a-z_][a-z0-9_]{0,62}$/;
+
+/** Pin the schema for THIS tx (pg_temp LAST so a temp table cannot shadow the authority tables;
+ *  pg_catalog is implicitly first so system funcs/catalogs cannot be shadowed) + assert SERIALIZABLE. */
+async function enterSourceTx(exec: PgExecutor, schema: string): Promise<void> {
+  if (!SCHEMA_RE.test(schema)) throw new ContractValidationError(`invalid schema identifier: ${schema}`);
+  const iso = String((await exec.query('SHOW transaction_isolation')).rows[0]?.transaction_isolation ?? '').toLowerCase();
+  if (iso !== 'serializable') throw new ContractValidationError(`source fence attestation requires SERIALIZABLE; got '${iso}'`);
+  await exec.query('SELECT pg_catalog.set_config($1, $2, true)', ['search_path', `${schema}, pg_temp`]);
+  const cur = (await exec.query('SELECT pg_catalog.current_schema() AS s')).rows[0]?.s;
+  if (cur !== schema) throw new ContractValidationError(`schema context mismatch: current_schema=${String(cur)} pinned=${schema}`);
+}
+
+/** Canonical full-catalog manifest of a source-fence table group (columns + constraints + indexes),
+ *  pg_catalog-qualified. Attested against a COMPILED pinned digest — never trust-on-first-use. The
+ *  lease group (on A) and the witness group (on control) are attested SEPARATELY: each attestation is
+ *  co-located with the transactor that actually owns those tables in its own DB. */
+async function sourceFenceManifest(exec: PgExecutor, tables: readonly string[], ver: string): Promise<string> {
+  const t = tables as string[];
+  const cols = (await exec.query(
+    `SELECT table_name, ordinal_position, column_name, data_type, is_nullable, COALESCE(column_default,'') AS d
+     FROM information_schema.columns WHERE table_schema = pg_catalog.current_schema() AND table_name = ANY($1)
+     ORDER BY table_name, ordinal_position`, [t])).rows;
+  const cons = (await exec.query(
+    `SELECT rel.relname AS t, c.contype, pg_catalog.pg_get_constraintdef(c.oid) AS def
+     FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class rel ON rel.oid = c.conrelid
+     JOIN pg_catalog.pg_namespace n ON n.oid = rel.relnamespace
+     WHERE n.nspname = pg_catalog.current_schema() AND rel.relname = ANY($1) AND c.contype IN ('p','c','u','f')
+     ORDER BY rel.relname, c.contype, def`, [t])).rows;
+  const idx = (await exec.query(
+    `SELECT tablename AS t, indexname AS n, indexdef AS def FROM pg_catalog.pg_indexes
+     WHERE schemaname = pg_catalog.current_schema() AND tablename = ANY($1) ORDER BY tablename, indexname`, [t])).rows;
+  return [
+    ver,
+    ...cols.map((r) => `C|${r.table_name}|${r.ordinal_position}|${r.column_name}|${r.data_type}|${r.is_nullable}|${r.d}`),
+    ...cons.map((r) => `K|${r.t}|${r.contype}|${r.def}`),
+    ...idx.map((r) => `I|${r.t}|${r.n}|${r.def}`),
+  ].join('\n');
+}
+
+/** COMPILED expected catalog digests (pinned in source; computed on PG16). Re-pin only via an offline
+ *  code-reviewed step; there is deliberately NO runtime override (R5-H1). The lease digest gates the
+ *  outbox (on A); the witness digest gates witness advances (on control). */
+export const SOURCE_LEASE_MANIFEST_DIGEST = 'b1020ac2e16fa0c622922d375b83a659ea9ee0f5e5db145655b49ad4c782cb62';
+export const SOURCE_WITNESS_MANIFEST_DIGEST = 'b12c9f68d9a2989339e5b446ead30c27a82e2669ad30d27e4e6a3d108dfcdc07';
+
+async function attestSourceLease(exec: PgExecutor): Promise<void> {
+  const digest = sha256hex(Buffer.from(await sourceFenceManifest(exec, TSK_SOURCE_LEASE_TABLES, 'Vsource_lease/1'), 'utf8'));
+  if (digest !== SOURCE_LEASE_MANIFEST_DIGEST) throw new ContractValidationError(`source lease attestation failed: live catalog digest ${digest} != pinned ${SOURCE_LEASE_MANIFEST_DIGEST}`);
+}
+/** Attest the witness table group on the control transactor before mutating/reading it (H1). */
+export async function attestSourceWitness(exec: PgExecutor): Promise<void> {
+  const digest = sha256hex(Buffer.from(await sourceFenceManifest(exec, TSK_SOURCE_WITNESS_TABLES, 'Vsource_witness/1'), 'utf8'));
+  if (digest !== SOURCE_WITNESS_MANIFEST_DIGEST) throw new ContractValidationError(`source witness attestation failed: live catalog digest ${digest} != pinned ${SOURCE_WITNESS_MANIFEST_DIGEST}`);
+}
+
+const READY_BRAND: unique symbol = Symbol('tsk_source_fence_ready');
+export interface SourceFenceReadyToken { readonly [READY_BRAND]: true }
+interface FenceBinding { db: PgTransactor; schema: string; streamId: string; holderNodeId: string; leaseId: string; grantDigest: string; }
+const READY_STATE = new WeakMap<object, FenceBinding>();
+function mintReady(b: FenceBinding): SourceFenceReadyToken {
+  const token = Object.freeze({ [READY_BRAND]: true as const });
+  READY_STATE.set(token, b);
+  return token as SourceFenceReadyToken;
+}
+// NO test-only / unsafe mint export: a token is obtainable ONLY via assertSourceFenceReady (real attest).
+
+/** Validate an unforgeable source-fence capability + that it is bound to this db/schema/stream. */
+export function requireSourceFenceReady(token: SourceFenceReadyToken, ctx: { db: PgTransactor; schema: string; streamId: string }): FenceBinding {
+  const st = READY_STATE.get(token as unknown as object);
+  if (!st) throw new ContractValidationError('invalid source-fence capability (forged or foreign token)');
+  if (st.db !== ctx.db) throw new ContractValidationError('source-fence capability bound to a different transactor');
+  if (st.schema !== ctx.schema || st.streamId !== ctx.streamId) throw new ContractValidationError('source-fence capability bound to a different schema/stream');
+  return st;
+}
+
+/** Attest the compiled source-fence catalog in the pinned schema (via the source transactor) + mint
+ *  an unforgeable capability bound to db+schema+stream+holder+leaseId+grantDigest. The fencible outbox
+ *  path REQUIRES this token, so the gate is MANDATORY and the authorized writer identity is bound. */
+export async function assertSourceFenceReady(db: PgTransactor, schema: string, binding: { streamId: string; holderNodeId: string; leaseId: string; grantDigest: string }): Promise<SourceFenceReadyToken> {
+  const streamId = vId(binding.streamId, STREAM_ID_RE, 'streamId');
+  const holderNodeId = vId(binding.holderNodeId, ID_RE, 'holderNodeId');
+  const leaseId = vId(binding.leaseId, ID_RE, 'leaseId');
+  if (!DIGEST_RE.test(binding.grantDigest)) throw new ContractValidationError('invalid grantDigest');
+  await db.transaction(async (exec) => { await enterSourceTx(exec, schema); await attestSourceLease(exec); });
+  return mintReady({ db, schema, streamId, holderNodeId, leaseId, grantDigest: binding.grantDigest });
 }
