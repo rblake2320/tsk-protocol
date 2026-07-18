@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { ContractValidationError } from './ha-outbox-contract.js';
 import type { PgExecutor, PgTransactor } from './tsk-hotp-outbox-pg.js';
 
@@ -174,32 +175,83 @@ async function boundedRollback(client: NodePostgresClient, ms: number, signal: A
 
 // (H1) A transaction callback receives a capability-limited executor: it may run
 // data statements but MUST NOT issue transaction/session control that would escape
-// or subvert the transactor's single-transaction guarantee (e.g. a callback that
-// COMMITs its own writes then throws would durably persist under an ordinary
-// pre-COMMIT error). We reject transaction-control leads and multi-statement text.
-const TX_CONTROL_LEAD = /^(begin|start|commit|end|rollback|abort|savepoint|release|discard)\b/i;
-const TX_CONTROL_SET = /^(set\s+(transaction\b|session\s+characteristics\b|constraints\b)|prepare\s+transaction\b|(commit|rollback)\s+prepared\b)/i;
-/** Strip comments and string/dollar-quoted literals so control-keyword and
- *  statement-separator detection cannot be evaded by hiding them in noise. */
-function stripSqlNoise(sql: string): string {
-  return sql
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')                       // block comments
-    .replace(/--[^\n]*/g, ' ')                                // line comments
-    .replace(/\$([A-Za-z_]\w*)?\$[\s\S]*?\$\1\$/g, "''")      // dollar-quoted strings
-    .replace(/'(?:[^']|'')*'/g, "''");                        // single-quoted strings
+// or subvert the transactor's single-transaction guarantee — a callback that COMMITs
+// its own writes then throws would durably persist under an ordinary pre-COMMIT error,
+// and a rogue SET could poison the pooled session. Detection must survive PostgreSQL's
+// NESTED block comments (`/* /* */ */`), line comments, and string/dollar/identifier
+// quoting, so a proper lexer blanks all of those BEFORE keyword/separator checks.
+const TX_CONTROL_LEAD = /^(begin|start|commit|end|rollback|abort|savepoint|release|discard|set|reset|prepare\s+transaction)\b/i;
+
+/** Blank comments and string/dollar/double-quoted literals, honoring PostgreSQL's
+ *  NESTED block comments, so hidden control keywords or `;` separators cannot slip
+ *  past. Returns SQL with all such spans replaced by neutral placeholders. */
+function sqlToCode(sql: string): string {
+  let out = '';
+  let i = 0;
+  const n = sql.length;
+  while (i < n) {
+    const c = sql[i];
+    const c2 = sql[i + 1];
+    if (c === '-' && c2 === '-') { i += 2; while (i < n && sql[i] !== '\n') i++; out += ' '; continue; }
+    if (c === '/' && c2 === '*') { // nested-aware block comment
+      let depth = 1; i += 2;
+      while (i < n && depth > 0) {
+        if (sql[i] === '/' && sql[i + 1] === '*') { depth++; i += 2; }
+        else if (sql[i] === '*' && sql[i + 1] === '/') { depth--; i += 2; }
+        else i++;
+      }
+      out += ' '; continue;
+    }
+    if (c === "'") { // single-quoted string: '' escape and backslash-escape (E'...')
+      i++;
+      while (i < n) {
+        if (sql[i] === '\\') { i += 2; continue; }
+        if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; }
+        if (sql[i] === "'") { i++; break; }
+        i++;
+      }
+      out += "''"; continue;
+    }
+    if (c === '$') { // dollar-quoted string $tag$...$tag$
+      const m = /^\$([A-Za-z_]\w*)?\$/.exec(sql.slice(i));
+      if (m) { const tag = m[0]; const end = sql.indexOf(tag, i + tag.length); i = end === -1 ? n : end + tag.length; out += "''"; continue; }
+    }
+    if (c === '"') { // double-quoted identifier: "" escape
+      i++;
+      while (i < n) {
+        if (sql[i] === '"' && sql[i + 1] === '"') { i += 2; continue; }
+        if (sql[i] === '"') { i++; break; }
+        i++;
+      }
+      out += '"x"'; continue;
+    }
+    out += c; i++;
+  }
+  return out;
 }
 function assertCallerQueryAllowed(sql: string): void {
   if (typeof sql !== 'string') throw new ContractValidationError('query sql must be a string');
-  const stripped = stripSqlNoise(sql).trim();
-  const lead = stripped.replace(/^[(\s]+/, ''); // tolerate leading '(' / whitespace
-  if (TX_CONTROL_LEAD.test(lead) || TX_CONTROL_SET.test(lead)) {
+  const code = sqlToCode(sql).trim();
+  const lead = code.replace(/^[('"\s]+/, ''); // tolerate leading '(' / quote-ident / whitespace
+  if (TX_CONTROL_LEAD.test(lead)) {
     throw new ContractValidationError('transaction/session-control statements are not allowed inside a transactor callback');
   }
-  const semi = stripped.indexOf(';');
-  if (semi >= 0 && stripped.slice(semi + 1).trim().length > 0) {
+  // set_config(...) is session-control smuggled through a SELECT: session-level
+  // set_config (is_local != true) can change role/search_path/etc and POISON the
+  // pooled connection. Only the tx-local form set_config(name, value, true) is allowed.
+  if (/\bset_config\s*\(/i.test(code) && !/\bset_config\s*\([^)]*,\s*true\s*\)/i.test(code)) {
+    throw new ContractValidationError('session-level set_config is not allowed inside a transactor callback (only tx-local set_config(name, value, true))');
+  }
+  const semi = code.indexOf(';');
+  if (semi >= 0 && code.slice(semi + 1).trim().length > 0) {
     throw new ContractValidationError('multiple statements are not allowed inside a transactor callback');
   }
 }
+
+// Control queries are schema-qualified to pg_catalog so a callback cannot shadow
+// current_setting/set_config via a pg_temp function + a search_path change.
+const STMT_TIMEOUT_MS_SQL = "SELECT (EXTRACT(EPOCH FROM pg_catalog.current_setting('statement_timeout')::interval) * 1000)::bigint::text AS statement_timeout_ms";
+const CONTINUITY_GUC = 'tsk.tx_continuity';
 
 export class NodePostgresTransactor implements PgTransactor {
   private readonly statementTimeoutMs: number;
@@ -336,24 +388,41 @@ export class NodePostgresTransactor implements PgTransactor {
       }
       // install the server-side statement timeout, then READ IT BACK to verify it
       // actually took (a silently-ignored SET would leave queries unbounded at the DB).
-      const install = await query("SELECT set_config('statement_timeout', $1, true) AS statement_timeout", [String(this.statementTimeoutMs)]);
+      const install = await query("SELECT pg_catalog.set_config('statement_timeout', $1, true) AS statement_timeout", [String(this.statementTimeoutMs)]);
       if (install.command !== 'SELECT' || typeof install.rows[0]?.statement_timeout !== 'string') {
         throw new ContractValidationError('PostgreSQL statement_timeout setup was not confirmed');
       }
-      const readback = await query(
-        "SELECT (EXTRACT(EPOCH FROM current_setting('statement_timeout')::interval) * 1000)::bigint::text AS statement_timeout_ms",
-      );
+      const readback = await query(STMT_TIMEOUT_MS_SQL);
       if (readback.command !== 'SELECT' || readback.rows[0]?.statement_timeout_ms !== String(this.statementTimeoutMs)) {
         throw new ContractValidationError('PostgreSQL statement_timeout readback did not match the requested value');
       }
+      // (H1 runtime backstop) ARM a transaction-continuity sentinel: an UNFORGEABLE
+      // per-transaction nonce stored in a tx-LOCAL custom GUC. It persists only while
+      // THIS transaction stays open; any COMMIT/ROLLBACK inside the callback drops it.
+      // Unforgeable (random) so a callback cannot pre-set a session value to match, and
+      // pg_catalog-qualified so it cannot be shadowed via pg_temp.
+      const nonce = randomUUID();
+      const armed = await query(`SELECT pg_catalog.set_config('${CONTINUITY_GUC}', $1, true) AS n`, [nonce]);
+      if (armed.command !== 'SELECT' || armed.rows[0]?.n !== nonce) {
+        throw new ContractValidationError('failed to arm the transaction-continuity sentinel');
+      }
       const exec: PgExecutor = {
         query: async (sql, params) => {
-          assertCallerQueryAllowed(sql); // (H1) capability limit: no transaction-control escape
+          assertCallerQueryAllowed(sql); // (H1) capability limit: no transaction/session-control escape
           const result = await query(sql, params);
           return { rows: result.rows, rowCount: result.rowCount ?? 0 };
         },
       };
       const result = await abortRace(fn(exec), signal);
+      // verify the sentinel BEFORE dispatching OUR COMMIT: if the callback slipped a
+      // transaction boundary past the executor guard (e.g. a procedure CALL that
+      // commits), the tx-local nonce is gone. Fail closed rather than commit against a
+      // different (auto)transaction. Runs BEFORE commitDispatched, so a violation is an
+      // ordinary pre-COMMIT failure (rollback + destroy), never ambiguous.
+      const continuity = await query(`SELECT pg_catalog.current_setting('${CONTINUITY_GUC}', true) AS n`);
+      if (continuity.command !== 'SELECT' || continuity.rows[0]?.n !== nonce) {
+        throw new ContractValidationError('transaction continuity violated before COMMIT: the transaction-local scope was lost (a COMMIT/ROLLBACK occurred inside the callback)');
+      }
       // from here the COMMIT is in flight; a lost response is AMBIGUOUS, not a failure.
       commitDispatched = true;
       const commit = await query('COMMIT');

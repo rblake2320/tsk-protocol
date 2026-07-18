@@ -19,11 +19,13 @@ interface ClientScript {
   onWork?: (sql: string, params?: unknown[]) => NodePostgresResult | Promise<NodePostgresResult>;
   release?: 'ok' | 'throw';
   rollbackHangs?: boolean;                      // ROLLBACK never resolves (tests cleanup clamping)
+  continuityBroken?: boolean;                   // 2nd statement_timeout readback differs (tx-local scope lost)
 }
 class FakeClient implements NodePostgresClient {
   queries: string[] = [];
   releaseCount = 0;
   releasedWith: boolean | Error | undefined = undefined;
+  private nonce = '';
   get destroyed(): boolean { return this.releasedWith === true || this.releasedWith instanceof Error; }
   constructor(private readonly script: ClientScript = {}) {}
   async query(sql: string, params?: unknown[]): Promise<NodePostgresResult> {
@@ -31,7 +33,9 @@ class FakeClient implements NodePostgresClient {
     const st = String(this.script.statementTimeoutMs ?? 30_000);
     if (sql.startsWith('BEGIN')) return { rows: [], rowCount: null, command: this.script.begin ?? 'BEGIN' };
     if (sql.includes("set_config('statement_timeout'")) return { rows: [{ statement_timeout: st }], rowCount: 1, command: 'SELECT' };
+    if (sql.includes("set_config('tsk.tx_continuity'")) { this.nonce = String(params?.[0] ?? ''); return { rows: [{ n: this.nonce }], rowCount: 1, command: 'SELECT' }; }
     if (sql.includes("current_setting('statement_timeout')")) return { rows: [{ statement_timeout_ms: st }], rowCount: 1, command: 'SELECT' };
+    if (sql.includes("current_setting('tsk.tx_continuity'")) { return { rows: [{ n: this.script.continuityBroken ? 'BROKEN' : this.nonce }], rowCount: 1, command: 'SELECT' }; }
     if (sql === 'COMMIT') {
       const c = this.script.commit;
       if (typeof c === 'function') return c();
@@ -222,8 +226,17 @@ describe('NodePostgresTransactor', () => {
   });
 
   it('(H1) capability-limits the callback executor: transaction/session control is blocked and rolls back', async () => {
-    const evils = ['COMMIT', 'ROLLBACK', 'BEGIN', 'END', 'SAVEPOINT s1', 'RELEASE s1', 'DISCARD ALL',
-      'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', '  /* sneaky */ commit', 'INSERT INTO t VALUES (1); COMMIT'];
+    const evils = [
+      'COMMIT', 'ROLLBACK', 'BEGIN', 'END', 'SAVEPOINT s1', 'RELEASE s1', 'DISCARD ALL',
+      'SET TRANSACTION ISOLATION LEVEL READ COMMITTED',
+      // session poisoning of a POOLED connection:
+      'SET ROLE evil', 'SET SESSION AUTHORIZATION bob', "SET application_name = 'poison'", 'RESET ALL',
+      'PREPARE TRANSACTION \'gid\'',
+      // session-control smuggled through a SELECT (session-level set_config):
+      "SELECT set_config('role', 'evil', false)", "SELECT set_config('search_path', 'pg_temp,pg_catalog', false)",
+      // comment / separator evasion, incl. PostgreSQL NESTED block comments:
+      '  /* sneaky */ commit', '/* outer /* inner */ */ COMMIT', '--x\nCOMMIT', 'INSERT INTO t VALUES (1); COMMIT',
+    ];
     for (const evil of evils) {
       const client = new FakeClient();
       const tx = new NodePostgresTransactor(poolOf(client));
@@ -232,6 +245,19 @@ describe('NodePostgresTransactor', () => {
       expect(client.queries).not.toContain('COMMIT'); // the transactor never reached its own COMMIT
       expect(client.destroyed).toBe(true);            // and the connection is discarded
     }
+  });
+
+  it('(H1 backstop) the pre-COMMIT continuity sentinel fails closed when the tx-local scope is lost', async () => {
+    // models a callback that lost the transaction (e.g. a CALL to a procedure that
+    // commits): the executor guard did not see a control keyword, but the tx-local
+    // statement_timeout no longer matches, so the transactor must NOT commit.
+    const client = new FakeClient({ continuityBroken: true });
+    const tx = new NodePostgresTransactor(poolOf(client));
+    const err = await tx.transaction(async (exec) => { await exec.query('CALL some_proc()'); }).catch((e) => e);
+    expect(err).toBeInstanceOf(ContractValidationError);
+    expect(String(err.message)).toContain('continuity');
+    expect(client.queries).not.toContain('COMMIT'); // our COMMIT was never dispatched
+    expect(client.destroyed).toBe(true);
   });
 
   it('(H1) allows ordinary data + read statements through the guarded executor', async () => {

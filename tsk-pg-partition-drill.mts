@@ -54,9 +54,8 @@ function startProxy(): Promise<Proxy> {
   const stalled: net.Socket[] = [];
   const stallTimers: ReturnType<typeof setTimeout>[] = [];
   const server = net.createServer((client) => {
-    const m = mode;
     client.on('error', () => {});
-    if (m === 'stallC') {
+    if (mode === 'stallC') {
       // accept, then dial upstream only AFTER STALL_DIAL_MS: the client's startup
       // stalls past a shorter acquire deadline, then the connection completes LATE.
       stalled.push(client);
@@ -79,11 +78,11 @@ function startProxy(): Promise<Proxy> {
     let sSlack = Buffer.alloc(0);
     const killClient = () => { if (!clientDead) { clientDead = true; state.cuts++; try { client.destroy(); } catch { /* gone */ } } };
     client.on('data', (chunk) => {
-      if (m === 'cutA') {
+      if (mode === 'cutA') {
         const scan = Buffer.concat([cSlack, chunk]);
         if (scan.includes(SENTINEL_A)) { try { upstream.destroy(); } catch { /* gone */ } killClient(); return; }
         cSlack = scan.subarray(Math.max(0, scan.length - SENTINEL_A.length));
-      } else if (m === 'cutB') {
+      } else if (mode === 'cutB') {
         const scan = Buffer.concat([cSlack, chunk]);
         if (scan.includes(CLIENT_COMMIT)) commitForwarded = true;
         cSlack = scan.subarray(Math.max(0, scan.length - CLIENT_COMMIT.length));
@@ -91,7 +90,7 @@ function startProxy(): Promise<Proxy> {
       if (!upstream.destroyed) upstream.write(chunk);
     });
     upstream.on('data', (chunk) => {
-      if (m === 'cutB' && commitForwarded && !clientDead) {
+      if (mode === 'cutB' && commitForwarded && !clientDead) {
         const scan = Buffer.concat([sSlack, chunk]);
         if (scan.includes(SERVER_COMMIT_DONE)) { killClient(); return; } // server committed; drop its reply
         sSlack = scan.subarray(Math.max(0, scan.length - SERVER_COMMIT_DONE.length));
@@ -119,7 +118,10 @@ async function main() {
   const direct = new Pool({ connectionString: PG_URL, max: 4 }); direct.on('error', () => {});
   await direct.query('DROP TABLE IF EXISTS partition_probe');
   await direct.query('CREATE TABLE partition_probe (id int primary key, tag text)');
-  const proxied = new Pool({ ...conn, max: 4 }); proxied.on('error', () => {});
+  // synchronous_commit=on is pinned ON THE PROXIED SESSION itself (startup option),
+  // so the commit whose ack we drop in Case B is genuinely WAL-flushed (crash-durable),
+  // not merely applied/visible. Verified by readback through the transactor below.
+  const proxied = new Pool({ ...conn, max: 4, options: '-c synchronous_commit=on' }); proxied.on('error', () => {});
   const tx = new NodePostgresTransactor(proxied as unknown as ConstructorParameters<typeof NodePostgresTransactor>[0], { statementTimeoutMs: 5_000, transactionTimeoutMs: 8_000, acquireTimeoutMs: 3_000 });
   const inUse = () => proxied.totalCount - proxied.idleCount;
 
@@ -142,6 +144,10 @@ async function main() {
     });
 
     await check('(B) COMMIT-window partition -> AmbiguousCommitError; authoritative reconciliation proves exactly-once', async () => {
+      // durability precondition, verified ON the proxied session used for the cut
+      // (a per-session setting checked on `direct` would not prove THIS connection):
+      const sc = await tx.transaction(async (exec) => String((await exec.query("SELECT current_setting('synchronous_commit') AS sc")).rows[0].sc));
+      assert.equal(sc, 'on', `B: crash-durability requires synchronous_commit=on on the proxied session (was '${sc}')`);
       proxy.setMode('cutB');
       const t0 = Date.now();
       const err = await tx.transaction(async (exec) => {
@@ -154,11 +160,8 @@ async function main() {
       assert.equal(err.committed, 'unknown');
       assert.ok(ms < 8_500, `B: must be bounded (was ${ms}ms)`);
       // 2) authoritative reconciliation by idempotency key (PK models the outbox tuple):
-      //    the server DID commit (we dropped the reply only AFTER its CommandComplete).
-      //    Crash-durability of that commit holds only if the WAL is flushed on COMMIT,
-      //    i.e. synchronous_commit != off — assert it so the durability claim is real.
-      const sc = String((await direct.query('SHOW synchronous_commit')).rows[0].synchronous_commit);
-      assert.notEqual(sc, 'off', `B: crash-durability requires synchronous_commit != off (was '${sc}')`);
+      //    the server DID commit (we dropped the reply only AFTER its CommandComplete,
+      //    on a synchronous_commit=on session — so it is WAL-flushed / crash-durable).
       const rows = (await direct.query('SELECT tag FROM partition_probe WHERE id = 1')).rows;
       assert.equal(rows.length, 1, 'B: the commit MUST be durable server-side despite the dropped ack');
       assert.equal(rows[0].tag, 'B');

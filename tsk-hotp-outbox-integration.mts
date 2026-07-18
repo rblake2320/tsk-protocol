@@ -165,17 +165,29 @@ async function main() {
     assert.equal(Number((await pool.query('SELECT sequence FROM tsk_outbox_source_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 0);
   });
 
-  await check('(#10 transactor) a callback attempting transaction-control (COMMIT) is blocked; no durable partial write', async () => {
+  await check('(#10 transactor) NESTED-comment transaction-control bypass is blocked; no durable partial write', async () => {
     await pool.query('DROP TABLE IF EXISTS tsk_txctl_probe');
     await pool.query('CREATE TABLE tsk_txctl_probe (id int primary key)');
-    // the H1 escape: INSERT then COMMIT from inside the callback, then throw. The
-    // capability-limited executor must REJECT the COMMIT so nothing durably persists.
+    // PostgreSQL parses `/* outer /* inner */ */` as ONE nested comment, so the
+    // statement is a bare COMMIT. A non-nested stripper would miss it; the lexer must
+    // reject it so the prior INSERT never durably commits.
     await assert.rejects(() => serial.transaction(async (exec) => {
       await exec.query('INSERT INTO tsk_txctl_probe(id) VALUES (1)');
-      await exec.query('COMMIT');
+      await exec.query('/* outer /* inner */ */ COMMIT');
     }), /transaction\/session-control/);
     assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM tsk_txctl_probe')).rows[0].n), 0, 'the blocked-escape insert must roll back');
     await pool.query('DROP TABLE tsk_txctl_probe');
+  });
+
+  await check('(#10 transactor) session-control (SET ROLE / application_name / RESET ALL) is blocked; pooled session not poisoned', async () => {
+    for (const evil of ['SET ROLE postgres', "SET application_name = 'poison'", 'RESET ALL', 'SET SESSION AUTHORIZATION postgres']) {
+      await assert.rejects(() => serial.transaction(async (exec) => { await exec.query(evil); }), /transaction\/session-control/, `must block: ${evil}`);
+    }
+    // session-control smuggled through a SELECT (session-level set_config) is also blocked
+    await assert.rejects(() => serial.transaction(async (exec) => { await exec.query("SELECT set_config('application_name', 'poison', false)"); }), /session-level set_config/);
+    // the pooled session must remain clean — application_name never became 'poison'
+    const appName = await serial.transaction(async (exec) => (await exec.query("SELECT current_setting('application_name') AS a")).rows[0].a);
+    assert.notEqual(appName, 'poison', 'a blocked SET must not have poisoned the pooled session');
   });
 
   await check('lost-ACK idempotency: redelivery after a lost ack is duplicate-ok; HOTP consumed exactly once', async () => {
