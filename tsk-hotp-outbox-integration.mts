@@ -190,6 +190,30 @@ async function main() {
     assert.notEqual(appName, 'poison', 'a blocked SET must not have poisoned the pooled session');
   });
 
+  await check('(#10 transactor) a callback lowering synchronous_commit (tx-local off) cannot weaken THIS commit', async () => {
+    await pool.query('DROP TABLE IF EXISTS tsk_durab_probe');
+    await pool.query('CREATE TABLE tsk_durab_probe (id int primary key)');
+    // tx-local set_config is allowed by the guard, but the transactor FORCES
+    // synchronous_commit back to its configured level (default on) before COMMIT.
+    await serial.transaction(async (exec) => {
+      await exec.query("SELECT set_config('synchronous_commit', 'off', true)");
+      await exec.query('INSERT INTO tsk_durab_probe(id) VALUES (1)');
+    });
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM tsk_durab_probe')).rows[0].n), 1, 'the commit must still land durably');
+    await pool.query('DROP TABLE tsk_durab_probe');
+  });
+
+  await check('(#10 transactor) DISCARD ALL scrubs session poison (advisory lock) before the pooled connection is reused', async () => {
+    const p1 = new Pool({ connectionString: URL, max: 1 }); p1.on('error', () => {});
+    const t1 = new NodePostgresTransactor(p1 as unknown as ConstructorParameters<typeof NodePostgresTransactor>[0]);
+    // pg_advisory_lock is a SELECT the guard allows, but it holds a SESSION-level lock
+    // that survives COMMIT — only the post-commit DISCARD ALL releases it.
+    await t1.transaction(async (exec) => { await exec.query('SELECT pg_advisory_lock(42)'); });
+    const n = await t1.transaction(async (exec) => Number((await exec.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'")).rows[0].n));
+    assert.equal(n, 0, 'the reused pooled session must be clean — the advisory lock was scrubbed by DISCARD ALL');
+    await p1.end();
+  });
+
   await check('lost-ACK idempotency: redelivery after a lost ack is duplicate-ok; HOTP consumed exactly once', async () => {
     const sid = 'tsk:lostack/v1'; await provision(sid);
     const receiver = new PgTskReceiverCheckpoint(serial, sid, sanitizer, headVerifier, applier, READY);

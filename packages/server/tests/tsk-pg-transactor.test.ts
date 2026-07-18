@@ -19,7 +19,9 @@ interface ClientScript {
   onWork?: (sql: string, params?: unknown[]) => NodePostgresResult | Promise<NodePostgresResult>;
   release?: 'ok' | 'throw';
   rollbackHangs?: boolean;                      // ROLLBACK never resolves (tests cleanup clamping)
-  continuityBroken?: boolean;                   // 2nd statement_timeout readback differs (tx-local scope lost)
+  continuityBroken?: boolean;                   // continuity nonce readback differs (tx-local scope lost)
+  syncCommitBad?: boolean;                      // synchronous_commit enforcement readback != requested
+  discardFails?: boolean;                       // post-commit DISCARD ALL throws
 }
 class FakeClient implements NodePostgresClient {
   queries: string[] = [];
@@ -41,6 +43,8 @@ class FakeClient implements NodePostgresClient {
       if (typeof c === 'function') return c();
       return { rows: [], rowCount: null, command: c ?? 'COMMIT' };
     }
+    if (sql.includes("set_config('synchronous_commit'")) { return { rows: [{ sc: this.script.syncCommitBad ? 'off' : String(params?.[0] ?? 'on') }], rowCount: 1, command: 'SELECT' }; }
+    if (sql === 'DISCARD ALL') { if (this.script.discardFails) throw new Error('discard failed'); return { rows: [], rowCount: null, command: 'DISCARD' }; }
     if (sql === 'ROLLBACK') { if (this.script.rollbackHangs) return new Promise<never>(() => {}); return { rows: [], rowCount: null, command: 'ROLLBACK' }; }
     if (this.script.onWork) return this.script.onWork(sql, params);
     return { rows: [], rowCount: 1, command: 'SELECT' };
@@ -75,7 +79,9 @@ describe('NodePostgresTransactor', () => {
     expect(client.queries[0]).toBe('BEGIN ISOLATION LEVEL SERIALIZABLE');
     expect(client.queries.some((q) => q.includes("set_config('statement_timeout'"))).toBe(true);
     expect(client.queries.some((q) => q.includes("current_setting('statement_timeout')"))).toBe(true);
-    expect(client.queries.at(-1)).toBe('COMMIT');
+    expect(client.queries).toContain('COMMIT');
+    expect(client.queries.some((q) => q.includes("set_config('synchronous_commit'"))).toBe(true); // durability forced before COMMIT
+    expect(client.queries.at(-1)).toBe('DISCARD ALL'); // session scrubbed after COMMIT, before release
     expect(client.releaseCount).toBe(1);
     expect(client.releasedWith).toBe(false); // returned to the pool, not destroyed
   });
@@ -248,12 +254,12 @@ describe('NodePostgresTransactor', () => {
   });
 
   it('(H1 backstop) the pre-COMMIT continuity sentinel fails closed when the tx-local scope is lost', async () => {
-    // models a callback that lost the transaction (e.g. a CALL to a procedure that
-    // commits): the executor guard did not see a control keyword, but the tx-local
-    // statement_timeout no longer matches, so the transactor must NOT commit.
+    // models a callback that lost the transaction by a path the static guard cannot
+    // see: the tx-local continuity nonce no longer matches, so the transactor must
+    // fail closed and NOT commit — even though the callback query itself was allowed.
     const client = new FakeClient({ continuityBroken: true });
     const tx = new NodePostgresTransactor(poolOf(client));
-    const err = await tx.transaction(async (exec) => { await exec.query('CALL some_proc()'); }).catch((e) => e);
+    const err = await tx.transaction(async (exec) => { await exec.query('SELECT 1'); }).catch((e) => e);
     expect(err).toBeInstanceOf(ContractValidationError);
     expect(String(err.message)).toContain('continuity');
     expect(client.queries).not.toContain('COMMIT'); // our COMMIT was never dispatched
@@ -269,7 +275,32 @@ describe('NodePostgresTransactor', () => {
       await exec.query('INSERT INTO t VALUES (1)');
       await exec.query('SELECT 1; '); // a trailing statement separator is fine
     });
-    expect(client.queries.at(-1)).toBe('COMMIT'); // committed normally
+    expect(client.queries).toContain('COMMIT'); // committed normally
+    expect(client.queries.at(-1)).toBe('DISCARD ALL');
+  });
+
+  it('(durability authority) forces synchronous_commit before COMMIT and fails closed if the readback does not match', async () => {
+    const client = new FakeClient({ syncCommitBad: true });
+    const tx = new NodePostgresTransactor(poolOf(client));
+    const err = await tx.transaction(async () => 'x').catch((e) => e);
+    expect(err).toBeInstanceOf(ContractValidationError);
+    expect(String(err.message)).toContain('synchronous_commit');
+    expect(client.queries).not.toContain('COMMIT'); // enforced BEFORE commit, so no commit
+    expect(client.destroyed).toBe(true);
+  });
+
+  it('(session-cleanliness authority) DISCARD ALL failure after a durable commit -> PostCommitReleaseError + destroy', async () => {
+    const client = new FakeClient({ discardFails: true });
+    const tx = new NodePostgresTransactor(poolOf(client));
+    const err = await tx.transaction(async () => 'x').catch((e) => e);
+    expect(err).toBeInstanceOf(PostCommitReleaseError);
+    expect(err.committed).toBe(true);              // the data IS durable
+    expect(client.queries).toContain('COMMIT');    // commit happened
+    expect(client.destroyed).toBe(true);           // but the un-scrubbed connection is discarded
+  });
+
+  it('rejects an unsafe synchronousCommit option', () => {
+    expect(() => new NodePostgresTransactor(poolOf(new FakeClient()), { synchronousCommit: 'maybe' as unknown as 'on' })).toThrow(ContractValidationError);
   });
 
   it('(H2) clamps cleanup rollback to the transaction deadline, not the full rollback budget', async () => {

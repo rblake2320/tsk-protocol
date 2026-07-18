@@ -52,6 +52,9 @@ export interface NodePostgresPool {
 }
 
 export interface NodePostgresTransactorOptions {
+  /** Durability level FORCED tx-locally + read back immediately before COMMIT, so the
+   *  commit's durability cannot be lowered by anything the callback did. Default 'on'. */
+  synchronousCommit?: 'on' | 'local' | 'remote_write' | 'remote_apply' | 'off';
   /** Server-side per-statement timeout, installed + verified inside the tx. */
   statementTimeoutMs?: number;
   /** Client-side total deadline covering acquire → BEGIN → work → COMMIT. */
@@ -106,6 +109,7 @@ export class ConnectionDisposalError extends Error {
 
 const MAX_TIMER_MS = 2_147_483_647;
 const RETRYABLE = new Set(['40001', '40P01']); // serialization_failure, deadlock_detected
+const SYNC_COMMIT_LEVELS = new Set(['on', 'local', 'remote_write', 'remote_apply', 'off']);
 
 function boundedInteger(value: number, label: string, min = 1, max = MAX_TIMER_MS): number {
   if (!Number.isSafeInteger(value) || value < min || value > max) {
@@ -180,7 +184,10 @@ async function boundedRollback(client: NodePostgresClient, ms: number, signal: A
 // and a rogue SET could poison the pooled session. Detection must survive PostgreSQL's
 // NESTED block comments (`/* /* */ */`), line comments, and string/dollar/identifier
 // quoting, so a proper lexer blanks all of those BEFORE keyword/separator checks.
-const TX_CONTROL_LEAD = /^(begin|start|commit|end|rollback|abort|savepoint|release|discard|set|reset|prepare\s+transaction)\b/i;
+// Defense-in-depth denylist (the runtime authorities below — forced durability + a
+// post-commit DISCARD ALL — are what actually guarantee integrity; this just blocks
+// the obvious escapes up front). Leading transaction/session/DDL/session-object verbs.
+const TX_CONTROL_LEAD = /^(begin|start|commit|end|rollback|abort|savepoint|release|discard|set|reset|prepare|do|call|create|listen|unlisten|load)\b/i;
 
 /** Blank comments and string/dollar/double-quoted literals, honoring PostgreSQL's
  *  NESTED block comments, so hidden control keywords or `;` separators cannot slip
@@ -261,10 +268,15 @@ export class NodePostgresTransactor implements PgTransactor {
   private readonly maxSerializationRetries: number;
   private readonly retryBaseDelayMs: number;
   private readonly onDisposalError?: NodePostgresTransactorOptions['onDisposalError'];
+  private readonly synchronousCommit: NonNullable<NodePostgresTransactorOptions['synchronousCommit']>;
 
   constructor(private readonly pool: NodePostgresPool, opts: NodePostgresTransactorOptions = {}) {
     if (!pool || typeof pool.connect !== 'function') {
       throw new ContractValidationError('pool.connect is required');
+    }
+    this.synchronousCommit = opts.synchronousCommit ?? 'on';
+    if (!SYNC_COMMIT_LEVELS.has(this.synchronousCommit)) {
+      throw new ContractValidationError(`synchronousCommit must be one of ${[...SYNC_COMMIT_LEVELS].join(', ')}`);
     }
     this.statementTimeoutMs = boundedInteger(opts.statementTimeoutMs ?? 30_000, 'statementTimeoutMs');
     this.transactionTimeoutMs = boundedInteger(opts.transactionTimeoutMs ?? 35_000, 'transactionTimeoutMs');
@@ -423,6 +435,14 @@ export class NodePostgresTransactor implements PgTransactor {
       if (continuity.command !== 'SELECT' || continuity.rows[0]?.n !== nonce) {
         throw new ContractValidationError('transaction continuity violated before COMMIT: the transaction-local scope was lost (a COMMIT/ROLLBACK occurred inside the callback)');
       }
+      // (durability authority) FORCE synchronous_commit tx-locally + read it back
+      // immediately before COMMIT, so nothing the callback did (e.g. a tx-local
+      // set_config('synchronous_commit','off',true)) can lower the durability of THIS
+      // commit — the observed CommandComplete then genuinely reflects the chosen level.
+      const dur = await query("SELECT pg_catalog.set_config('synchronous_commit', $1, true) AS sc", [this.synchronousCommit]);
+      if (dur.command !== 'SELECT' || dur.rows[0]?.sc !== this.synchronousCommit) {
+        throw new ContractValidationError(`failed to enforce synchronous_commit=${this.synchronousCommit} before COMMIT`);
+      }
       // from here the COMMIT is in flight; a lost response is AMBIGUOUS, not a failure.
       commitDispatched = true;
       const commit = await query('COMMIT');
@@ -431,6 +451,20 @@ export class NodePostgresTransactor implements PgTransactor {
         throw new ContractValidationError(`PostgreSQL COMMIT was not confirmed (command=${commit.command ?? 'missing'})`);
       }
       committed = true;
+      // (session-cleanliness authority) the connection is now out of the transaction
+      // and about to return to the pool. DISCARD ALL scrubs ANY session state the
+      // callback may have left — SET/RESET, prepared statements, LISTEN channels, temp
+      // objects, held advisory locks — that a SQL guard cannot fully reason about. If
+      // the scrub fails, the connection is NOT provably clean: destroy it and surface
+      // PostCommitReleaseError (the data is durably committed).
+      try {
+        const scrub = await query('DISCARD ALL');
+        // node-postgres reports only the first token of the command tag ('DISCARD ALL' -> 'DISCARD').
+        if (scrub.command !== 'DISCARD') throw new ContractValidationError(`post-commit DISCARD ALL was not confirmed (command=${scrub.command ?? 'missing'})`);
+      } catch (scrubError) {
+        destroy();
+        throw new PostCommitReleaseError('PostgreSQL committed but the post-commit session scrub (DISCARD ALL) failed; connection destroyed to avoid reusing a poisoned session', { cause: scrubError });
+      }
       releaseNormally();
       return result;
     } catch (error) {
