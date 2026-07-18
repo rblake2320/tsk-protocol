@@ -34,6 +34,7 @@ const MAX_SEQ = 2 ** 40;
 const MAX_MS = 8.64e15;                        // JS Date range bound
 const MAX_LEASE_HORIZON_MS = 24 * 3600 * 1000; // a granted max-expiry is at most this far ahead of control-now
 const MAX_SAFETY_MARGIN_MS = 3600 * 1000;      // fence safety margin bounded to 1h
+const MAX_CLAIM_REMAINING_MS = 3600 * 1000;    // configured worst-case final-tx+commit+skew budget, bounded to 1h
 const STREAM_ID_RE = /^[A-Za-z0-9:._/-]{1,200}$/;
 const ID_RE = /^[A-Za-z0-9:._-]{1,128}$/;      // leaseId, holder/nodeId, commandId, grantCommandId
 const DIGEST_RE = /^[0-9a-f]{64}$/;
@@ -136,6 +137,30 @@ const leaseMsg = (s: string, leaseId: string, holder: string, epoch: number, seq
 const cutMsg = (s: string, epoch: number, commandId: string, seqno: number, phase: string, evidence: string | null, prev: string | null, digest: string): Buffer =>
   frame('tsk_ha_cutover/v1', s, epoch, commandId, seqno, phase, evidence, prev, digest);
 const claimDigest = (r: FenceRecord): string => sha256hex(frame('tsk_ha_claim/v1', r.nodeId, r.fenceEpoch, r.expiresAt, r.commandId));
+
+/** (§3.4 + Erratum-R4) Cross-check the Redis claim vs the SIGNED witness floor before a fence.
+ *  A NULL Redis record is the canonical GENESIS state ONLY while witness == 0 (RedisFencingStore
+ *  models fence epochs as >= 1, so no record exists until the first promotion); NULL with
+ *  witness > 0 is a loss/rollback → quarantine. A Redis-ahead state is admissible ONLY for the
+ *  exact active intent (ambiguous mid-saga claim). Pure/deterministic — exhaustively unit-tested. */
+export function assertRedisAuthority(r: FenceRecord | null, witnessEpoch: number, commandId: string, targetEpoch: number): void {
+  if (r === null) {
+    if (witnessEpoch === 0) return; // canonical genesis: no Redis record until the first promotion
+    throw new FenceAuthorityQuarantineError(`Redis fence authority is absent with witness epoch ${witnessEpoch} > 0 — loss/rollback; quarantine`);
+  }
+  if (r.fenceEpoch < witnessEpoch) throw new FenceAuthorityQuarantineError(`Redis fence epoch ${r.fenceEpoch} < witness ${witnessEpoch} — authority rolled back; quarantine`);
+  if (r.fenceEpoch > witnessEpoch && !(r.fenceEpoch === targetEpoch && r.commandId === commandId)) {
+    throw new FenceAuthorityQuarantineError(`Redis epoch ${r.fenceEpoch} ahead of witness ${witnessEpoch} without the matching active intent — quarantine`);
+  }
+}
+
+/** (H4) On an idempotent post-FENCED retry, the Redis authority MUST still reflect the fenced
+ *  epoch (or a later one) — a NULL/rolled-back record means the authority was lost since the fence
+ *  and the promotion cannot be reported as durable. Pure/deterministic. */
+export function assertFencedAuthority(r: FenceRecord | null, fencedEpoch: number): void {
+  if (r === null) throw new FenceAuthorityQuarantineError('Redis authority absent on a FENCED retry — loss/rollback; quarantine');
+  if (r.fenceEpoch < fencedEpoch) throw new FenceAuthorityQuarantineError(`Redis epoch ${r.fenceEpoch} < fenced ${fencedEpoch} on retry — rollback; quarantine`);
+}
 const CUTOVER_TERMINAL = new Set(['ACTIVE', 'ABORTED']);
 const CUTOVER_FROZEN = new Set(['PREPARING', 'FENCED', 'IMPORTING', 'READY']); // lease grants frozen while a promotion is in-flight
 
@@ -226,7 +251,8 @@ CREATE TABLE IF NOT EXISTS tsk_ha_lease_history (
   guard_signature text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (stream_id, grant_seq),
-  UNIQUE (stream_id, grant_digest)
+  UNIQUE (stream_id, grant_digest),
+  UNIQUE (stream_id, grant_command_id)
 );
 CREATE TABLE IF NOT EXISTS tsk_ha_cutover_head (
   stream_id text PRIMARY KEY,
@@ -263,7 +289,7 @@ export const HA_CONTROL_TABLES = [
   'tsk_ha_epoch_witness', 'tsk_ha_epoch_witness_history', 'tsk_ha_lease_head',
   'tsk_ha_lease_history', 'tsk_ha_cutover_head', 'tsk_ha_cutover_history',
 ] as const;
-const MANIFEST_TABLES = HA_CONTROL_TABLES.filter((t) => t !== 'tsk_ha_schema');
+const MANIFEST_TABLES = [...HA_CONTROL_TABLES]; // attest the FULL set incl tsk_ha_schema (R4-H3)
 
 // ── exact-session critical tx: SERIALIZABLE + pinned search_path ─────────────
 
@@ -284,21 +310,63 @@ async function enterCriticalTx(exec: PgExecutor, schema: string): Promise<void> 
 
 // ── schema attestation + unforgeable readiness capability (H3) ───────────────
 
-/** Full catalog manifest of the control tables (columns + typed constraints), canonical. */
+/**
+ * Canonical FULL-catalog manifest of the control tables: columns (ordinal + default + type +
+ * nullability), constraints, indexes, triggers, relkind/persistence/row-security, and RLS
+ * policies — INCLUDING tsk_ha_schema. This is attested against a COMPILED pinned digest (below),
+ * never trust-on-first-use. NOTE: point-in-time. Preserving it at runtime is a DB privilege
+ * boundary — the runtime role MUST NOT hold DDL rights (no CREATE/ALTER/DROP) on this schema;
+ * provisioning/migration run under a separate privileged role, offline from serving.
+ */
 async function controlManifest(exec: PgExecutor): Promise<string> {
   const tables = [...MANIFEST_TABLES];
   const cols = (await exec.query(
-    `SELECT table_name, column_name, data_type, is_nullable
+    `SELECT table_name, ordinal_position, column_name, data_type, is_nullable, COALESCE(column_default,'') AS column_default
      FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ANY($1)
-     ORDER BY table_name, column_name`, [tables])).rows;
+     ORDER BY table_name, ordinal_position`, [tables])).rows;
   const cons = (await exec.query(
     `SELECT rel.relname AS t, c.contype, pg_get_constraintdef(c.oid) AS def
      FROM pg_constraint c JOIN pg_class rel ON rel.oid = c.conrelid JOIN pg_namespace n ON n.oid = rel.relnamespace
      WHERE n.nspname = current_schema() AND rel.relname = ANY($1) AND c.contype IN ('p','c','u','f')
      ORDER BY rel.relname, c.contype, def`, [tables])).rows;
-  const colLines = cols.map((r) => `C|${r.table_name}|${r.column_name}|${r.data_type}|${r.is_nullable}`);
-  const conLines = cons.map((r) => `K|${r.t}|${r.contype}|${r.def}`);
-  return [`V${CONTROL_SCHEMA_VERSION}`, ...colLines, ...conLines].join('\n');
+  const idx = (await exec.query(
+    `SELECT tablename AS t, indexname AS n, indexdef AS def FROM pg_indexes
+     WHERE schemaname = current_schema() AND tablename = ANY($1) ORDER BY tablename, indexname`, [tables])).rows;
+  const trg = (await exec.query(
+    `SELECT rel.relname AS t, tg.tgname AS n, pg_get_triggerdef(tg.oid) AS def
+     FROM pg_trigger tg JOIN pg_class rel ON rel.oid = tg.tgrelid JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+     WHERE ns.nspname = current_schema() AND rel.relname = ANY($1) AND NOT tg.tgisinternal ORDER BY rel.relname, tg.tgname`, [tables])).rows;
+  const rel = (await exec.query(
+    `SELECT rel.relname AS t, rel.relkind, rel.relpersistence, rel.relrowsecurity, rel.relforcerowsecurity
+     FROM pg_class rel JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+     WHERE ns.nspname = current_schema() AND rel.relname = ANY($1) ORDER BY rel.relname`, [tables])).rows;
+  const pol = (await exec.query(
+    `SELECT tablename AS t, policyname AS n, permissive, roles::text AS roles, cmd, COALESCE(qual,'') AS qual, COALESCE(with_check,'') AS wc
+     FROM pg_policies WHERE schemaname = current_schema() AND tablename = ANY($1) ORDER BY tablename, policyname`, [tables])).rows;
+  return [
+    `V${CONTROL_SCHEMA_VERSION}`,
+    ...cols.map((r) => `C|${r.table_name}|${r.ordinal_position}|${r.column_name}|${r.data_type}|${r.is_nullable}|${r.column_default}`),
+    ...cons.map((r) => `K|${r.t}|${r.contype}|${r.def}`),
+    ...idx.map((r) => `I|${r.t}|${r.n}|${r.def}`),
+    ...trg.map((r) => `T|${r.t}|${r.n}|${r.def}`),
+    ...rel.map((r) => `R|${r.t}|${r.relkind}|${r.relpersistence}|${r.relrowsecurity}|${r.relforcerowsecurity}`),
+    ...pol.map((r) => `P|${r.t}|${r.n}|${r.permissive}|${r.roles}|${r.cmd}|${r.qual}|${r.wc}`),
+  ].join('\n');
+}
+
+/** COMPILED expected full-catalog manifest digest (pinned; computed from HA_CONTROL_PG_SCHEMA on
+ *  PostgreSQL 16). Attestation compares the LIVE catalog to THIS — a dropped/added CHECK, column,
+ *  index, trigger, or policy fails closed. Env override supports the pin-capture bootstrap only. */
+export const HA_CONTROL_MANIFEST_DIGEST = process.env['TSK_HA_CONTROL_MANIFEST_DIGEST'] ?? '87ac344f15ce054c71c8e8e6b26884371432b2ddf989c27a96ed9f067a4398c0';
+
+/** Attest the live catalog hashes to the pinned expected manifest (fail-closed, NOT TOFU). */
+async function attestControlSchema(exec: PgExecutor): Promise<string> {
+  const live = await controlManifest(exec);
+  const digest = sha256hex(Buffer.from(live, 'utf8'));
+  if (digest !== HA_CONTROL_MANIFEST_DIGEST) {
+    throw new ContractValidationError(`control schema attestation failed: live catalog digest ${digest} != pinned ${HA_CONTROL_MANIFEST_DIGEST}`);
+  }
+  return digest;
 }
 
 const READY_BRAND: unique symbol = Symbol('tsk_ha_control_schema_ready');
@@ -325,32 +393,29 @@ export async function assertControlSchemaReady(db: PgTransactor, schema: string)
   let manifestDigest = '';
   await db.transaction(async (exec) => {
     await enterCriticalTx(exec, schema);
-    const live = await controlManifest(exec);
-    const rows = (await exec.query('SELECT version, catalog_manifest FROM tsk_ha_schema WHERE id = 1')).rows;
+    manifestDigest = await attestControlSchema(exec); // live catalog === COMPILED pinned expected (not TOFU)
+    const rows = (await exec.query('SELECT version FROM tsk_ha_schema WHERE id = 1')).rows;
     if (!rows.length) throw new ContractValidationError('control schema is not provisioned (no tsk_ha_schema row)');
     if (vInt(rows[0].version, 'schema version', 1, MAX_EPOCH) !== CONTROL_SCHEMA_VERSION) {
       throw new ContractValidationError(`control schema version mismatch: db=${rows[0].version} expected=${CONTROL_SCHEMA_VERSION}`);
     }
-    if (String(rows[0].catalog_manifest) !== live) throw new ContractValidationError('control schema drift: live catalog != provisioned manifest');
-    manifestDigest = sha256hex(Buffer.from(live, 'utf8'));
   });
   return mintReady({ db, schema, version: CONTROL_SCHEMA_VERSION, manifestDigest });
 }
 
-/** FRESH provisioning: attest live structure, then stamp the manifest+version (idempotent on an
- *  exact-current row; any divergent existing row is rejected). */
+/** FRESH provisioning: attest the live structure against the pinned expected manifest, then stamp
+ *  the version+digest (idempotent at the pinned version; a divergent existing row is rejected). */
 export async function provisionControlSchema(db: PgTransactor, schema: string): Promise<ControlSchemaReadyToken> {
   let manifestDigest = '';
   await db.transaction(async (exec) => {
     await enterCriticalTx(exec, schema);
-    const live = await controlManifest(exec);
-    manifestDigest = sha256hex(Buffer.from(live, 'utf8'));
-    const rows = (await exec.query('SELECT version, catalog_manifest FROM tsk_ha_schema WHERE id = 1 FOR UPDATE')).rows;
+    manifestDigest = await attestControlSchema(exec); // fail-closed against the compiled pinned manifest
+    const rows = (await exec.query('SELECT version FROM tsk_ha_schema WHERE id = 1 FOR UPDATE')).rows;
     if (rows.length) {
-      if (vInt(rows[0].version, 'schema version', 1, MAX_EPOCH) === CONTROL_SCHEMA_VERSION && String(rows[0].catalog_manifest) === live) return;
-      throw new ContractValidationError('control schema already provisioned with a different version/manifest');
+      if (vInt(rows[0].version, 'schema version', 1, MAX_EPOCH) === CONTROL_SCHEMA_VERSION) return;
+      throw new ContractValidationError('control schema already provisioned at a different version');
     }
-    affectedOne(await exec.query('INSERT INTO tsk_ha_schema (id, version, catalog_manifest) VALUES (1, $1, $2)', [CONTROL_SCHEMA_VERSION, live]), 'fresh control schema provision');
+    affectedOne(await exec.query('INSERT INTO tsk_ha_schema (id, version, catalog_manifest) VALUES (1, $1, $2)', [CONTROL_SCHEMA_VERSION, manifestDigest]), 'fresh control schema provision');
   });
   return mintReady({ db, schema, version: CONTROL_SCHEMA_VERSION, manifestDigest });
 }
@@ -362,8 +427,16 @@ export interface WitnessState { streamId: string; epoch: number; state: 'incompl
 export interface LeaseState { streamId: string; leaseId: string; holderNodeId: string; epoch: number; grantSeq: number; status: 'active' | 'revoked'; grantedMaxExpiryMs: number; grantCommandId: string; grantDigest: string; }
 export interface CutoverState { streamId: string; epoch: number; commandId: string; seqno: number; phase: 'PREPARING' | 'FENCED' | 'IMPORTING' | 'READY' | 'ACTIVE' | 'ABORTED'; evidence: string | null; stateDigest: string; }
 /** Caller-supplied bounds for a fence-advance. The control clock is read IN-TX (never trusted
- *  from the caller); only the bounded safety margin + the Redis claim TTL come from the caller. */
-export interface FenceProof { safetyMarginMs: number; claimExpiresAtMs: number; }
+ *  from the caller); only the bounded margins + the Redis claim TTL come from the caller. */
+export interface FenceProof {
+  safetyMarginMs: number;
+  claimExpiresAtMs: number;
+  /** Configured worst-case (final-tx + commit + clock-skew) budget the Redis claim TTL MUST still
+   *  cover at the FENCED commit, validated against the control-DB clock IN the final tx. This is
+   *  MECHANISM EVIDENCE only — NOT a universal commit-time or source-precommit guarantee; the
+   *  non-bypassable in-tx SOURCE fence is a later milestone. */
+  minClaimRemainingMs: number;
+}
 export interface FenceEvidence {
   holderNodeId: string; grantSeq: number; grantDigest: string; maxExpiryMs: number;
   controlNowMs: number; safetyMarginMs: number;
@@ -428,16 +501,16 @@ export class HaControlFencing {
 
   // ── provisioning saga (H5: durable signed per-step tx; Redis epoch-0 genesis) ──
 
-  /** Provision a stream as a RESUMABLE, durable, per-step saga:
+  /** Provision a stream as a RESUMABLE, durable, per-step saga (control-DB only):
    *  Tx-a intent → Tx-b incomplete + signed witness genesis (epoch 0, incomplete) →
-   *  [Redis epoch-0 genesis claim] → Tx-c provisioned + signed witness (epoch 0, provisioned),
-   *  which REQUIRES the Redis epoch-0 claim. Re-running resumes from the durable state; a
-   *  conflicting genesis marker is REJECTED (M5). */
-  async provision(streamId: string, genesisMarker: string, fencingStore: FencingStore, genesisNodeId: string, genesisClaimExpiryMs: number): Promise<ProvisioningState> {
+   *  Tx-c provisioned + signed witness (epoch 0, provisioned). NO Redis genesis claim — the
+   *  production RedisFencingStore models fence epochs as >= 1, so the canonical genesis is a
+   *  witness floor of 0 with a NULL Redis record; the FIRST Redis record is the FIRST promotion
+   *  (epoch 1). Re-running resumes from the durable state; a conflicting genesis marker is
+   *  REJECTED (M5). See docs/PR2_HA_DESIGN.md §Erratum-R4. */
+  async provision(streamId: string, genesisMarker: string): Promise<ProvisioningState> {
     const sid = vId(streamId, STREAM_ID_RE, 'streamId');
     if (typeof genesisMarker !== 'string' || genesisMarker.length < 1 || genesisMarker.length > 512) throw new ContractValidationError('invalid genesisMarker');
-    const nodeId = vId(genesisNodeId, ID_RE, 'genesisNodeId');
-    const claimExpiry = vInt(genesisClaimExpiryMs, 'genesisClaimExpiryMs', 1, MAX_MS);
 
     // Tx-a: intent
     await this.criticalTx(sid, async (exec) => {
@@ -454,14 +527,7 @@ export class HaControlFencing {
         await this.witnessGenesis(exec, sid, 'incomplete', next.stateDigest);
       }
     });
-    // Between incomplete and provisioned: durable Redis epoch-0 genesis claim (idempotent; a
-    // strictly-monotonic store returns false if epoch 0 already claimed — accept iff it matches).
-    await fencingStore.claim({ nodeId, fenceEpoch: 0, expiresAt: claimExpiry, commandId: 'genesis' });
-    const g = await fencingStore.current();
-    if (!g || g.fenceEpoch !== 0 || g.commandId !== 'genesis') {
-      throw new FenceAuthorityQuarantineError('Redis epoch-0 genesis claim not present — cannot complete provisioning');
-    }
-    // Tx-c: provisioned + signed witness provisioned (requires the Redis genesis claim above)
+    // Tx-c: provisioned + signed witness provisioned
     return this.criticalTx(sid, async (exec) => {
       const cur = (await this.readProvisioning(exec, sid))!;
       if (cur.genesisMarker !== genesisMarker) throw new ContractValidationError('genesis marker conflict');
@@ -568,10 +634,23 @@ export class HaControlFencing {
         throw new FenceAuthorityQuarantineError('lease grants are frozen while a promotion is in-flight');
       }
       const cur = await this.readLease(exec, s);
-      // idempotent lost-ACK retry: same command already at head → return it (no new seq)
-      if (cur && cur.grantCommandId === grantCmd && cur.leaseId === leaseId && cur.holderNodeId === holder && cur.epoch === epoch && cur.status === input.status && cur.grantedMaxExpiryMs === reqMax) return cur;
-      // monotonic max-expiry across ALL grants for (epoch, holder)
-      const priorMax = vInt((await exec.query('SELECT COALESCE(max(granted_max_expiry_ms), 0) AS m FROM tsk_ha_lease_history WHERE stream_id=$1 AND epoch=$2 AND holder_node_id=$3', [s, epoch, holder])).rows[0].m, 'prior max expiry', 0, MAX_MS);
+      // (H2) grantCommandId binds the FULL tuple: a prior grant with this command must match every
+      // field (idempotent lost-ACK retry, no new seq); a reuse with a DIFFERENT tuple is rejected.
+      const byCmd = (await exec.query('SELECT lease_id, holder_node_id, epoch, grant_seq, status, granted_max_expiry_ms, grant_digest FROM tsk_ha_lease_history WHERE stream_id=$1 AND grant_command_id=$2', [s, grantCmd])).rows[0];
+      if (byCmd) {
+        if (String(byCmd.lease_id) !== leaseId || String(byCmd.holder_node_id) !== holder || vInt(byCmd.epoch, 'epoch', 0, MAX_EPOCH) !== epoch || String(byCmd.status) !== input.status || vInt(byCmd.granted_max_expiry_ms, 'granted_max_expiry_ms', 0, MAX_MS) !== reqMax) {
+          throw new FenceAuthorityQuarantineError('grantCommandId reused with a different lease tuple — quarantine');
+        }
+        return { streamId: s, leaseId, holderNodeId: holder, epoch, grantSeq: vInt(byCmd.grant_seq, 'grant_seq', 1, MAX_SEQ), status: input.status, grantedMaxExpiryMs: reqMax, grantCommandId: grantCmd, grantDigest: vDigest(byCmd.grant_digest, 'grant_digest') };
+      }
+      // (CRIT) holder+leaseId are IMMUTABLE within an epoch — the first grant fixes the writer
+      // identity, so a same-epoch holder pivot (A active long, B revoked) is impossible.
+      const firstAtEpoch = (await exec.query('SELECT holder_node_id, lease_id FROM tsk_ha_lease_history WHERE stream_id=$1 AND epoch=$2 ORDER BY grant_seq ASC LIMIT 1', [s, epoch])).rows[0];
+      if (firstAtEpoch && (String(firstAtEpoch.holder_node_id) !== holder || String(firstAtEpoch.lease_id) !== leaseId)) {
+        throw new FenceAuthorityQuarantineError('lease holder/leaseId is immutable within an epoch — advance the epoch to change the writer');
+      }
+      // monotonic max-expiry across ALL grants at this epoch (no holder pivot can shorten it)
+      const priorMax = vInt((await exec.query('SELECT COALESCE(max(granted_max_expiry_ms), 0) AS m FROM tsk_ha_lease_history WHERE stream_id=$1 AND epoch=$2', [s, epoch])).rows[0].m, 'prior max expiry', 0, MAX_MS);
       if (reqMax < priorMax) throw new ContractValidationError(`grantedMaxExpiryMs ${reqMax} would shorten the monotonic fence horizon ${priorMax}`);
       const grantSeq = (cur?.grantSeq ?? 0) + 1;
       const prev = cur?.grantDigest ?? null;
@@ -659,16 +738,6 @@ export class HaControlFencing {
     });
   }
 
-  /** (§3.4) Cross-check the Redis claim vs the witness floor. Fail closed if Redis is
-   *  absent/rolled-back; a Redis-ahead state is admissible ONLY for the exact active intent. */
-  private assertRedisNotLost(r: FenceRecord | null, witnessEpoch: number, commandId: string, targetEpoch: number): void {
-    if (r === null) throw new FenceAuthorityQuarantineError('Redis fence authority is absent after provisioning — quarantine, do not re-initialize');
-    if (r.fenceEpoch < witnessEpoch) throw new FenceAuthorityQuarantineError(`Redis fence epoch ${r.fenceEpoch} < witness ${witnessEpoch} — authority rolled back; quarantine`);
-    if (r.fenceEpoch > witnessEpoch && !(r.fenceEpoch === targetEpoch && r.commandId === commandId)) {
-      throw new FenceAuthorityQuarantineError(`Redis epoch ${r.fenceEpoch} ahead of witness ${witnessEpoch} without the matching active intent — quarantine`);
-    }
-  }
-
   /**
    * Advance the epoch (fence the old writer) for a PREPARING intent. NO cross-tx TOCTOU:
    * grants are frozen once PREPARING, and the final witness/FENCED tx RE-READS and RE-ASSERTS
@@ -683,6 +752,7 @@ export class HaControlFencing {
     const newHolder = vId(holderNodeId, ID_RE, 'holderNodeId');
     const margin = vInt(proof.safetyMarginMs, 'safetyMarginMs', 0, MAX_SAFETY_MARGIN_MS);
     const claimExpiry = vInt(proof.claimExpiresAtMs, 'claimExpiresAtMs', 1, MAX_MS);
+    const minRemaining = vInt(proof.minClaimRemainingMs, 'minClaimRemainingMs', 0, MAX_CLAIM_REMAINING_MS);
 
     // Tx1: preconditions + capture the FROZEN revoked-lease evidence + Redis-not-lost cross-check.
     const pre = await this.criticalTx(s, async (exec) => {
@@ -693,10 +763,13 @@ export class HaControlFencing {
       if (!w || w.state !== 'provisioned') throw new FenceAuthorityQuarantineError('stream not provisioned');
       if (w.epoch !== target - 1) throw new ContractValidationError(`witness epoch ${w.epoch} is not targetEpoch-1 (${target - 1})`);
       const ev = await this.proveOldFenced(exec, s, target, margin);
-      this.assertRedisNotLost(await fencingStore.current(), w.epoch, cmd, target);
+      assertRedisAuthority(await fencingStore.current(), w.epoch, cmd, target);
       return { done: false as const, ev, witnessFrom: w.epoch };
     });
-    if (pre.done) return { epoch: target, fenceToken: fenceTokenForEpoch(target), evidence: null, idempotent: true };
+    if (pre.done) { // H7 idempotent retry — but still RECONCILE Redis (H4), never report success blind
+      assertFencedAuthority(await fencingStore.current(), target);
+      return { epoch: target, fenceToken: fenceTokenForEpoch(target), evidence: null, idempotent: true };
+    }
 
     // Redis claim (external resource); verify the FULL tuple readback (H4).
     await fencingStore.claim({ nodeId: newHolder, fenceEpoch: target, expiresAt: claimExpiry, commandId: cmd });
@@ -710,7 +783,8 @@ export class HaControlFencing {
     return this.criticalTx(s, async (exec) => {
       const cut = await this.readCutover(exec, s);
       if (cut && cut.phase === 'FENCED' && cut.commandId === cmd && cut.epoch === target) {
-        return { epoch: target, fenceToken: fenceTokenForEpoch(target), evidence: null, idempotent: true }; // H7 post-commit retry
+        assertFencedAuthority(await fencingStore.current(), target); // H4: reconcile Redis on retry
+        return { epoch: target, fenceToken: fenceTokenForEpoch(target), evidence: null, idempotent: true };
       }
       if (!cut || cut.phase !== 'PREPARING' || cut.commandId !== cmd || cut.epoch !== target) throw new ContractValidationError('intent changed under promotion — abort');
       const w = await this.readWitness(exec, s);
@@ -720,7 +794,10 @@ export class HaControlFencing {
       const rr = await fencingStore.current();
       const nowFinal = await this.controlNowMs(exec);
       if (!rr || rr.active !== true || rr.nodeId !== newHolder || rr.fenceEpoch !== target || rr.commandId !== cmd || rr.expiresAt !== claimExpiry) throw new FenceAuthorityQuarantineError('Redis tuple changed before FENCED — abort');
-      if (rr.expiresAt <= nowFinal) throw new FenceAuthorityQuarantineError('Redis claim already expired — quarantine');
+      // (H3) the Redis claim TTL MUST still cover the configured worst-case final-tx+commit+skew
+      // budget, measured against the control DB clock IN this tx. Mechanism evidence only — the
+      // non-bypassable commit-time/source-precommit fence is a later milestone.
+      if (rr.expiresAt < nowFinal + minRemaining) throw new FenceAuthorityQuarantineError(`Redis claim TTL (${rr.expiresAt - nowFinal}ms remaining) is below the configured min budget ${minRemaining}ms — quarantine`);
       await this.witnessAdvanceState(exec, s, target, 'provisioned');
       const evidence: FenceEvidence = { holderNodeId: ev2.holderNodeId, grantSeq: ev2.grantSeq, grantDigest: ev2.grantDigest, maxExpiryMs: ev2.maxExpiryMs, controlNowMs: ev2.controlNowMs, safetyMarginMs: margin, redisNodeId: rr.nodeId, redisEpoch: rr.fenceEpoch, redisExpiresMs: rr.expiresAt, redisClaimDigest, witnessFrom: target - 1, witnessTo: target, proofMode: 'lease-expiry-control-clock' };
       await this.cutTransition(exec, s, target, cmd, cut.seqno + 1, 'FENCED', encodeEvidence(evidence), cut.stateDigest);
@@ -736,7 +813,9 @@ export class HaControlFencing {
     if (!lease) throw new FenceAuthorityQuarantineError('no lease to fence — A not proven fenced');
     if (lease.epoch !== target - 1) throw new FenceAuthorityQuarantineError(`lease epoch ${lease.epoch} != targetEpoch-1 (${target - 1}) — A not proven fenced`);
     if (lease.status !== 'revoked') throw new FenceAuthorityQuarantineError('lease is not revoked — A not proven fenced');
-    const maxExpiryMs = vInt((await exec.query('SELECT COALESCE(max(granted_max_expiry_ms), 0) AS m FROM tsk_ha_lease_history WHERE stream_id=$1 AND epoch=$2 AND holder_node_id=$3', [s, lease.epoch, lease.holderNodeId])).rows[0].m, 'max grant expiry', 0, MAX_MS);
+    // max-expiry over ALL grants at epoch target-1 (holder+leaseId is immutable per epoch, so this
+    // covers every writer that could hold epoch target-1) — a revoke can never shorten it.
+    const maxExpiryMs = vInt((await exec.query('SELECT COALESCE(max(granted_max_expiry_ms), 0) AS m FROM tsk_ha_lease_history WHERE stream_id=$1 AND epoch=$2', [s, lease.epoch])).rows[0].m, 'max grant expiry', 0, MAX_MS);
     const now = await this.controlNowMs(exec);
     if (now < maxExpiryMs + margin) throw new FenceAuthorityQuarantineError('lease grant has not expired past the safety margin — A not proven fenced (wait or STONITH)');
     return { holderNodeId: lease.holderNodeId, grantSeq: lease.grantSeq, grantDigest: lease.grantDigest, maxExpiryMs, controlNowMs: now };

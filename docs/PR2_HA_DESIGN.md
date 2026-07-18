@@ -617,3 +617,46 @@ All decisions from Codex's reviews are now folded in — **no open choices remai
   **H5** per-transition forward-CAS signatures (§5.1); **H6** cross-DB durable saga (§5.2);
   **H7** manifest keys/limits (§4.1); **H8** source-ledger vs applied (§4.3); **H9** chunked
   tail (§4.3); **H11** 3-distinct-PG evidence (§5.8).
+
+---
+
+## Erratum-R4 (2026-07-18) — Redis genesis epoch, superseding the epoch-0 genesis claim
+
+The original design (§3.2) described a **Redis epoch-0 genesis claim** written between the
+`incomplete` and `provisioned` provisioning steps. Independent adversarial review of the PR2a
+implementation established that this is **incompatible with the production `RedisFencingStore`**,
+whose record validator requires `fenceEpoch >= 1` (an epoch-0 claim returns
+`TSK_FENCE_RECORD_CORRUPT` and writes no key). The store deliberately models fence epochs as
+**≥ 1**, with the pre-promotion/genesis state represented by the **absence** of a record
+(`current() === null`).
+
+**Corrected rule (authoritative):**
+
+1. **Provisioning is control-DB only.** The signed provisioning saga (intent → incomplete +
+   signed witness genesis → provisioned) makes **no** Redis claim. The authoritative genesis is a
+   **signed witness floor of epoch 0** with **no** Redis record.
+2. **The first Redis record is the first promotion (epoch 1).** `advanceEpoch(target=1)` writes the
+   first `RedisFencingStore` record.
+3. **Redis-vs-witness authority policy** (fail-closed, `assertRedisAuthority`):
+   - `current() === null` **AND** signed `witness == 0` → **canonical genesis**, admissible.
+   - `current() === null` **AND** signed `witness > 0` → **loss/rollback → quarantine**.
+   - `current().fenceEpoch < witness` → **rollback → quarantine**.
+   - `current().fenceEpoch > witness` → admissible **only** for the exact active intent
+     (`fenceEpoch == targetEpoch && commandId == the PREPARING command`); otherwise quarantine.
+4. **On an idempotent post-FENCED retry** (`assertFencedAuthority`), Redis must still reflect the
+   fenced epoch (or later); a null/rolled-back record is a loss → quarantine (never report a
+   promotion durable without reading the authority).
+
+The external signed **witness** remains the authoritative epoch floor; Redis is the cross-node
+claim coordinator, always cross-checked against the witness, never trusted alone. This erratum does
+not change the §5 promotion/import/attest machinery or the #10 acceptance boundary (real 3-node
+Redis Sentinel/quorum + persistence/replication + failover/rollback + measured RPO/RTO).
+
+### Fence-TTL note (mechanism scope)
+
+`advanceEpoch` requires the Redis claim TTL to still cover a **configured worst-case
+final-tx + commit + clock-skew budget** (`FenceProof.minClaimRemainingMs`), validated against the
+control-DB clock **inside the final FENCED transaction**. This is **mechanism evidence** that the
+claim is not about to expire at commit — it is **not** a universal commit-time guarantee nor a
+source-side pre-commit fence. The non-bypassable in-transaction **source** fence/lease (a stale
+writer loses in its own commit even after passing a Redis pre-check) is a subsequent PR2a milestone.

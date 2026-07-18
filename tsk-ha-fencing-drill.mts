@@ -1,28 +1,32 @@
 /**
- * PR2a — HA fencing FOUNDATION drill (control DB). Validates HaControlFencing against a
- * REAL PostgreSQL 16 control DB: schema attestation + drift, the signed per-step provisioning
- * saga (with a Redis epoch-0 genesis claim), the SIGNED epoch witness, the monotonic
- * command-bound lease, replay-over-head / tamper / rotation defenses, the control-clock
- * fence-advance saga with a strict signed evidence payload + freeze-under-PREPARING + idempotent
- * retry, Redis-loss quarantine, one-active-intent, target==witness+1, integer-range rejection,
- * and a BARRIER-controlled concurrent-intent race (atomic admission — not a timing test).
+ * PR2a — HA fencing FOUNDATION drill (control DB + REAL Redis). Validates HaControlFencing
+ * against a REAL PostgreSQL 16 control DB and a REAL Redis (ioredis + production RedisFencingStore):
+ * pinned full-catalog schema attestation + drift + stale-token, the signed control-DB provisioning
+ * saga (NO Redis genesis — Erratum-R4), the SIGNED epoch witness, the monotonic command-bound lease
+ * with holder/leaseId immutability (kills the same-epoch holder pivot), replay-over-head / tamper /
+ * rotation defenses, the exhaustive Redis-vs-witness authority policy (null/W0, null/W>0, R<W,
+ * R>W), the control-clock fence-advance with a strict signed evidence payload + freeze-under-
+ * PREPARING + min-TTL budget + idempotent retry that reconciles Redis, and a BARRIER-controlled
+ * two-transactor concurrent-intent race proven overlapping via pg_locks.
  *
- * BOUNDED / MECHANISM-ONLY — NO split-brain/HA/uptime claim. #10 stays OPEN. `MemoryFencingStore`
- * is an in-process reference, NOT a fault-tolerant Redis. The full 3-node Redis Sentinel/quorum +
- * child-process SIGKILL crash matrix + measured RPO/RTO remain later PR2b/PR2c milestones.
+ * BOUNDED / MECHANISM-ONLY — NO split-brain/HA/uptime claim. #10 stays OPEN. Multi-epoch cutover
+ * completion (FENCED→…→ACTIVE import/attest), the in-tx SOURCE fence, a 3-node Redis Sentinel/
+ * quorum, the child-process SIGKILL crash matrix, and measured RPO/RTO remain later PR2b/PR2c.
  */
 import assert from 'node:assert/strict';
 import pg from 'pg';
+import { Redis } from 'ioredis';
 import {
   HA_CONTROL_PG_SCHEMA, HA_CONTROL_TABLES, HaControlFencing, GuardSigner,
-  NodePostgresTransactor, MemoryFencingStore, FenceAuthorityQuarantineError,
-  provisionControlSchema, assertControlSchemaReady,
+  NodePostgresTransactor, RedisFencingStore, FenceAuthorityQuarantineError,
+  provisionControlSchema, assertControlSchemaReady, assertRedisAuthority, assertFencedAuthority,
   type GuardKeyResolver, type FenceProof, type ControlSchemaReadyToken,
 } from './packages/server/dist/index.js';
 
-const URL = process.env['TSK_TEST_CONTROL_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
-if (!URL) throw new Error('TSK_TEST_CONTROL_PG_URL (control PG16) is required');
-const { Pool } = pg;
+const PG_URL = process.env['TSK_TEST_CONTROL_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
+if (!PG_URL) throw new Error('TSK_TEST_CONTROL_PG_URL (control PG16) is required');
+const REDIS_URL: string = process.env['TSK_TEST_REDIS_URL'] ?? process.env['TSK_REDIS_URL'] ?? '';
+if (!REDIS_URL) throw new Error('TSK_TEST_REDIS_URL (real Redis) is required — mechanism-only, not a fault-tolerant topology');
 
 const GUARD_KEY = 'guard-1';
 const guardSecret = Buffer.alloc(32, 0x2b);
@@ -30,174 +34,180 @@ const resolver: GuardKeyResolver = { resolve: (kid) => (kid === GUARD_KEY ? guar
 const revokedResolver: GuardKeyResolver = { resolve: () => null };
 const signer = new GuardSigner(GUARD_KEY, guardSecret);
 const HOUR = 3_600_000;
+const rec = (nodeId: string, fenceEpoch: number, commandId: string, expiresAt = 1) => ({ nodeId, fenceEpoch, expiresAt, commandId, active: true });
 
 let passed = 0;
 async function check(name: string, fn: () => Promise<void>) { await fn(); passed++; console.log(`  ok - ${name}`); }
 
 async function main() {
-  console.log('# TSK PR2a HA fencing-foundation drill (real control PG16)');
-  const pool = new Pool({ connectionString: URL, max: 6 }); pool.on('error', () => {});
+  console.log('# TSK PR2a HA fencing-foundation drill (real control PG16 + real Redis)');
+  const pool = new pg.Pool({ connectionString: PG_URL, max: 8 }); pool.on('error', () => {});
+  const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2, lazyConnect: false });
+  await redis.flushdb();
   await pool.query(`DROP TABLE IF EXISTS ${HA_CONTROL_TABLES.join(', ')} CASCADE`);
   for (const s of HA_CONTROL_PG_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
   const tx = new NodePostgresTransactor(pool as never);
-
-  const stores = new Map<string, MemoryFencingStore>();
-  const storeFor = (sid: string) => { let s = stores.get(sid); if (!s) { s = new MemoryFencingStore(); stores.set(sid, s); } return s; };
+  const storeFor = (sid: string) => new RedisFencingStore(redis, `tsk:fence:${sid}`);
   const nowMs = async () => Number((await pool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
   const histCount = async (t: string, sid: string) => Number((await pool.query(`SELECT count(*)::int AS n FROM ${t} WHERE stream_id=$1`, [sid])).rows[0].n);
-  const prov = async (ctl: HaControlFencing, sid: string, marker: string) => ctl.provision(sid, marker, storeFor(sid), 'A', (await nowMs()) + HOUR);
 
-  // ── schema attestation + readiness capability + drift detection ──────────────
-  let ready: ControlSchemaReadyToken = await provisionControlSchema(tx as never, 'public');
-  let ctl = new HaControlFencing(tx as never, signer, resolver, ready);
+  const ready: ControlSchemaReadyToken = await provisionControlSchema(tx as never, 'public');
+  const ctl = new HaControlFencing(tx as never, signer, resolver, ready);
 
-  await check('schema attestation: a foreign/forged readiness token is rejected', async () => {
-    const forged = Object.freeze({}) as unknown as ControlSchemaReadyToken;
-    assert.throws(() => new HaControlFencing(tx as never, signer, resolver, forged), /forged or foreign token/);
+  // ── schema attestation (pinned, not TOFU) + drift + stale-token ─────────────
+  await check('attestation: forged/foreign readiness token rejected', async () => {
+    assert.throws(() => new HaControlFencing(tx as never, signer, resolver, Object.freeze({}) as unknown as ControlSchemaReadyToken), /forged or foreign token/);
   });
-
-  await check('schema attestation: a post-provision catalog drift fails readiness closed', async () => {
+  await check('attestation: catalog drift + a stale token cannot be re-minted (fail closed vs pinned)', async () => {
     await pool.query('ALTER TABLE tsk_ha_lease_head ADD COLUMN drift_col int');
-    await assert.rejects(() => assertControlSchemaReady(tx as never, 'public'), /drift/);
+    await assert.rejects(() => assertControlSchemaReady(tx as never, 'public'), /attestation failed/); // no fresh capability against a drifted schema
     await pool.query('ALTER TABLE tsk_ha_lease_head DROP COLUMN drift_col');
-    await assertControlSchemaReady(tx as never, 'public'); // clean again
+    await assertControlSchemaReady(tx as never, 'public'); // clean again == pinned
   });
 
-  // ── signed per-step provisioning saga + Redis epoch-0 genesis ───────────────
+  // ── signed control-DB provisioning saga (NO Redis genesis — Erratum-R4) ──────
   const SID = 'tsk:pair:pr2a/v1';
-  await check('provisioning saga: 3 signed forward-CAS steps + signed witness genesis + Redis epoch-0', async () => {
-    const st = await prov(ctl, SID, 'genesis-nonce-abc');
+  await check('provisioning saga: 3 signed steps + signed witness genesis; witness epoch-0 provisioned; NO Redis record', async () => {
+    const st = await ctl.provision(SID, 'genesis-abc');
     assert.equal(st.state, 'provisioned'); assert.equal(st.stateSeq, 3);
     assert.equal(await histCount('tsk_ha_provisioning_history', SID), 3);
-    assert.equal(await histCount('tsk_ha_epoch_witness_history', SID), 2, 'witness genesis incomplete + provisioned');
-    const w = await ctl.witness(SID);
-    assert.equal(w?.epoch, 0); assert.equal(w?.state, 'provisioned');
-    assert.equal((await storeFor(SID).current())?.fenceEpoch, 0, 'Redis epoch-0 genesis claim present');
+    assert.equal(await histCount('tsk_ha_epoch_witness_history', SID), 2);
+    const w = await ctl.witness(SID); assert.equal(w?.epoch, 0); assert.equal(w?.state, 'provisioned');
+    assert.equal(await storeFor(SID).current(), null, 'no Redis record at genesis (witness floor 0)');
+  });
+  await check('provisioning idempotent + conflicting genesis marker rejected', async () => {
+    assert.equal((await ctl.provision(SID, 'genesis-abc')).stateSeq, 3);
+    assert.equal(await histCount('tsk_ha_provisioning_history', SID), 3);
+    await assert.rejects(() => ctl.provision(SID, 'DIFFERENT'), /genesis marker conflict/);
   });
 
-  await check('provisioning is idempotent + rejects a conflicting genesis marker', async () => {
-    const st = await prov(ctl, SID, 'genesis-nonce-abc');
-    assert.equal(st.state, 'provisioned');
-    assert.equal(await histCount('tsk_ha_provisioning_history', SID), 3, 'no extra transitions');
-    await assert.rejects(() => prov(ctl, SID, 'DIFFERENT-marker'), /genesis marker conflict/);
-  });
-
-  // ── signed, monotonic, command-bound lease ───────────────────────────────────
-  await check('lease: grant->renew->revoke signed monotonic; idempotent retry adds no seq', async () => {
+  // ── monotonic, command-bound, holder-immutable lease ────────────────────────
+  await check('lease grant->renew->revoke monotonic; grantCommandId idempotent (same tuple, no seq)', async () => {
     const now = await nowMs();
-    const g1 = await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 30_000, grantCommandId: 'gc1' });
-    assert.equal(g1.grantSeq, 1);
-    const g2 = await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 60_000, grantCommandId: 'gc2' });
-    assert.equal(g2.grantSeq, 2);
-    const again = await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 60_000, grantCommandId: 'gc2' });
-    assert.equal(again.grantSeq, 2, 'idempotent lost-ACK retry: same grantCommandId, no seq+1');
-    const g3 = await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: now + 60_000, grantCommandId: 'gc3' });
-    assert.equal(g3.grantSeq, 3); assert.equal(g3.status, 'revoked');
+    assert.equal((await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 30_000, grantCommandId: 'gc1' })).grantSeq, 1);
+    assert.equal((await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 60_000, grantCommandId: 'gc2' })).grantSeq, 2);
+    assert.equal((await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 60_000, grantCommandId: 'gc2' })).grantSeq, 2, 'idempotent same-command retry, no seq+1');
+    assert.equal((await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: now + 60_000, grantCommandId: 'gc3' })).status, 'revoked');
     assert.equal(await histCount('tsk_ha_lease_history', SID), 3);
   });
-
-  await check('lease rejects: wrong epoch, shortened max-expiry, unprovisioned stream, integer ranges', async () => {
+  await check('lease rejects: command-id tuple mismatch, holder pivot, wrong epoch, shortened expiry, unprovisioned, int ranges', async () => {
     const now = await nowMs();
-    await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 1, status: 'active', grantedMaxExpiryMs: now + 1000, grantCommandId: 'x' }), /must equal the current witness epoch/);
-    await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: now + 1000, grantCommandId: 'x' }), /shorten the monotonic fence horizon/);
-    await assert.rejects(() => ctl.writeLease({ streamId: 'tsk:unprov/v1', leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 1000, grantCommandId: 'x' }), FenceAuthorityQuarantineError);
-    await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l', holderNodeId: 'A', epoch: -1, status: 'active', grantedMaxExpiryMs: now, grantCommandId: 'x' }), /epoch must be a safe integer/);
-    await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: Number.POSITIVE_INFINITY, grantCommandId: 'x' }), /grantedMaxExpiryMs must be a safe integer/);
+    await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 99_000, grantCommandId: 'gc3' }), /reused with a different lease tuple/);
+    await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'EVIL', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 60_000, grantCommandId: 'gcX' }), /holder\/leaseId is immutable within an epoch/);
+    await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 1, status: 'active', grantedMaxExpiryMs: now + 1000, grantCommandId: 'gy' }), /must equal the current witness epoch/);
+    await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: 1, grantCommandId: 'gz' }), /shorten the monotonic fence horizon/);
+    await assert.rejects(() => ctl.writeLease({ streamId: 'tsk:unprov/v1', leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now, grantCommandId: 'g' }), FenceAuthorityQuarantineError);
+    await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: Number.POSITIVE_INFINITY, grantCommandId: 'g' }), /grantedMaxExpiryMs must be a safe integer/);
   });
 
   // ── H10 replay-over-head + tamper + rotation ────────────────────────────────
-  const SIDr = 'tsk:pair:replay/v1';
-  await check('H10: replaying an older valid lease row over the head is rejected (head!=latest history)', async () => {
-    await prov(ctl, SIDr, 'g-replay');
+  await check('H10: replaying an older valid lease row over the head is rejected (head != latest history)', async () => {
+    const SIDr = 'tsk:pair:replay/v1';
+    await ctl.provision(SIDr, 'g-replay');
     const now = await nowMs();
     await ctl.writeLease({ streamId: SIDr, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 1000, grantCommandId: 'r1' });
     await ctl.writeLease({ streamId: SIDr, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 2000, grantCommandId: 'r2' });
-    // overwrite the head with the older (seq-1) validly-signed row
     await pool.query('DELETE FROM tsk_ha_lease_head WHERE stream_id=$1', [SIDr]);
-    await pool.query(`INSERT INTO tsk_ha_lease_head (stream_id, lease_id, holder_node_id, epoch, grant_seq, status, granted_max_expiry_ms, grant_command_id, prev_grant_digest, grant_digest, guard_key_id, guard_signature)
-      SELECT stream_id, lease_id, holder_node_id, epoch, grant_seq, status, granted_max_expiry_ms, grant_command_id, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_ha_lease_history WHERE stream_id=$1 AND grant_seq=1`, [SIDr]);
+    await pool.query(`INSERT INTO tsk_ha_lease_head SELECT * FROM (SELECT stream_id, lease_id, holder_node_id, epoch, grant_seq, status, granted_max_expiry_ms, grant_command_id, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_ha_lease_history WHERE stream_id=$1 AND grant_seq=1) x`, [SIDr]);
     await assert.rejects(() => ctl.lease(SIDr), /head is not the latest history row/);
   });
-
-  await check('tamper + rotation/revocation: corrupted head signature and a revoked keyId both fail closed', async () => {
+  await check('tamper + rotation/revocation fail closed', async () => {
     await pool.query("UPDATE tsk_ha_lease_head SET guard_signature='AAAA' WHERE stream_id=$1", [SID]);
     await assert.rejects(() => ctl.lease(SID), /guard signature/);
-    // restore the true head from history seq 3
     await pool.query('DELETE FROM tsk_ha_lease_head WHERE stream_id=$1', [SID]);
-    await pool.query(`INSERT INTO tsk_ha_lease_head (stream_id, lease_id, holder_node_id, epoch, grant_seq, status, granted_max_expiry_ms, grant_command_id, prev_grant_digest, grant_digest, guard_key_id, guard_signature)
-      SELECT stream_id, lease_id, holder_node_id, epoch, grant_seq, status, granted_max_expiry_ms, grant_command_id, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_ha_lease_history WHERE stream_id=$1 AND grant_seq=3`, [SID]);
+    await pool.query(`INSERT INTO tsk_ha_lease_head SELECT * FROM (SELECT stream_id, lease_id, holder_node_id, epoch, grant_seq, status, granted_max_expiry_ms, grant_command_id, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_ha_lease_history WHERE stream_id=$1 AND grant_seq=3) x`, [SID]);
     const ctlRevoked = new HaControlFencing(tx as never, signer, revokedResolver, ready);
     await assert.rejects(() => ctlRevoked.lease(SID), /unknown or revoked guard keyId/);
   });
 
-  // ── control-clock fence-advance saga + evidence + guards + freeze + idempotency ──
-  await check('fence-advance: not-revoked and not-expired both quarantine; revoked+elapsed advances 0->1 with signed evidence', async () => {
+  // ── exhaustive Redis-vs-witness authority policy (pure, deterministic) ───────
+  await check('Redis authority policy: null/W0 ok, null/W>0 denied, R<W rollback, R>W non-matching denied, R>W exact-intent ok', async () => {
+    assert.doesNotThrow(() => assertRedisAuthority(null, 0, 'c', 1));                       // null/W0 = genesis
+    assert.throws(() => assertRedisAuthority(null, 1, 'c', 2), FenceAuthorityQuarantineError); // null/W>0 = loss
+    assert.throws(() => assertRedisAuthority(rec('B', 1, 'c'), 2, 'c', 3), FenceAuthorityQuarantineError); // R<W rollback
+    assert.throws(() => assertRedisAuthority(rec('B', 5, 'other'), 2, 'c', 3), FenceAuthorityQuarantineError); // R>W not our intent
+    assert.doesNotThrow(() => assertRedisAuthority(rec('B', 3, 'c'), 2, 'c', 3));            // R>W == exact active intent
+    assert.doesNotThrow(() => assertRedisAuthority(rec('B', 2, 'c'), 2, 'c', 3));            // R==W
+    assert.throws(() => assertFencedAuthority(null, 1), FenceAuthorityQuarantineError);       // fenced retry, Redis lost
+    assert.throws(() => assertFencedAuthority(rec('B', 0 as never, 'c'), 2), FenceAuthorityQuarantineError); // fenced retry, rollback
+    assert.doesNotThrow(() => assertFencedAuthority(rec('B', 2, 'c'), 2));
+  });
+
+  // ── control-clock fence-advance with REAL Redis (null/W0 allowed end-to-end) ─
+  await check('fence-advance (real Redis): freeze/not-revoked/not-expired guard; revoked+elapsed advances 0->1 w/ signed evidence; idempotent retry reconciles Redis', async () => {
     const SID2 = 'tsk:pair:advance/v1';
-    await prov(ctl, SID2, 'g-adv');
+    await ctl.provision(SID2, 'g-adv');
     const store = storeFor(SID2);
-    const past = (await nowMs()) - 5_000; // an already-elapsed lease (control clock is real; no sleep)
+    const past = (await nowMs()) - 5_000;
     await ctl.writeLease({ streamId: SID2, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a1' });
     await ctl.beginPromotionIntent(SID2, 'c1', 1);
-    // freeze-under-PREPARING: a new active grant is refused while the promotion is in-flight
     await assert.rejects(() => ctl.writeLease({ streamId: SID2, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a2' }), /frozen while a promotion is in-flight/);
-    const proof: FenceProof = { safetyMarginMs: 0, claimExpiresAtMs: (await nowMs()) + HOUR };
-    // A not proven fenced yet (lease still active) -> quarantine
-    await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, proof), FenceAuthorityQuarantineError);
+    const proof: FenceProof = { safetyMarginMs: 0, minClaimRemainingMs: 5_000, claimExpiresAtMs: (await nowMs()) + HOUR };
+    await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, proof), FenceAuthorityQuarantineError); // not revoked
     await ctl.writeLease({ streamId: SID2, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: past, grantCommandId: 'a3' });
-    // revoked but a huge margin keeps A within the fence horizon -> still quarantine
-    await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, { ...proof, safetyMarginMs: HOUR }), /not proven fenced/);
-    // revoked AND elapsed past the margin -> advance with signed evidence
+    await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, { ...proof, safetyMarginMs: HOUR }), /not proven fenced/); // margin keeps A inside horizon
     const res = await ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, proof);
     assert.equal(res.epoch, 1); assert.equal(res.fenceToken, '1'); assert.equal(res.idempotent, false);
     assert.ok(res.evidence && res.evidence.witnessFrom === 0 && res.evidence.witnessTo === 1 && res.evidence.proofMode === 'lease-expiry-control-clock');
-    assert.equal((await ctl.witness(SID2))?.epoch, 1, 'witness advanced 0->1');
-    assert.equal((await store.current())?.fenceEpoch, 1, 'Redis claimed epoch 1');
-    // H7 idempotent retry after commit -> returns existing, no new FENCED history
-    const again = await ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, proof);
-    assert.equal(again.idempotent, true);
-    assert.equal((await ctl.witness(SID2))?.epoch, 1, 'still epoch 1 after idempotent retry');
+    assert.equal((await ctl.witness(SID2))?.epoch, 1);
+    assert.equal((await store.current())?.fenceEpoch, 1, 'REAL Redis record written at epoch 1');
+    assert.equal((await ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, proof)).idempotent, true, 'idempotent retry (Redis reconciled)');
+    // H4: after the fence, a Redis LOSS makes the idempotent retry fail closed
+    await redis.del('tsk:fence:' + SID2);
+    await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, proof), /absent on a FENCED retry/);
   });
 
-  await check('Redis-loss quarantine: an absent Redis authority after provisioning fails closed', async () => {
-    const SID3 = 'tsk:pair:redisloss/v1';
-    await prov(ctl, SID3, 'g-rl');
+  await check('fence-advance min-TTL: a claim TTL below the configured worst-case budget quarantines', async () => {
+    const SID3 = 'tsk:pair:ttl/v1';
+    await ctl.provision(SID3, 'g-ttl');
     const past = (await nowMs()) - 5_000;
-    await ctl.writeLease({ streamId: SID3, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'b1' });
-    await ctl.beginPromotionIntent(SID3, 'cr', 1);
-    await ctl.writeLease({ streamId: SID3, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: past, grantCommandId: 'b2' });
-    const empty = new MemoryFencingStore(); // current() === null => Redis lost after provisioning
-    const rlProof: FenceProof = { safetyMarginMs: 0, claimExpiresAtMs: (await nowMs()) + HOUR };
-    await assert.rejects(() => ctl.advanceEpoch(SID3, 'cr', 1, 'B', empty, rlProof), /Redis fence authority is absent/);
+    await ctl.writeLease({ streamId: SID3, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 't1' });
+    await ctl.beginPromotionIntent(SID3, 'c1', 1);
+    await ctl.writeLease({ streamId: SID3, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: past, grantCommandId: 't2' });
+    const tooSoon = (await nowMs()) + 2_000; // remaining 2s < 5s budget
+    await assert.rejects(() => ctl.advanceEpoch(SID3, 'c1', 1, 'B', storeFor(SID3), { safetyMarginMs: 0, minClaimRemainingMs: 5_000, claimExpiresAtMs: tooSoon }), /below the configured min budget/);
   });
 
   await check('one active intent + target==witness+1 + integer-range rejection', async () => {
     const SID4 = 'tsk:pair:intent/v1';
-    await prov(ctl, SID4, 'g-i');
+    await ctl.provision(SID4, 'g-i');
     await assert.rejects(() => ctl.beginPromotionIntent(SID4, 'c1', 2), /must equal witness.epoch\+1/);
     await assert.rejects(() => ctl.beginPromotionIntent(SID4, 'c1', 0), /targetEpoch must be a safe integer/);
     await ctl.beginPromotionIntent(SID4, 'c1', 1);
     await assert.rejects(() => ctl.beginPromotionIntent(SID4, 'c2', 1), /in-flight intent/);
-    const same = await ctl.beginPromotionIntent(SID4, 'c1', 1);
-    assert.equal(same.phase, 'PREPARING');
+    assert.equal((await ctl.beginPromotionIntent(SID4, 'c1', 1)).phase, 'PREPARING');
   });
 
-  await check('barrier-controlled concurrent intents: atomic admission yields exactly one winner', async () => {
+  // ── barrier-controlled concurrency: two transactors, gate lock, pg_locks proof ─
+  await check('barrier-controlled concurrent intents (two transactors, proven overlapping via pg_locks): exactly one winner', async () => {
     const SID5 = 'tsk:pair:race/v1';
-    await prov(ctl, SID5, 'g-race');
-    // launch both together; the per-stream advisory lock + SERIALIZABLE make admission atomic
-    const results = await Promise.allSettled([
-      ctl.beginPromotionIntent(SID5, 'cX', 1),
-      ctl.beginPromotionIntent(SID5, 'cY', 1),
-    ]);
-    const winners = results.filter((r) => r.status === 'fulfilled');
-    assert.equal(winners.length, 1, 'exactly one intent admitted');
+    await ctl.provision(SID5, 'g-race');
+    const txA = new NodePostgresTransactor(pool as never), txB = new NodePostgresTransactor(pool as never);
+    const ctlA = new HaControlFencing(txA as never, signer, resolver, await assertControlSchemaReady(txA as never, 'public'));
+    const ctlB = new HaControlFencing(txB as never, signer, resolver, await assertControlSchemaReady(txB as never, 'public'));
+    const gate = await pool.connect();
+    await gate.query('BEGIN');
+    await gate.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [SID5]); // hold the per-stream lock
+    const p1 = ctlA.beginPromotionIntent(SID5, 'cX', 1);
+    const p2 = ctlB.beginPromotionIntent(SID5, 'cY', 1);
+    // prove genuine overlap: BOTH intents are blocked WAITING on the advisory lock (the drill is
+    // the only workload, so any ungranted advisory waiter is one of our two intents).
+    let waiters = 0;
+    for (let i = 0; i < 100 && waiters < 2; i++) {
+      waiters = Number((await pool.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype='advisory' AND NOT granted")).rows[0].n);
+      if (waiters < 2) await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(waiters, 2, 'both intents proven blocked/overlapping on the per-stream advisory lock');
+    await gate.query('COMMIT'); gate.release();
+    const results = await Promise.allSettled([p1, p2]);
+    assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1, 'exactly one intent admitted');
     assert.equal(await histCount('tsk_ha_cutover_history', SID5), 1, 'only one PREPARING row appended');
-    const head = (await pool.query('SELECT phase FROM tsk_ha_cutover_head WHERE stream_id=$1', [SID5])).rows[0];
-    assert.equal(head.phase, 'PREPARING');
+    assert.equal((await pool.query('SELECT phase FROM tsk_ha_cutover_head WHERE stream_id=$1', [SID5])).rows[0].phase, 'PREPARING');
   });
 
   console.log(`\n# ${passed} PR2a fencing-foundation checks passed`);
   await pool.end().catch(() => {});
+  redis.disconnect();
 }
 
 main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
