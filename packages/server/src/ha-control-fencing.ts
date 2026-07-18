@@ -154,24 +154,22 @@ export function assertRedisAuthority(r: FenceRecord | null, witnessEpoch: number
   }
 }
 
-/** (H4 + R5-H2) Reconcile the Redis authority on an idempotent post-FENCED retry against the
- *  SIGNED FENCED evidence. At the fenced epoch the Redis record must EXACTLY match the signed
- *  tuple (active + node + command + expiry + claim digest) — a wrong node/command, inactive,
- *  or altered-expiry record is a loss/tamper → quarantine. A LATER Redis epoch is admissible
- *  ONLY when the signed witness has itself advanced to at least that epoch (a real later
- *  promotion); a null/rolled-back record is a loss. Pure/deterministic — exhaustively tested. */
-export function reconcileFencedRedis(r: FenceRecord | null, evidence: FenceEvidence, witnessEpoch: number, commandId: string): void {
+/** (H4 + R5-H2 + R7-HIGH2) Reconcile the Redis authority on an idempotent post-FENCED retry
+ *  against the SIGNED FENCED evidence we matched. The Redis record MUST EXACTLY equal the signed
+ *  tuple at `evidence.witnessTo` (epoch + active + node + command + expiry + claim digest). ANY
+ *  other epoch — higher OR lower — quarantines: a genuine later promotion moves the cutover head
+ *  off FENCED@target so this reconcile is never reached for it, therefore a Redis epoch ahead of
+ *  the signed cutover we matched is authority-ahead-of-signed-state, NOT a blessing. A witness
+ *  INTEGER is never trusted to bless an unauthenticated later record. Pure/deterministic. */
+export function reconcileFencedRedis(r: FenceRecord | null, evidence: FenceEvidence, commandId: string): void {
   if (r === null) throw new FenceAuthorityQuarantineError('Redis authority absent on a FENCED retry — loss/rollback; quarantine');
   const fenced = evidence.witnessTo;
-  if (r.fenceEpoch < fenced) throw new FenceAuthorityQuarantineError(`Redis epoch ${r.fenceEpoch} < fenced ${fenced} on retry — rollback; quarantine`);
-  if (r.fenceEpoch === fenced) {
-    if (r.active !== true || r.nodeId !== evidence.redisNodeId || r.commandId !== commandId || r.expiresAt !== evidence.redisExpiresMs || claimDigest(r) !== evidence.redisClaimDigest) {
-      throw new FenceAuthorityQuarantineError('Redis record does not match the signed FENCED evidence tuple on retry — quarantine');
-    }
-    return;
+  if (r.fenceEpoch !== fenced) {
+    throw new FenceAuthorityQuarantineError(`Redis epoch ${r.fenceEpoch} != the signed FENCED epoch ${fenced} on retry — rollback/ahead-of-signed-authority; quarantine`);
   }
-  // r.fenceEpoch > fenced: only admissible if the SIGNED witness backs the later epoch.
-  if (witnessEpoch < r.fenceEpoch) throw new FenceAuthorityQuarantineError(`Redis epoch ${r.fenceEpoch} ahead of the signed witness ${witnessEpoch} on retry — quarantine`);
+  if (r.active !== true || r.nodeId !== evidence.redisNodeId || r.commandId !== commandId || r.expiresAt !== evidence.redisExpiresMs || claimDigest(r) !== evidence.redisClaimDigest) {
+    throw new FenceAuthorityQuarantineError('Redis record does not match the signed FENCED evidence tuple on retry — quarantine');
+  }
 }
 const CUTOVER_TERMINAL = new Set(['ACTIVE', 'ABORTED']);
 const CUTOVER_FROZEN = new Set(['PREPARING', 'FENCED', 'IMPORTING', 'READY']); // lease grants frozen while a promotion is in-flight
@@ -462,6 +460,13 @@ export interface HaControlPolicy {
    *  claim TTL MUST still cover at the FENCED commit, validated against the control-DB clock IN the
    *  final tx. MECHANISM EVIDENCE only — NOT a universal commit-time/source-precommit guarantee. */
   minClaimRemainingMs: number;
+  /** (R7-HIGH1) When true (DEFAULT), EVERY control op re-attests the LIVE catalog against the
+   *  compiled pinned manifest inside its own tx, so a post-mint DDL drift fails the NEXT op closed
+   *  (the readiness token is point-in-time and does NOT by itself prevent later DDL). Set false ONLY
+   *  under an explicit STARTUP-ONLY boundary where the runtime DB role holds NO DDL rights
+   *  (CREATE/ALTER/DROP) on this schema — then drift is impossible under the operating identity and
+   *  the per-op re-attestation is redundant. */
+  attestEveryTx?: boolean;
 }
 export interface FenceEvidence {
   holderNodeId: string; grantSeq: number; grantDigest: string; maxExpiryMs: number;
@@ -496,13 +501,16 @@ function verifyChain(resolver: GuardKeyResolver, history: Linked[], head: Linked
 }
 
 /**
- * Control-DB fencing authority. Construction REQUIRES an unforgeable readiness capability
- * bound to the same transactor + a pinned schema. Every op runs in an exact-session
- * SERIALIZABLE tx with a per-stream advisory lock (atomic admission).
+ * Control-DB fencing authority. Construction REQUIRES an unforgeable readiness capability bound to
+ * the same transactor + a pinned schema. The token is POINT-IN-TIME; by default (policy
+ * `attestEveryTx`) every op ALSO re-attests the live catalog against the compiled pinned manifest
+ * inside its own SERIALIZABLE tx, so a post-mint DDL drift fails the next op closed. Every op runs
+ * exact-session SERIALIZABLE with a pinned search_path + a per-stream advisory lock (atomic admission).
  */
 export class HaControlFencing {
   private readonly schema: string;
   private readonly minClaimRemainingMs: number;
+  private readonly attestEveryTx: boolean;
   constructor(
     private readonly db: PgTransactor,
     private readonly signer: GuardSigner,
@@ -512,13 +520,17 @@ export class HaControlFencing {
   ) {
     this.schema = requireReady(ready, db).schema;
     this.minClaimRemainingMs = vInt(policy?.minClaimRemainingMs, 'policy.minClaimRemainingMs', 1, MAX_CLAIM_REMAINING_MS); // strictly positive
+    this.attestEveryTx = policy?.attestEveryTx !== false; // default true (R7-HIGH1)
   }
 
-  /** Exact-session SERIALIZABLE + pinned schema + per-stream advisory lock. */
+  /** Exact-session SERIALIZABLE + pinned schema + (R7-HIGH1) LIVE per-tx catalog re-attestation +
+   *  per-stream advisory lock. The re-attestation makes the point-in-time readiness token safe
+   *  against a post-mint DDL drift: any structural change fails the NEXT op closed. */
   private criticalTx<T>(streamId: string, fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
     const sid = vId(streamId, STREAM_ID_RE, 'streamId');
     return this.db.transaction(async (exec) => {
       await enterCriticalTx(exec, this.schema);
+      if (this.attestEveryTx) await attestControlSchema(exec); // live catalog === compiled pinned digest
       await exec.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [sid]);
       return fn(exec);
     });
@@ -786,10 +798,10 @@ export class HaControlFencing {
     // Tx1: preconditions + capture the FROZEN revoked-lease evidence + Redis-not-lost cross-check.
     const pre = await this.criticalTx(s, async (exec) => {
       const cut = await this.readCutover(exec, s);
-      const w = await this.readWitness(exec, s);
       if (cut && cut.phase === 'FENCED' && cut.commandId === cmd && cut.epoch === target) {
-        return { done: true as const, evidence: cut.evidence, witnessEpoch: w ? w.epoch : -1 };
+        return { done: true as const, evidence: cut.evidence };
       }
+      const w = await this.readWitness(exec, s);
       if (!cut || cut.phase !== 'PREPARING' || cut.commandId !== cmd || cut.epoch !== target) throw new ContractValidationError('no matching PREPARING intent for this promotion');
       if (!w || w.state !== 'provisioned') throw new FenceAuthorityQuarantineError('stream not provisioned');
       if (w.epoch !== target - 1) throw new ContractValidationError(`witness epoch ${w.epoch} is not targetEpoch-1 (${target - 1})`);
@@ -797,9 +809,9 @@ export class HaControlFencing {
       assertRedisAuthority(await fencingStore.current(), w.epoch, cmd, target);
       return { done: false as const, ev, witnessFrom: w.epoch };
     });
-    if (pre.done) { // H7 idempotent retry — RECONCILE Redis vs the SIGNED FENCED evidence (R5-H2), never blind
+    if (pre.done) { // H7 idempotent retry — RECONCILE Redis vs the SIGNED FENCED evidence (R5-H2/R7-HIGH2), never blind
       if (!pre.evidence) throw new FenceAuthorityQuarantineError('FENCED cutover is missing its signed evidence — quarantine');
-      reconcileFencedRedis(await fencingStore.current(), decodeEvidence(pre.evidence), pre.witnessEpoch, cmd);
+      reconcileFencedRedis(await fencingStore.current(), decodeEvidence(pre.evidence), cmd);
       return { epoch: target, fenceToken: fenceTokenForEpoch(target), evidence: null, idempotent: true };
     }
 
@@ -815,9 +827,8 @@ export class HaControlFencing {
     return this.criticalTx(s, async (exec) => {
       const cut = await this.readCutover(exec, s);
       if (cut && cut.phase === 'FENCED' && cut.commandId === cmd && cut.epoch === target) {
-        const wr = await this.readWitness(exec, s); // R5-H2: reconcile Redis vs signed evidence on retry
         if (!cut.evidence) throw new FenceAuthorityQuarantineError('FENCED cutover is missing its signed evidence — quarantine');
-        reconcileFencedRedis(await fencingStore.current(), decodeEvidence(cut.evidence), wr ? wr.epoch : -1, cmd);
+        reconcileFencedRedis(await fencingStore.current(), decodeEvidence(cut.evidence), cmd); // R5-H2/R7-HIGH2
         return { epoch: target, fenceToken: fenceTokenForEpoch(target), evidence: null, idempotent: true };
       }
       if (!cut || cut.phase !== 'PREPARING' || cut.commandId !== cmd || cut.epoch !== target) throw new ContractValidationError('intent changed under promotion — abort');
@@ -867,7 +878,7 @@ function unframe(buf: Buffer): string[] {
   let i = 0;
   while (i < buf.length) {
     const tag = buf[i]; i += 1;
-    if (tag === 0) { out.push(' '); continue; }
+    if (tag === 0) { out.push(''); continue; }
     if (tag !== 1) throw new ContractValidationError('malformed evidence frame tag');
     if (i + 4 > buf.length) throw new ContractValidationError('truncated evidence frame length');
     const len = buf.readUInt32BE(i); i += 4;

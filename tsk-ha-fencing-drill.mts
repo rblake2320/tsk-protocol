@@ -131,17 +131,26 @@ async function main() {
     assert.doesNotThrow(() => assertRedisAuthority(rec('B', 3, 'c'), 2, 'c', 3));            // R>W == exact active intent
     assert.doesNotThrow(() => assertRedisAuthority(rec('B', 2, 'c'), 2, 'c', 3));            // R==W
   });
-  await check('FENCED-retry reconcile (R5-H2): rejects null/rollback/wrong-node/wrong-command/inactive/expiry/digest; later epoch needs witness', async () => {
+  await check('FENCED-retry reconcile (R5-H2/R7-HIGH2): requires EXACT signed epoch+tuple; ANY other epoch (higher OR lower) quarantines — no witness-integer trust', async () => {
     const e = evi({ witnessTo: 1, redisNodeId: 'B', redisExpiresMs: 1000, redisClaimDigest: '0'.repeat(64) });
-    assert.throws(() => reconcileFencedRedis(null, e, 1, 'c'), FenceAuthorityQuarantineError);                                   // lost
-    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'c', 1000), evi({ witnessTo: 2 }), 2, 'c'), FenceAuthorityQuarantineError); // R<fenced rollback
-    assert.throws(() => reconcileFencedRedis(rec('X', 1, 'c', 1000), e, 1, 'c'), FenceAuthorityQuarantineError);                 // wrong node
-    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'other', 1000), e, 1, 'c'), FenceAuthorityQuarantineError);             // wrong command
-    assert.throws(() => reconcileFencedRedis({ ...rec('B', 1, 'c', 1000), active: false }, e, 1, 'c'), FenceAuthorityQuarantineError); // inactive
-    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'c', 999), e, 1, 'c'), FenceAuthorityQuarantineError);                  // altered expiry
-    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'c', 1000), e, 1, 'c'), FenceAuthorityQuarantineError);                 // digest mismatch (bogus pinned digest)
-    assert.throws(() => reconcileFencedRedis(rec('B', 2, 'c', 1000), e, 1, 'c'), FenceAuthorityQuarantineError);                 // later epoch, witness behind
-    assert.doesNotThrow(() => reconcileFencedRedis(rec('B', 2, 'c', 1000), e, 2, 'c'));                                          // later epoch, witness backs it
+    assert.throws(() => reconcileFencedRedis(null, e, 'c'), FenceAuthorityQuarantineError);                                   // lost
+    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'c', 1000), evi({ witnessTo: 2 }), 'c'), FenceAuthorityQuarantineError); // R < fenced (rollback)
+    assert.throws(() => reconcileFencedRedis(rec('X', 1, 'c', 1000), e, 'c'), FenceAuthorityQuarantineError);                 // wrong node
+    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'other', 1000), e, 'c'), FenceAuthorityQuarantineError);             // wrong command
+    assert.throws(() => reconcileFencedRedis({ ...rec('B', 1, 'c', 1000), active: false }, e, 'c'), FenceAuthorityQuarantineError); // inactive
+    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'c', 999), e, 'c'), FenceAuthorityQuarantineError);                  // altered expiry
+    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'c', 1000), e, 'c'), FenceAuthorityQuarantineError);                 // digest mismatch
+    // R7-HIGH2: a forged INACTIVE EVIL tuple at a LATER epoch is NOT blessed by any witness integer
+    assert.throws(() => reconcileFencedRedis({ ...rec('EVIL', 2, 'c', 1000), active: false }, e, 'c'), FenceAuthorityQuarantineError);
+    assert.throws(() => reconcileFencedRedis(rec('B', 2, 'c', 1000), e, 'c'), FenceAuthorityQuarantineError); // any epoch != signed fenced epoch
+  });
+  await check('R7-HIGH1: live per-tx attestation rejects a MUTATION after a post-mint DDL drift', async () => {
+    await pool.query('ALTER TABLE tsk_ha_provisioning ADD COLUMN drift2 int');
+    const dn = await nowMs();
+    await assert.rejects(() => ctl.provision('tsk:drift/v1', 'g-drift'), /attestation failed/);
+    await assert.rejects(() => ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: dn + 1000, grantCommandId: 'drx' }), /attestation failed/);
+    await pool.query('ALTER TABLE tsk_ha_provisioning DROP COLUMN drift2');
+    assert.equal((await ctl.provision('tsk:drift/v1', 'g-drift')).state, 'provisioned'); // clean again -> succeeds
   });
 
   // ── control-clock fence-advance with REAL Redis (null/W0 allowed end-to-end) ─

@@ -106,13 +106,14 @@ jobs:
         env:
           TSK_TEST_POSTGRES_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
           TSK_TEST_POSTGRES_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5433/tsk_test
-      # PR2a HA fencing FOUNDATION drill (#10): control-DB schema attestation, signed
-      # per-step provisioning saga, signed epoch witness, monotonic command-bound lease,
-      # replay-over-head / tamper / rotation defenses, control-clock fence-advance with a
-      # signed evidence payload + freeze-under-PREPARING + idempotent retry, Redis-loss
-      # quarantine, and a BARRIER-controlled concurrent-intent race. Runs against the THIRD
-      # independent control PG16 (5434). THROWS if TSK_TEST_CONTROL_PG_URL is unset (no
-      # silent skip). Bounded/mechanism-only: an in-process fencing store, NOT real Redis;
+      # PR2a HA fencing FOUNDATION drill (#10): pinned full-catalog schema attestation
+      # (+ live per-tx re-attestation), signed per-step provisioning saga, signed epoch
+      # witness, monotonic command-bound lease, replay-over-head / tamper / rotation
+      # defenses, control-clock fence-advance with a signed evidence payload + freeze-
+      # under-PREPARING + idempotent retry, and a BARRIER-controlled concurrent-intent
+      # race. Runs against the THIRD independent control PG16 instance (5434) + the REAL
+      # Redis service (production RedisFencingStore). THROWS if either URL is unset (no
+      # silent skip). Bounded/mechanism-only (single Redis, not a fault-tolerant topology);
       # does NOT close #10.
       - run: npm run test:ha-fencing
         env:
