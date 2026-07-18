@@ -23,7 +23,7 @@ import {
 
 const A_URL = process.env['TSK_TEST_SOURCE_PG_URL_A'] ?? process.env['TSK_TEST_POSTGRES_URL'];
 const C_URL = process.env['TSK_TEST_CONTROL_PG_URL'];
-const R_URL = process.env['TSK_TEST_REDIS_URL'] ?? process.env['TSK_REDIS_URL'];
+const R_URL: string = process.env['TSK_TEST_REDIS_URL'] ?? process.env['TSK_REDIS_URL'] ?? '';
 if (!A_URL || !C_URL || !R_URL) throw new Error('TSK_TEST_SOURCE_PG_URL_A + TSK_TEST_CONTROL_PG_URL + TSK_TEST_REDIS_URL are required');
 
 const GUARD_KEY = 'guard-1'; const guardSecret = Buffer.alloc(32, 0x2b);
