@@ -1,7 +1,7 @@
 {
   "name": "@tsk/server",
   "version": "0.1.0",
-  "description": "TSK Protocol server \u2014 provisioning, validation middleware, stores",
+  "description": "TSK Protocol server — provisioning, validation middleware, stores",
   "type": "module",
   "engines": {
     "node": ">=24 <25"
@@ -21,6 +21,7 @@
     "build": "tsc -p tsconfig.json",
     "prepack": "npm run build --prefix ../..",
     "test:ha-contract": "vitest run tests/ha-outbox-contract.test.ts",
+    "test:hotp-outbox": "vitest run tests/tsk-hotp-outbox-pg.test.ts",
     "typecheck:contract": "tsc --noEmit -p tsconfig.contract-typecheck.json"
   },
   "dependencies": {
@@ -29,6 +30,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
+    "pg": "^8.22.0",
     "typescript": "^5.4.0",
     "vitest": "^4.1.10"
   }

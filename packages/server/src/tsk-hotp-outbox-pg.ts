@@ -294,7 +294,7 @@ CREATE TABLE IF NOT EXISTS tsk_outbox_applied (
   PRIMARY KEY (stream_id, source_epoch, sequence)
 );
 -- Per-tumbler HOTP high-water mark: the receiver consumes a counter EXACTLY ONCE
--- by advancing this monotonically; a counter <= last_counter is a replay.
+-- by advancing this monotonically. A counter at or below last_counter is a replay.
 CREATE TABLE IF NOT EXISTS tsk_hotp_consumed (
   stream_id     text NOT NULL CHECK (length(stream_id) BETWEEN 1 AND 512),
   tumbler_id    text NOT NULL CHECK (length(tumbler_id) BETWEEN 1 AND 512),
@@ -312,7 +312,7 @@ const TSK_OUTBOX_TABLES = [
 
 /** Pinned catalog manifest — recompute via schemaManifest() on a PG-major bump.
  *  (Placeholder; the real-PG manifest-pin test asserts and reports the value.) */
-export const TSK_OUTBOX_SCHEMA_MANIFEST = '__TSK_MANIFEST_PLACEHOLDER__';
+export const TSK_OUTBOX_SCHEMA_MANIFEST = 'cacfbe6d29dee67c87df244d3041df72096e2d069427911df62dc3b5572b50b6';
 
 export async function schemaManifest(exec: PgExecutor): Promise<string> {
   const tables = TSK_OUTBOX_TABLES as unknown as string[];

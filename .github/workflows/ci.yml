@@ -20,6 +20,19 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: tsk_test
+          POSTGRES_USER: tsk_test
+          POSTGRES_PASSWORD: tsk-test-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tsk_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -33,10 +46,17 @@ jobs:
       # HA outbox contract vitest (declared local dependency, not an npx fetch).
       - run: npm run typecheck:contract -w packages/server
       - run: npm run test:ha-contract -w packages/server
+      # TSK durable HOTP-outbox (#10): hermetic logic + real-PG adversarial evidence.
+      - run: npm run test:hotp-outbox -w packages/server
       - run: npm run test:ha
       - run: npm run test:redis
         env:
           TSK_REDIS_URL: redis://127.0.0.1:6379
+      # real-PG adversarial evidence; the .mts THROWS if TSK_TEST_POSTGRES_URL is
+      # unset, so this step FAILS rather than silently skipping.
+      - run: npm run test:postgres:ha
+        env:
+          TSK_TEST_POSTGRES_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
       - run: npm run test:pack
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
