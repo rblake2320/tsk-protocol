@@ -142,6 +142,10 @@ jobs:
         env:
           TSK_TEST_SOURCE_PG_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
           TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
+      # (PR2b-1) complete canonical 1..N export + ONE replay authority + dual independent signatures.
+      - run: npm run test:source-export
+        env:
+          TSK_TEST_SOURCE_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
       - run: npm run test:pack
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
