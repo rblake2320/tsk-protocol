@@ -45,6 +45,14 @@ class FakeClient implements NodePostgresClient {
     this.releasedWith = destroy;
     if (this.script.release === 'throw') throw new Error('release failed');
   }
+  errorListeners: Array<(e: unknown) => void> = [];
+  on(event: 'error', listener: (e: unknown) => void): void { if (event === 'error') this.errorListeners.push(listener); }
+  removeListener(event: 'error', listener: (e: unknown) => void): void {
+    if (event !== 'error') return;
+    const i = this.errorListeners.indexOf(listener);
+    if (i >= 0) this.errorListeners.splice(i, 1);
+  }
+  emitError(e: unknown): void { for (const l of [...this.errorListeners]) l(e); }
 }
 class FakePool implements NodePostgresPool {
   connects = 0;
@@ -210,6 +218,18 @@ describe('NodePostgresTransactor', () => {
     const err = await tx.transaction(async () => { throw new Error('callback boom'); }).catch((e) => e);
     expect(observed).toBe(true);
     expect(err).toBeInstanceOf(ConnectionDisposalError); // outcome unchanged by telemetry failure
+  });
+
+  it('owns the checked-out client error event for the tx lifetime and swallows a mid-tx connection error', async () => {
+    const client = new FakeClient();
+    const tx = new NodePostgresTransactor(poolOf(client));
+    let duringCount = 0;
+    await tx.transaction(async () => {
+      duringCount = client.errorListeners.length;
+      client.emitError(new Error('mid-tx socket blip')); // must NOT throw / crash — the listener swallows it
+    });
+    expect(duringCount).toBe(1);                    // attached while checked out
+    expect(client.errorListeners).toHaveLength(0);  // released afterward (no listener leak)
   });
 
   it('exports the public outcome errors and the transactor from the module', () => {

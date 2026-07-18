@@ -36,6 +36,14 @@ export interface NodePostgresClient {
   query(sql: string, params?: unknown[]): Promise<NodePostgresResult>;
   /** Return to the pool; `destroy` (true or an Error) permanently discards it. */
   release(destroy?: boolean | Error): void;
+  /** Optional EventEmitter surface (a real `pg` client has it). While a client is
+   *  checked out, `pg` removes its OWN 'error' listener and makes the borrower
+   *  responsible — an unlistened mid-transaction connection death would otherwise
+   *  crash the process. When present, the transactor attaches an 'error' listener
+   *  for the checked-out lifetime; the real failure still surfaces through the
+   *  in-flight query rejection, so this listener only prevents the unhandled crash. */
+  on?(event: 'error', listener: (err: unknown) => void): void;
+  removeListener?(event: 'error', listener: (err: unknown) => void): void;
 }
 
 export interface NodePostgresPool {
@@ -234,6 +242,7 @@ export class NodePostgresTransactor implements PgTransactor {
       return await Promise.race([pending, gate]);
     } catch (error) {
       pending.then((late) => {
+        late.on?.('error', () => {}); // a late connection we are about to discard must not crash on error
         try { late.release(true); } catch (releaseError) { this.reportDisposalError(releaseError, 'late-acquire'); }
       }).catch(() => {});
       throw error;
@@ -270,6 +279,11 @@ export class NodePostgresTransactor implements PgTransactor {
     };
     const onAbort = () => destroy();
     signal.addEventListener('abort', onAbort, { once: true });
+    // Own the checked-out client's 'error' event so a mid-transaction connection
+    // death (real network partition) cannot escape as an unhandled 'error'. The
+    // authoritative failure still arrives via the in-flight query rejection below.
+    const onClientError = () => { /* swallow — the query rejection carries the real error */ };
+    client.on?.('error', onClientError);
 
     const query = (sql: string, params?: unknown[]) => {
       if (signal.aborted) return Promise.reject(abortError(signal));
@@ -336,6 +350,7 @@ export class NodePostgresTransactor implements PgTransactor {
     } finally {
       signal.removeEventListener('abort', onAbort);
       if (releaseState === 'open') destroy();
+      client.removeListener?.('error', onClientError);
     }
   }
 }

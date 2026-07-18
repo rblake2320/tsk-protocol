@@ -19,6 +19,7 @@ import {
   streamHeadDigest,
   TSK_OUTBOX_PG_SCHEMA,
   TSK_OUTBOX_SCHEMA_MANIFEST,
+  NodePostgresTransactor,
   PgTskDurableOutbox,
   PgTskPublisher,
   PgTskReceiverCheckpoint,
@@ -51,40 +52,26 @@ const pool = new Pool({ connectionString: URL, max: 16 });
 const SCHEMA = 'public';
 let READY: SchemaReadyToken;
 
-/** Contract-conforming transactor: statement_timeout, COMMIT command-tag verify,
- *  signal honor (destroy on abort), discard on error, serialization retry. */
-class RealPg implements PgTransactor {
-  constructor(private readonly level: 'SERIALIZABLE' | 'READ COMMITTED' = 'SERIALIZABLE', private readonly crash?: () => boolean) {}
-  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T> {
-    const signal = opts?.signal;
-    for (let attempt = 0; ; attempt++) {
-      const client = await pool.connect();
-      let released = false; let errored = false;
-      const discard = () => { if (!released) { released = true; try { client.release(new Error('discard')); } catch { /* gone */ } } };
-      if (signal) { if (signal.aborted) discard(); else signal.addEventListener('abort', discard, { once: true }); }
-      try {
-        await client.query(`BEGIN ISOLATION LEVEL ${this.level}`);
-        await client.query("SET LOCAL statement_timeout = '30000'");
-        const exec: PgExecutor = { query: async (sql, params) => { const r = await client.query(sql, params as unknown[]); return { rows: r.rows, rowCount: r.rowCount ?? 0 }; } };
-        const result = await fn(exec);
-        if (this.crash && this.crash()) { errored = true; throw new Error('SIMULATED CRASH before commit'); }
-        const c = await client.query('COMMIT');
-        if ((c as { command?: string }).command !== 'COMMIT') { errored = true; throw new Error(`COMMIT did not commit -> ${(c as { command?: string }).command}`); }
-        return result;
-      } catch (e) {
-        errored = true;
-        await Promise.race([client.query('ROLLBACK').catch(() => {}), new Promise((r) => setTimeout(r, 1000))]);
-        const code = (e as { code?: string }).code;
-        if ((code === '40001' || code === '40P01') && attempt < 50) { discard(); continue; }
-        throw e;
-      } finally {
-        if (signal) signal.removeEventListener('abort', discard);
-        if (errored) discard(); else if (!released) { released = true; client.release(); }
-      }
-    }
-  }
-}
-const serial = new RealPg('SERIALIZABLE');
+// PRODUCTION transactor under test: the shipped NodePostgresTransactor over a real
+// pg.Pool. Bounded serialization retries are ENABLED here because the TSK outbox
+// callbacks are replay-safe (redelivery is duplicate-ok; HOTP consumed exactly once
+// — proven by the lost-ACK and single-active-lease checks below).
+const serial = new NodePostgresTransactor(pool as unknown as ConstructorParameters<typeof NodePostgresTransactor>[0], { maxSerializationRetries: 50, retryBaseDelayMs: 5 });
+
+// Test-only isolation-gate probe: a minimal READ COMMITTED transactor used ONLY to
+// prove the consumer's SERIALIZABLE assertion fails closed. NOT a production path.
+const readCommittedProbe: PgTransactor = {
+  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      const exec: PgExecutor = { query: async (sql, params) => { const r = await client.query(sql, params as unknown[]); return { rows: r.rows, rowCount: r.rowCount ?? 0 }; } };
+      const result = await fn(exec);
+      await client.query('COMMIT');
+      return result;
+    } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
+  },
+};
 
 // ── crypto: real ed25519 signer + verifier ──
 const { publicKey, privateKey } = generateKeyPairSync('ed25519');
@@ -146,7 +133,7 @@ async function main() {
   });
 
   await check('READ COMMITTED transactor cannot obtain readiness (SERIALIZABLE enforced)', async () => {
-    await assert.rejects(() => assertSchemaReady(new RealPg('READ COMMITTED'), SCHEMA), /SERIALIZABLE/);
+    await assert.rejects(() => assertSchemaReady(readCommittedProbe, SCHEMA), /SERIALIZABLE/);
   });
 
   await check('end-to-end: append N -> publish -> receiver applies strictly 1..N; HOTP consumed once', async () => {
@@ -167,12 +154,13 @@ async function main() {
 
   await check('crash-atomicity: an append that crashes before commit rolls back (no row, no seq advance)', async () => {
     const sid = 'tsk:crash/v1'; await provision(sid);
-    const st = { armed: false };
-    const crashDb = new RealPg('SERIALIZABLE', () => { const c = st.armed; st.armed = false; return c; });
-    const readyCrash = await assertSchemaReady(crashDb, SCHEMA); // not armed yet -> succeeds
-    const ob = mkOutbox(crashDb, sid, readyCrash);
-    st.armed = true; // arm the crash only for the append's commit
-    await assert.rejects(() => ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 1 }, fenceToken: 0n })), /CRASH/);
+    const ob = mkOutbox(serial, sid);
+    // A crash before COMMIT = the callback throws after its writes; the production
+    // transactor must ROLLBACK + destroy, leaving no row and no source-seq advance.
+    await assert.rejects(() => ob.withOutboxTx(async (tx) => {
+      await ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 1 }, fenceToken: 0n });
+      throw new Error('SIMULATED CRASH before commit');
+    }), /CRASH/);
     assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM tsk_outbox_rows WHERE stream_id=$1', [sid])).rows[0].n), 0);
     assert.equal(Number((await pool.query('SELECT sequence FROM tsk_outbox_source_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 0);
   });
@@ -250,7 +238,7 @@ async function main() {
     await pool.query('DROP INDEX tsk_outbox_rows_deliverable');
     await assert.rejects(() => serial.transaction((e) => attestSchema(e)), /attestation failed/);
     await resetSchema();
-    const other = new RealPg('SERIALIZABLE');
+    const other = new NodePostgresTransactor(pool as unknown as ConstructorParameters<typeof NodePostgresTransactor>[0]); // a DISTINCT transactor instance
     assert.throws(() => new PgTskDurableOutbox(other, READY, { streamId: 's/v1', sanitizer, signer, maxPendingRows: 1, backpressure: 'quarantine' }), /different PgTransactor/);
     assert.throws(() => new PgTskDurableOutbox(serial, {} as SchemaReadyToken, { streamId: 's/v1', sanitizer, signer, maxPendingRows: 1, backpressure: 'quarantine' }), /forged or foreign/);
   });

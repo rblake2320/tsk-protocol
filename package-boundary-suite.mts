@@ -75,6 +75,18 @@ for (const workspace of workspaces) {
         && !/export\s*\{[^}]*(?:[Mm]intReady|__internalUnsafe)[^}]*\}/.test(outbox),
       '@tsk/server dist exports a readiness-token mint helper (deep-import bypass)',
     );
+    // (#10 production transactor) `pg` MUST stay OUT of the runtime dependency
+    // closure: the NodePostgresTransactor depends only on the structural
+    // NodePostgres* interfaces, so a real pg.Pool is injected by the app, never
+    // pulled in by @tsk/server itself.
+    assert(
+      !Object.keys(manifest.dependencies ?? {}).includes('pg') && !Object.keys(manifest.dependencies ?? {}).includes('@types/pg'),
+      '@tsk/server must not depend on `pg` at runtime (structural injection only)',
+    );
+    // and the production transactor + its outcome taxonomy MUST be exported.
+    for (const sym of ['NodePostgresTransactor', 'AmbiguousCommitError', 'PostCommitReleaseError', 'ConnectionDisposalError']) {
+      assert(typeof (exports as Record<string, unknown>)[sym] === 'function', `@tsk/server must export ${sym}`);
+    }
   }
   passed++;
   console.log(`  PASS ${manifest.name} entry points exist and import (no mint/unsafe export)`);
