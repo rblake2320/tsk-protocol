@@ -10,7 +10,8 @@ import assert from 'node:assert/strict';
 import pg from 'pg';
 import {
   HA_CONTROL_PG_SCHEMA, HA_CONTROL_TABLES, HaControlFencing, GuardSigner,
-  NodePostgresTransactor, type GuardKeyResolver,
+  NodePostgresTransactor, MemoryFencingStore, FenceAuthorityQuarantineError,
+  type GuardKeyResolver, type FenceProof,
 } from './packages/server/dist/index.js';
 
 const URL = process.env['TSK_TEST_CONTROL_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -69,6 +70,51 @@ async function main() {
     await assert.rejects(() => ctl.lease(SID), /guard signature/);
     // restore a valid head so cleanup is clean
     await pool.query('DELETE FROM tsk_ha_lease_head WHERE stream_id=$1', [SID]);
+  });
+
+  // ── M2: fence-advance saga (Redis coordinator via MemoryFencingStore; real Redis next milestone) ──
+  const SID2 = 'tsk:pair:pr2a-advance/v1';
+  await pool.query('DELETE FROM tsk_ha_cutover_history WHERE stream_id=$1', [SID2]);
+
+  await check('fence-advance: provision -> grant -> intent -> revoke+expiry -> advanceEpoch bumps witness 0->1 and Redis-claims', async () => {
+    await ctl.provision(SID2, 'genesis-2');
+    const store = new MemoryFencingStore();
+    await store.claim({ nodeId: 'A', fenceEpoch: 0, expiresAt: Date.now() + 60_000, commandId: 'genesis' }); // epoch-0 genesis claim
+    const now = Date.now();
+    await ctl.writeLease({ streamId: SID2, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: now + 60_000 });
+    await ctl.beginPromotionIntent(SID2, 'c1', 1);
+    const proof: FenceProof = { controlNowMs: now + 61_000, safetyMarginMs: 0, claimExpiresAtMs: now + 120_000 };
+    // A not proven fenced yet (lease still active) -> quarantine
+    await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, proof), FenceAuthorityQuarantineError);
+    await ctl.writeLease({ streamId: SID2, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: now + 60_000 });
+    // revoked but not past expiry -> still quarantine
+    await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, { ...proof, controlNowMs: now }), FenceAuthorityQuarantineError);
+    // revoked AND past expiry+margin -> advance
+    const res = await ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, proof);
+    assert.equal(res.epoch, 1); assert.equal(res.fenceToken, '1');
+    assert.equal((await ctl.witness(SID2))?.epoch, 1, 'witness advanced 0->1');
+    assert.equal((await store.current())?.fenceEpoch, 1, 'Redis claimed epoch 1');
+  });
+
+  await check('Redis-loss quarantine: an absent Redis authority after provisioning fails closed', async () => {
+    const SID3 = 'tsk:pair:pr2a-redisloss/v1';
+    await ctl.provision(SID3, 'genesis-3');       // witness provisioned at epoch 0
+    await ctl.beginPromotionIntent(SID3, 'cr', 1);
+    const empty = new MemoryFencingStore();       // current() === null => Redis lost after provisioning
+    const now = Date.now();
+    await assert.rejects(
+      () => ctl.advanceEpoch(SID3, 'cr', 1, 'B', empty, { controlNowMs: now, safetyMarginMs: 0, claimExpiresAtMs: now + 60_000 }),
+      /Redis fence authority is absent/,
+    );
+  });
+
+  await check('one active intent per stream: a different commandId is denied while an intent is in-flight (same is idempotent)', async () => {
+    const SID4 = 'tsk:pair:pr2a-intent/v1';
+    await ctl.provision(SID4, 'genesis-4');
+    await ctl.beginPromotionIntent(SID4, 'c1', 1); // PREPARING (in-flight, not terminal)
+    await assert.rejects(() => ctl.beginPromotionIntent(SID4, 'c2', 1), /in-flight intent/);
+    const same = await ctl.beginPromotionIntent(SID4, 'c1', 1);
+    assert.equal(same.phase, 'PREPARING');
   });
 
   console.log(`\n# ${passed} PR2a fencing-foundation checks passed`);

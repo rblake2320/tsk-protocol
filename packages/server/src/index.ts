@@ -69,12 +69,16 @@ export {
   HaControlFencing,
   GuardSigner,
   verifyGuard,
+  fenceTokenForEpoch,
+  FenceAuthorityQuarantineError,
 } from './ha-control-fencing.js';
 export type {
   GuardKeyResolver,
   ProvisioningState,
   LeaseState,
   WitnessState,
+  CutoverState,
+  FenceProof,
 } from './ha-control-fencing.js';
 export type {
   ReplayNonceStore,
