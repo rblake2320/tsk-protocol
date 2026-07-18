@@ -114,6 +114,7 @@ async function expectPreflightDenial(
       tskStore: override?.tskStore ?? f.store,
       tskConfig: override?.tskConfig,
       bpcSnapshotMaxAgeMs: override?.bpcSnapshotMaxAgeMs,
+      now: override?.now,
       identityBinding: override?.identityBinding ?? f.identityBinding,
     },
   );
@@ -224,38 +225,37 @@ test('rejects disagreement between result and snapshot pair IDs', async () => {
   );
 });
 
-test('rejects stale authorization snapshots before TSK', async () => {
-  await expectPreflightDenial(
-    'BPC: INVALID_AUTH_SNAPSHOT',
-    f => async () => ({
-      ok: true,
-      pairId: f.pairId,
-      snapshot: Object.freeze({
-        pairId: f.pairId,
-        scope: 'read',
-        mode: 'production',
-        kind: 'legitimate',
-        verifiedAt: Date.now() - 60_001,
-      }),
-    }),
-  );
+// Deterministic snapshot age/skew boundary tests under a FIXED injected clock. The old
+// tests used Date.now() for BOTH the snapshot and the (later) internal Date.now(), so a
+// few ms of elapsed time shrank a +60_001 future skew back inside the 60_000 window and
+// the future test flaked. A fixed clock removes the race and lets us test exact edges.
+const AGE_CLOCK = 1_700_000_000_000; // fixed reference "now"
+const MAX_AGE = 60_000;
+const snapshotAt = (f: Fixture, verifiedAt: number) => async () => ({
+  ok: true,
+  pairId: f.pairId,
+  snapshot: Object.freeze({ pairId: f.pairId, scope: 'read', mode: 'production', kind: 'legitimate', verifiedAt }),
+});
+const fixedNow = () => ({ now: () => AGE_CLOCK });
+
+test('rejects a snapshot 1ms past the max age (stale edge, fixed clock)', async () => {
+  await expectPreflightDenial('BPC: INVALID_AUTH_SNAPSHOT', f => snapshotAt(f, AGE_CLOCK - MAX_AGE - 1), undefined, fixedNow);
 });
 
-test('rejects future-dated authorization snapshots before TSK', async () => {
-  await expectPreflightDenial(
-    'BPC: INVALID_AUTH_SNAPSHOT',
-    f => async () => ({
-      ok: true,
-      pairId: f.pairId,
-      snapshot: Object.freeze({
-        pairId: f.pairId,
-        scope: 'read',
-        mode: 'production',
-        kind: 'legitimate',
-        verifiedAt: Date.now() + 60_001,
-      }),
-    }),
-  );
+test('rejects a future-dated snapshot 1ms past the max skew (future edge, fixed clock)', async () => {
+  await expectPreflightDenial('BPC: INVALID_AUTH_SNAPSHOT', f => snapshotAt(f, AGE_CLOCK + MAX_AGE + 1), undefined, fixedNow);
+});
+
+test('accepts a snapshot exactly at the max age/skew edges (fixed clock)', async () => {
+  for (const verifiedAt of [AGE_CLOCK - MAX_AGE, AGE_CLOCK + MAX_AGE]) {
+    const f = await fixture();
+    const result = await verifyUltraRequest(
+      f.request,
+      snapshotAt(f, verifiedAt) as never,
+      { tskStore: f.store, now: () => AGE_CLOCK, identityBinding: f.identityBinding },
+    );
+    expect(result.ok, `expected acceptance at edge verifiedAt=${verifiedAt}, got ${result.ok ? 'ok' : result.error}`);
+  }
 });
 
 test('rejects an unsafe snapshot-age configuration', async () => {
