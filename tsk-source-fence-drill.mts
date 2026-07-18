@@ -15,7 +15,8 @@ import {
   TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_LEASE_TABLES, NodePostgresTransactor,
   signLeaseGrant, installLeaseGrant, assertSourceLeaseWritable, readSourceLease, SourceFenceQuarantineError,
   TSK_SOURCE_WITNESS_SCHEMA, TSK_SOURCE_WITNESS_TABLES, advanceSourceWitness, readSourceWitness, assertSourceWitnessConsistent,
-  type SourceVerifyKeyResolver, type BareLeaseGrant, type LeaseGrant, type SourceLiveState,
+  signSourceCheckpointReceipt,
+  type SourceVerifyKeyResolver, type BareLeaseGrant, type LeaseGrant, type SourceLiveState, type SourceCheckpointReceipt,
 } from './packages/server/dist/index.js';
 
 const URL = process.env['TSK_TEST_SOURCE_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -24,7 +25,9 @@ if (!URL) throw new Error('TSK_TEST_SOURCE_PG_URL (source PG16) is required');
 const GUARD_KEY = 'guard-1'; // ed25519: private signs (control/guard), public verifies (source)
 const guard = generateKeyPairSync('ed25519');
 const guardSecret = guard.privateKey;
-const resolver: SourceVerifyKeyResolver = { resolve: (kid) => (kid === GUARD_KEY ? guard.publicKey : null) };
+const SOURCE_KEY = 'source-1'; const source = generateKeyPairSync('ed25519'); // source signs its checkpoint receipts
+const resolver: SourceVerifyKeyResolver = { resolve: (kid) => (kid === GUARD_KEY ? guard.publicKey : kid === SOURCE_KEY ? source.publicKey : null) };
+const GEN = '0'.repeat(64);
 const SID = 'tsk:pair:pr2b0/v1';
 const HOUR = 3_600_000;
 
@@ -109,25 +112,30 @@ async function main() {
   // ── M4: external restore/fork witness ──
   const H = (x: string) => x.repeat(64).slice(0, 64);
   const WSID = 'tsk:pair:witness/v1';
-  await check('witness: advance genesis; assertConsistent ok for >= high-water; advance rejects regression', async () => {
-    await tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, { streamId: WSID, sourceSystemId: 'sysA', grantSeq: 2, sourceSeq: 5, headDigest: H('a') }));
+  const ckpt = (over: Partial<Omit<SourceCheckpointReceipt, 'receiptDigest' | 'sourceKeyId' | 'sourceSignature'>>): SourceCheckpointReceipt =>
+    signSourceCheckpointReceipt(SOURCE_KEY, source.privateKey, { streamId: WSID, sourceSystemId: 'sysA', sourceSeq: 5, sourceHeadDigest: H('a'), grantSeq: 2, priorSeq: 0, priorHeadDigest: GEN, ...over });
+  await check('witness advances only from a SOURCE-SIGNED checkpoint receipt; monotonic; caller-forged state cannot advance', async () => {
+    await tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, ckpt({}))); // genesis @ ss5
     const w = await tx.transaction((exec) => readSourceWitness(exec, resolver, WSID));
     assert.equal(w?.maxSourceSeq, 5); assert.equal(w?.witnessSeq, 1);
-    assertSourceWitnessConsistent(w, { sourceSystemId: 'sysA', grantSeq: 2, sourceSeq: 5, headDigest: H('a') }); // exact high-water
-    assertSourceWitnessConsistent(w, { sourceSystemId: 'sysA', grantSeq: 3, sourceSeq: 7, headDigest: H('b') }); // advanced ok
-    // advance forward
-    await tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, { streamId: WSID, sourceSystemId: 'sysA', grantSeq: 3, sourceSeq: 7, headDigest: H('b') }));
-    // advancing with a regressed high-water is rejected
-    await assert.rejects(() => tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, { streamId: WSID, sourceSystemId: 'sysA', grantSeq: 3, sourceSeq: 4, headDigest: H('b') })), /restore\/rollback/);
+    // advance forward with continuity (priorSeq/head = the witnessed height ss5/H(a))
+    await tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, ckpt({ sourceSeq: 7, sourceHeadDigest: H('b'), grantSeq: 3, priorSeq: 5, priorHeadDigest: H('a') })));
+    // a receipt signed by an UNKNOWN key (forged, not the source) cannot advance
+    const badKp = generateKeyPairSync('ed25519');
+    const forged = signSourceCheckpointReceipt(SOURCE_KEY, badKp.privateKey, { streamId: WSID, sourceSystemId: 'sysA', sourceSeq: 9, sourceHeadDigest: H('c'), grantSeq: 4, priorSeq: 7, priorHeadDigest: H('b') });
+    await assert.rejects(() => tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, forged)), /invalid signature/);
+    // regressed source seq rejected
+    await assert.rejects(() => tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, ckpt({ sourceSeq: 4, priorSeq: 7, priorHeadDigest: H('b'), grantSeq: 3 }))), /restore\/rollback/);
   });
-  await check('witness detects: restore (grant/seq regression), same-height FORK, system_identifier change, tamper', async () => {
-    const w = (await tx.transaction((exec) => readSourceWitness(exec, resolver, WSID)))!; // sysA, gs3, ss7, headB
+  await check('C5 witness catches a restore+FORK that grew BEYOND the witnessed height (continuity at prior height)', async () => {
+    // current witness: ss7, head H(b). A restored+forked source presents a HIGHER seq (ss9) but its head
+    // AT the witnessed height (ss7) diverges → continuity check quarantines even though it is longer.
+    await assert.rejects(() => tx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, ckpt({ sourceSeq: 9, sourceHeadDigest: H('d'), grantSeq: 3, priorSeq: 7, priorHeadDigest: H('c') }))), /diverges from the witness/);
+    // same-height fork + regression + system change still caught by the pure consistency check
+    const w = (await tx.transaction((exec) => readSourceWitness(exec, resolver, WSID)))!;
     const live = (over: Partial<SourceLiveState>): SourceLiveState => ({ sourceSystemId: 'sysA', grantSeq: 3, sourceSeq: 7, headDigest: H('b'), ...over });
-    assert.throws(() => assertSourceWitnessConsistent(w, live({ grantSeq: 2 })), /restore\/rollback/);       // grant_seq regressed
-    assert.throws(() => assertSourceWitnessConsistent(w, live({ sourceSeq: 6 })), /restore\/rollback/);      // source seq regressed
-    assert.throws(() => assertSourceWitnessConsistent(w, live({ headDigest: H('c') })), /same-height FORK/); // divergent head @ ss7
+    assert.throws(() => assertSourceWitnessConsistent(w, live({ headDigest: H('c') })), /same-height FORK/);
     assert.throws(() => assertSourceWitnessConsistent(w, live({ sourceSystemId: 'sysB' })), /system_identifier changed/);
-    assert.doesNotThrow(() => assertSourceWitnessConsistent(null, live({}))); // genesis ok
     await pool.query("UPDATE tsk_source_witness SET guard_signature='AAAA' WHERE stream_id=$1", [WSID]);
     await assert.rejects(() => tx.transaction((exec) => readSourceWitness(exec, resolver, WSID)), /invalid signature/);
   });

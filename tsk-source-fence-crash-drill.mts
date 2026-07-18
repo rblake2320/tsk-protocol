@@ -17,7 +17,7 @@ import {
   TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_WITNESS_SCHEMA, TSK_SOURCE_WITNESS_TABLES,
   provisionSchemaVersion, PgTskDurableOutbox, NodePostgresTransactor, RedisFencingStore, ContractValidationError,
   signLeaseGrant, installLeaseGrant, readSourceLease, emitSourceFrozenReceipt, verifySourceFrozenReceipt,
-  advanceSourceWitness, readSourceWitness, SourceFenceQuarantineError,
+  advanceSourceWitness, readSourceWitness, signSourceCheckpointReceipt, SourceFenceQuarantineError,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation, type TskHotpMutation, type SourceVerifyKeyResolver,
 } from './packages/server/dist/index.js';
 
@@ -103,10 +103,11 @@ async function main() {
 
   await check('CRASH witness advance: mid-tx crash rolls back (witness unchanged); retry advances; re-advance same high-water is idempotent', async () => {
     const sid = 'tsk:crash:witness/v1';
-    await assert.rejects(() => cTx.transaction(async (exec) => { await advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, { streamId: sid, sourceSystemId: 'sysA', grantSeq: 1, sourceSeq: 3, headDigest: 'a'.repeat(64) }); throw new Crash('mid-advance'); }), Crash);
+    const cr = signSourceCheckpointReceipt(SOURCE_KEY, source.privateKey, { streamId: sid, sourceSystemId: 'sysA', sourceSeq: 3, sourceHeadDigest: 'a'.repeat(64), grantSeq: 1, priorSeq: 0, priorHeadDigest: '0'.repeat(64) });
+    await assert.rejects(() => cTx.transaction(async (exec) => { await advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, cr); throw new Crash('mid-advance'); }), Crash);
     assert.equal(await cTx.transaction((exec) => readSourceWitness(exec, resolver, sid)), null, 'no partial witness after crash');
-    await cTx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, { streamId: sid, sourceSystemId: 'sysA', grantSeq: 1, sourceSeq: 3, headDigest: 'a'.repeat(64) })); // resume
-    await cTx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, { streamId: sid, sourceSystemId: 'sysA', grantSeq: 1, sourceSeq: 3, headDigest: 'a'.repeat(64) })); // idempotent re-advance
+    await cTx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, cr)); // resume
+    await cTx.transaction((exec) => advanceSourceWitness(exec, resolver, GUARD_KEY, guardSecret, cr)); // idempotent re-advance
     const w = await cTx.transaction((exec) => readSourceWitness(exec, resolver, sid));
     assert.equal(w?.witnessSeq, 1, 'no duplicate witness seq on idempotent re-advance');
   });

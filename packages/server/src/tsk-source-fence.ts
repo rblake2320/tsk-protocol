@@ -422,6 +422,35 @@ export const TSK_SOURCE_WITNESS_TABLES = ['tsk_source_witness', 'tsk_source_witn
 export interface SourceLiveState { sourceSystemId: string; grantSeq: number; sourceSeq: number; headDigest: string; }
 export interface WitnessState { streamId: string; sourceSystemId: string; maxGrantSeq: number; maxSourceSeq: number; headDigest: string; witnessSeq: number; witnessDigest: string; }
 
+/** (C5) A SOURCE-SIGNED checkpoint attestation the witness advance verifies (never caller-supplied
+ *  state): the source's current `(sourceSeq, sourceHeadDigest, grantSeq, system_id)` PLUS a
+ *  continuity anchor — the source's head AT a prior seq (`priorSeq`/`priorHeadDigest`), which the
+ *  witness pins to its own last-witnessed height so a restore+fork that grew BEYOND that height is
+ *  caught (the source's head at the witnessed height would diverge). */
+export interface SourceCheckpointReceipt {
+  streamId: string; sourceSystemId: string; sourceSeq: number; sourceHeadDigest: string; grantSeq: number;
+  priorSeq: number; priorHeadDigest: string; receiptDigest: string; sourceKeyId: string; sourceSignature: string;
+}
+type BareCheckpointReceipt = Omit<SourceCheckpointReceipt, 'receiptDigest' | 'sourceKeyId' | 'sourceSignature'>;
+function checkpointReceiptMsg(b: BareCheckpointReceipt, digest: string): Buffer {
+  return frame('tsk_source_checkpoint/v1', b.streamId, b.sourceSystemId, b.sourceSeq, b.sourceHeadDigest, b.grantSeq, b.priorSeq, b.priorHeadDigest, digest);
+}
+/** SOURCE issuer: sign a checkpoint receipt over the exact canonical tuple (source custody). */
+export function signSourceCheckpointReceipt(sourceKeyId: string, sourcePrivateKey: KeyObject | string, b: BareCheckpointReceipt): SourceCheckpointReceipt {
+  vId(b.streamId, STREAM_ID_RE, 'streamId'); vId(b.sourceSystemId, ID_RE, 'sourceSystemId');
+  vInt(b.sourceSeq, 'sourceSeq', 0, MAX_SEQ); vInt(b.grantSeq, 'grantSeq', 0, MAX_SEQ); vInt(b.priorSeq, 'priorSeq', 0, MAX_SEQ);
+  vHeadDigest(b.sourceHeadDigest, 'sourceHeadDigest'); vHeadDigest(b.priorHeadDigest, 'priorHeadDigest');
+  const receiptDigest = sha256hex(checkpointReceiptMsg(b, ''));
+  const sourceSignature = edSignB64u(sourceKeyId, sourcePrivateKey, checkpointReceiptMsg(b, receiptDigest));
+  return { ...b, receiptDigest, sourceKeyId, sourceSignature };
+}
+/** Verify a checkpoint receipt's digest + source signature (resolver holds the source PUBLIC key). */
+export function verifySourceCheckpointReceipt(resolver: SourceVerifyKeyResolver, r: SourceCheckpointReceipt): void {
+  const bare: BareCheckpointReceipt = { streamId: r.streamId, sourceSystemId: r.sourceSystemId, sourceSeq: r.sourceSeq, sourceHeadDigest: r.sourceHeadDigest, grantSeq: r.grantSeq, priorSeq: r.priorSeq, priorHeadDigest: r.priorHeadDigest };
+  if (sha256hex(checkpointReceiptMsg(bare, '')) !== r.receiptDigest) throw new ContractValidationError('checkpoint receipt digest mismatch');
+  verifySig(resolver, r.sourceKeyId, checkpointReceiptMsg(bare, r.receiptDigest), r.sourceSignature);
+}
+
 const witnessMsg = (s: string, sysId: string, gs: number, ss: number, head: string, wseq: number, prev: string | null, digest: string): Buffer =>
   frame('tsk_source_witness/v1', s, sysId, gs, ss, head, wseq, prev, digest);
 
@@ -457,18 +486,28 @@ export function assertSourceWitnessConsistent(witness: WitnessState | null, live
   }
 }
 
-/** Monotonically advance the external witness (guard-signed forward-CAS). Rejects a regression/fork
- *  (via assertSourceWitnessConsistent against the incoming high-water) before stamping. */
-export async function advanceSourceWitness(exec: PgExecutor, resolver: SourceVerifyKeyResolver, guardKeyId: string, guardPrivateKey: KeyObject | string, entry: SourceLiveState & { streamId: string }): Promise<WitnessState> {
-  const s = vId(entry.streamId, STREAM_ID_RE, 'streamId');
-  const sysId = vId(entry.sourceSystemId, ID_RE, 'sourceSystemId');
-  const gs = vInt(entry.grantSeq, 'grantSeq', 0, MAX_SEQ), ss = vInt(entry.sourceSeq, 'sourceSeq', 0, MAX_SEQ);
-  const head = vHeadDigest(entry.headDigest, 'headDigest');
+/** (C5) Advance the external witness from a SOURCE-SIGNED checkpoint receipt (never caller-supplied
+ *  state). Verifies the source signature; enforces system_id + grant/seq monotonicity; and a
+ *  CONTINUITY proof at the last-witnessed height — the receipt's `priorSeq`/`priorHeadDigest` must
+ *  equal the witness's `(maxSourceSeq, headDigest)`, so a restore+fork that grew BEYOND the witnessed
+ *  height is caught. Then guard-signed forward-CAS. Per-stream advisory-locked. */
+export async function advanceSourceWitness(exec: PgExecutor, resolver: SourceVerifyKeyResolver, guardKeyId: string, guardPrivateKey: KeyObject | string, receipt: SourceCheckpointReceipt): Promise<WitnessState> {
   if (!KEY_ID_RE.test(guardKeyId)) throw new ContractValidationError('invalid guard keyId');
+  verifySourceCheckpointReceipt(resolver, receipt); // SOURCE-signed, not caller-supplied state
+  const s = vId(receipt.streamId, STREAM_ID_RE, 'streamId');
+  const sysId = receipt.sourceSystemId, gs = receipt.grantSeq, ss = receipt.sourceSeq, head = receipt.sourceHeadDigest;
+  await exec.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))', [s]);
   const cur = await readSourceWitness(exec, resolver, s);
   // idempotent re-advance (crash-resume): an identical high-water is a no-op, not a new witness seq.
   if (cur && cur.sourceSystemId === sysId && cur.maxGrantSeq === gs && cur.maxSourceSeq === ss && cur.headDigest === head) return cur;
-  assertSourceWitnessConsistent(cur, { sourceSystemId: sysId, grantSeq: gs, sourceSeq: ss, headDigest: head });
+  if (cur) {
+    if (sysId !== cur.sourceSystemId) throw new SourceFenceQuarantineError(`source system_identifier changed (${sysId} != witnessed ${cur.sourceSystemId}) — restore/clone; quarantine`);
+    if (gs < cur.maxGrantSeq) throw new SourceFenceQuarantineError(`grant_seq ${gs} < witnessed ${cur.maxGrantSeq} — restore/rollback; quarantine`);
+    if (ss < cur.maxSourceSeq) throw new SourceFenceQuarantineError(`source seq ${ss} < witnessed ${cur.maxSourceSeq} — restore/rollback; quarantine`);
+    // (C5) continuity at the witnessed height — catches a restore+fork that grew past it.
+    if (receipt.priorSeq !== cur.maxSourceSeq) throw new SourceFenceQuarantineError(`checkpoint priorSeq ${receipt.priorSeq} != witnessed height ${cur.maxSourceSeq} — quarantine`);
+    if (receipt.priorHeadDigest !== cur.headDigest) throw new SourceFenceQuarantineError('checkpoint head at the witnessed height diverges from the witness — restore/FORK; quarantine');
+  }
   const wseq = (cur?.witnessSeq ?? 0) + 1;
   const prev = cur?.witnessDigest ?? null;
   const digest = sha256hex(witnessMsg(s, sysId, gs, ss, head, wseq, prev, ''));
