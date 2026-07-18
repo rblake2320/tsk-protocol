@@ -418,6 +418,8 @@ export async function advanceSourceWitness(exec: PgExecutor, resolver: GuardKeyR
   const head = vHeadDigest(entry.headDigest, 'headDigest');
   if (!KEY_ID_RE.test(guardKeyId)) throw new ContractValidationError('invalid guard keyId');
   const cur = await readSourceWitness(exec, resolver, s);
+  // idempotent re-advance (crash-resume): an identical high-water is a no-op, not a new witness seq.
+  if (cur && cur.sourceSystemId === sysId && cur.maxGrantSeq === gs && cur.maxSourceSeq === ss && cur.headDigest === head) return cur;
   assertSourceWitnessConsistent(cur, { sourceSystemId: sysId, grantSeq: gs, sourceSeq: ss, headDigest: head });
   const wseq = (cur?.witnessSeq ?? 0) + 1;
   const prev = cur?.witnessDigest ?? null;
