@@ -151,6 +151,16 @@ jobs:
         env:
           TSK_TEST_SOURCE_PG_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
           TSK_TEST_RECEIVER_PG_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
+      # (PR2b-3) control cutover ordering — signed SOURCE_FENCED->FENCED->IMPORTING->READY binding the
+      # frozen receipt + BFinalizedReceipt, with the proven B!=source AND B!=control capability. Three
+      # INDEPENDENT PG16 (A@5432 source, B@5433 receiver, control@5434) + real Redis. THROWS if any URL
+      # is unset (no silent skip). Bounded/mechanism-only; does NOT close #10.
+      - run: npm run test:control-cutover
+        env:
+          TSK_TEST_SOURCE_PG_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+          TSK_TEST_RECEIVER_PG_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5433/tsk_test
+          TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
+          TSK_TEST_REDIS_URL: redis://127.0.0.1:6379
       - run: npm run test:pack
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
