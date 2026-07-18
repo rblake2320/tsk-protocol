@@ -49,7 +49,7 @@ import {
   type TskReceiverCheckpoint,
 } from './ha-outbox-contract.js';
 import { assertSourceLeaseWritable } from './tsk-source-fence.js';
-import type { GuardKeyResolver } from './ha-control-fencing.js';
+import type { SourceVerifyKeyResolver } from './tsk-source-fence.js';
 
 /** Contract HOTP counter bound (mirrors the TSK segment counter ceiling). */
 export const TSK_HOTP_MAX_COUNTER = 2_147_483_647;
@@ -602,7 +602,7 @@ export interface PgTskOutboxOptions {
    *  clock + bounded skew) in the SAME tx, holding the lease row FOR SHARE to commit — so a revoke
    *  UPDATE cannot commit until in-flight appends finish, then new appends fail closed. A fencible
    *  source MUST configure this. */
-  sourceLeaseGate?: { resolver: GuardKeyResolver; controlToASkewBoundMs: number };
+  sourceLeaseGate?: { resolver: SourceVerifyKeyResolver; controlToASkewBoundMs: number };
 }
 
 // ── Source-side durable outbox (append builds + signs the head chain) ────────

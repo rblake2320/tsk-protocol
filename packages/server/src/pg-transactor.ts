@@ -442,32 +442,30 @@ export class NodePostgresTransactor implements PgTransactor {
         },
       };
       const result = await abortRace(fn(exec), signal);
-      // verify the sentinel BEFORE dispatching OUR COMMIT: if the callback slipped a
-      // transaction boundary past the executor guard (e.g. a procedure CALL that
-      // commits), the tx-local nonce is gone. Fail closed rather than commit against a
-      // different (auto)transaction. Runs BEFORE commitDispatched, so a violation is an
-      // ordinary pre-COMMIT failure (rollback + destroy), never ambiguous.
+      // (PR2b-0, C3) caller PRE-COMMIT hook (e.g. the source lease re-check). Runs AFTER the
+      // callback but BEFORE the final continuity + durability authority below, so a hook that
+      // (maliciously or otherwise) flips synchronous_commit / reloads fsync / slips a tx boundary
+      // is STILL caught by the continuity nonce + forced synchronous_commit + assertDurableSettings
+      // that follow — those remain the LAST authority before COMMIT. Runs BEFORE commitDispatched,
+      // so any failure is an ordinary pre-COMMIT rollback + destroy, never ambiguous.
+      if (onBeforeCommit) await abortRace(onBeforeCommit(exec), signal);
+      // verify the sentinel BEFORE dispatching OUR COMMIT: if the callback (or the hook) slipped a
+      // transaction boundary past the executor guard (e.g. a procedure CALL that commits), the
+      // tx-local nonce is gone. Fail closed rather than commit against a different (auto)transaction.
       const continuity = await query(`SELECT pg_catalog.current_setting('${CONTINUITY_GUC}', true) AS n`);
       if (continuity.command !== 'SELECT' || continuity.rows[0]?.n !== nonce) {
         throw new ContractValidationError('transaction continuity violated before COMMIT: the transaction-local scope was lost (a COMMIT/ROLLBACK occurred inside the callback)');
       }
-      // (durability authority) FORCE synchronous_commit tx-locally + read it back
-      // immediately before COMMIT, so nothing the callback did (e.g. a tx-local
-      // set_config('synchronous_commit','off',true)) can lower the durability of THIS
-      // commit — the observed CommandComplete then genuinely reflects the chosen level.
+      // (durability authority — LAST before COMMIT) FORCE synchronous_commit tx-locally + read it
+      // back, so nothing the callback OR the pre-commit hook did (e.g. a tx-local
+      // set_config('synchronous_commit','off',true)) can lower the durability of THIS commit.
       const dur = await query("SELECT pg_catalog.set_config('synchronous_commit', $1, true) AS sc", [this.synchronousCommit]);
       if (dur.command !== 'SELECT' || dur.rows[0]?.sc !== this.synchronousCommit) {
         throw new ContractValidationError(`failed to enforce synchronous_commit=${this.synchronousCommit} before COMMIT`);
       }
-      // TOCTOU re-check: fsync/full_page_writes could have been reloaded during the
-      // callback. The durability that matters is the one in effect AT COMMIT.
+      // TOCTOU re-check: fsync/full_page_writes could have been reloaded. The durability that
+      // matters is the one in effect AT COMMIT.
       await assertDurableSettings();
-      // (PR2b-0) caller PRE-COMMIT hook — the LAST statement before COMMIT (e.g. the source
-      // lease re-check that catches a tx which passed the start gate then stalled past expiry).
-      // Runs BEFORE commitDispatched, so any failure is an ordinary pre-COMMIT rollback + destroy,
-      // never ambiguous. It CANNOT itself dispatch a COMMIT/ROLLBACK (the continuity nonce was
-      // already verified above and the executor rejects transaction-control statements).
-      if (onBeforeCommit) await abortRace(onBeforeCommit(exec), signal);
       // from here the COMMIT is in flight; a lost response is AMBIGUOUS, not a failure.
       commitDispatched = true;
       const commit = await query('COMMIT');

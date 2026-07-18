@@ -15,11 +15,10 @@
  * append-tx wiring, the transactor pre-commit recheck, the SourceFrozenReceipt, and the external
  * restore/fork witness land in subsequent PR2b-0 commits.
  */
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, sign as edSign, verify as edVerify, createPublicKey, createPrivateKey, type KeyObject } from 'node:crypto';
 
 import { ContractValidationError } from './ha-outbox-contract.js';
 import type { PgExecutor } from './tsk-hotp-outbox-pg.js';
-import type { GuardKeyResolver } from './ha-control-fencing.js';
 
 // ── bounds + grammar ─────────────────────────────────────────────────────────
 
@@ -50,12 +49,22 @@ function vNullableDigest(v: unknown, label: string): string | null {
   return v;
 }
 
-// ── guard signing (matches PR2a's keyId-bound, length-prefixed HMAC framing) ──
+// ── asymmetric ed25519 signing (C1: verifiers hold PUBLIC keys ONLY, never signer material) ──
 
-function toSecret(s: Buffer | string): Buffer {
-  const b = Buffer.isBuffer(s) ? Buffer.from(s) : Buffer.from(String(s), 'utf8'); // defensive copy
-  if (b.length < 32) throw new ContractValidationError('guard secret must be >= 32 bytes');
-  return b;
+/** Resolves a keyId to its ed25519 PUBLIC verify key (KeyObject or PEM/DER), or null if
+ *  unknown/revoked. Verifiers (source, receiver B, control) hold ONLY public keys — so a verifier
+ *  can NEVER forge a signature (unlike symmetric HMAC, where the verifier holds the signer secret). */
+export interface SourceVerifyKeyResolver { resolve(keyId: string): KeyObject | string | null; }
+
+function toPublicKey(k: KeyObject | string): KeyObject {
+  const key = typeof k === 'string' ? createPublicKey(k) : k;
+  if (key.type !== 'public' || key.asymmetricKeyType !== 'ed25519') throw new ContractValidationError('verify key must be an ed25519 public key');
+  return key;
+}
+function toPrivateKey(k: KeyObject | string): KeyObject {
+  const key = typeof k === 'string' ? createPrivateKey(k) : k;
+  if (key.type !== 'private' || key.asymmetricKeyType !== 'ed25519') throw new ContractValidationError('signing key must be an ed25519 private key');
+  return key;
 }
 /** Length-prefixed, tagged framing (no in-band NUL): [1][len][bytes] per field, [0] for null. */
 function frame(...parts: (string | number | null)[]): Buffer {
@@ -69,20 +78,23 @@ function frame(...parts: (string | number | null)[]): Buffer {
   return Buffer.concat(bufs);
 }
 const sha256hex = (b: Buffer): string => createHash('sha256').update(b).digest('hex');
-const withKey = (keyId: string, msg: Buffer): Buffer => Buffer.concat([frame('tsk_ha_key', keyId), msg]);
-function ctEqB64u(a: string, expected: Buffer): boolean {
-  if (typeof a !== 'string' || !B64U_CANON.test(a)) return false;
-  let got: Buffer;
-  try { got = Buffer.from(a, 'base64url'); } catch { return false; }
-  if (got.toString('base64url') !== a) return false;
-  return got.length === expected.length && timingSafeEqual(got, expected);
+/** Bind the keyId INTO the signed bytes so a signature cannot be replayed under another keyId. */
+const withKey = (keyId: string, msg: Buffer): Buffer => Buffer.concat([frame('tsk_src_key', keyId), msg]);
+
+/** ed25519-sign over withKey(keyId, msg); returns a base64url signature. Holder of the PRIVATE key only. */
+function edSignB64u(keyId: string, privateKey: KeyObject | string, msg: Buffer): string {
+  if (!KEY_ID_RE.test(keyId)) throw new ContractValidationError('invalid keyId');
+  return edSign(null, withKey(keyId, msg), toPrivateKey(privateKey)).toString('base64url');
 }
-function verifyGuard(resolver: GuardKeyResolver, keyId: string, msg: Buffer, signature: string): void {
-  if (!KEY_ID_RE.test(keyId)) throw new ContractValidationError('invalid guard keyId');
-  const secret = resolver.resolve(keyId);
-  if (secret === null) throw new ContractValidationError('unknown or revoked guard keyId');
-  const expected = createHmac('sha256', toSecret(secret)).update(withKey(keyId, msg)).digest();
-  if (!ctEqB64u(signature, expected)) throw new ContractValidationError('invalid guard signature');
+/** Verify an ed25519 base64url signature over withKey(keyId, msg) using the resolver's PUBLIC key. */
+function verifySig(resolver: SourceVerifyKeyResolver, keyId: string, msg: Buffer, signature: string): void {
+  if (!KEY_ID_RE.test(keyId)) throw new ContractValidationError('invalid keyId');
+  if (typeof signature !== 'string' || !B64U_CANON.test(signature)) throw new ContractValidationError('invalid signature encoding');
+  const pub = resolver.resolve(keyId);
+  if (pub === null) throw new ContractValidationError('unknown or revoked keyId');
+  let sigBuf: Buffer;
+  try { sigBuf = Buffer.from(signature, 'base64url'); } catch { throw new ContractValidationError('invalid signature encoding'); }
+  if (!edVerify(null, withKey(keyId, msg), toPublicKey(pub), sigBuf)) throw new ContractValidationError('invalid signature');
 }
 
 /** Canonical signed message for a lease grant/revocation (control signs; source verifies — same
@@ -103,7 +115,7 @@ export type BareLeaseGrant = Omit<LeaseGrant, 'grantDigest' | 'guardKeyId' | 'gu
 
 /** CONTROL-SIDE issuer: compute the grant digest + guard signature over the exact canonical tuple.
  *  The guard holds the signing key; the source only verifies (both use `leaseGrantMsg`). */
-export function signLeaseGrant(guardKeyId: string, guardSecret: Buffer | string, bare: BareLeaseGrant): LeaseGrant {
+export function signLeaseGrant(guardKeyId: string, guardPrivateKey: KeyObject | string, bare: BareLeaseGrant): LeaseGrant {
   if (!KEY_ID_RE.test(guardKeyId)) throw new ContractValidationError('invalid guard keyId');
   vId(bare.streamId, STREAM_ID_RE, 'streamId'); vId(bare.holderNodeId, ID_RE, 'holderNodeId');
   vId(bare.leaseId, ID_RE, 'leaseId'); vId(bare.commandId, ID_RE, 'commandId');
@@ -112,12 +124,11 @@ export function signLeaseGrant(guardKeyId: string, guardSecret: Buffer | string,
   if (bare.leaseStatus !== 'active' && bare.leaseStatus !== 'revoked') throw new ContractValidationError('invalid leaseStatus');
   vNullableDigest(bare.prevGrantDigest, 'prevGrantDigest');
   const digest = sha256hex(leaseGrantMsg(bare, ''));
-  const secret = toSecret(guardSecret);
-  const signature = createHmac('sha256', secret).update(withKey(guardKeyId, leaseGrantMsg(bare, digest))).digest().toString('base64url');
+  const signature = edSignB64u(guardKeyId, guardPrivateKey, leaseGrantMsg(bare, digest));
   return { ...bare, grantDigest: digest, guardKeyId, guardSignature: signature };
 }
 /** Recompute the grant digest + verify the guard signature over the exact canonical tuple. */
-export function verifyLeaseGrant(resolver: GuardKeyResolver, g: LeaseGrant): void {
+export function verifyLeaseGrant(resolver: SourceVerifyKeyResolver, g: LeaseGrant): void {
   vId(g.streamId, STREAM_ID_RE, 'streamId'); vId(g.holderNodeId, ID_RE, 'holderNodeId');
   vId(g.leaseId, ID_RE, 'leaseId'); vId(g.commandId, ID_RE, 'commandId');
   vInt(g.leaseEpoch, 'leaseEpoch', 0, MAX_EPOCH); vInt(g.leaseGrantSeq, 'leaseGrantSeq', 1, MAX_SEQ);
@@ -126,7 +137,7 @@ export function verifyLeaseGrant(resolver: GuardKeyResolver, g: LeaseGrant): voi
   vNullableDigest(g.prevGrantDigest, 'prevGrantDigest');
   const expect = sha256hex(leaseGrantMsg(g, ''));
   if (expect !== g.grantDigest) throw new ContractValidationError('lease grant digest mismatch');
-  verifyGuard(resolver, g.guardKeyId, leaseGrantMsg(g, g.grantDigest), g.guardSignature);
+  verifySig(resolver, g.guardKeyId, leaseGrantMsg(g, g.grantDigest), g.guardSignature);
 }
 
 // ── DDL: signed lease head + append-only history ─────────────────────────────
@@ -187,7 +198,7 @@ const affectedOne = (res: { rowCount: number }, what: string): void => {
  * Idempotent lost-ACK: the same `command_id` + identical tuple is a no-op; a reused `command_id` with
  * a different tuple → quarantine (also enforced by `UNIQUE(stream_id, command_id)`).
  */
-export async function installLeaseGrant(exec: PgExecutor, resolver: GuardKeyResolver, g: LeaseGrant): Promise<LeaseState> {
+export async function installLeaseGrant(exec: PgExecutor, resolver: SourceVerifyKeyResolver, g: LeaseGrant): Promise<LeaseState> {
   verifyLeaseGrant(resolver, g);
   const cur = await readSourceLease(exec, resolver, g.streamId);
   // idempotent: this exact grant already installed (by grant_seq + digest) → no-op
@@ -227,22 +238,22 @@ function rowToLease(streamId: string, r: Record<string, unknown>): { state: Leas
 }
 
 /** Read + verify the current signed lease head (tamper-evident). Returns null if unleased. */
-export async function readSourceLease(exec: PgExecutor, resolver: GuardKeyResolver, streamId: string): Promise<LeaseState | null> {
+export async function readSourceLease(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<LeaseState | null> {
   const s = vId(streamId, STREAM_ID_RE, 'streamId');
   const r = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease WHERE stream_id=$1', [s])).rows[0];
   if (!r) return null;
   const m = rowToLease(s, r);
   if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease head digest mismatch');
-  verifyGuard(resolver, m.keyId, m.sigMsg, m.sig);
+  verifySig(resolver, m.keyId, m.sigMsg, m.sig);
   return m.state;
 }
 
-async function readSourceLeaseAtSeq(exec: PgExecutor, resolver: GuardKeyResolver, streamId: string, seq: number): Promise<LeaseState | null> {
+async function readSourceLeaseAtSeq(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string, seq: number): Promise<LeaseState | null> {
   const r = (await exec.query('SELECT lease_epoch, lease_status, holder_node_id, lease_id, command_id, lease_expires_at_ms, lease_grant_seq, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_source_lease_history WHERE stream_id=$1 AND lease_grant_seq=$2', [streamId, seq])).rows[0];
   if (!r) return null;
   const m = rowToLease(streamId, r);
   if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease history digest mismatch');
-  verifyGuard(resolver, m.keyId, m.sigMsg, m.sig);
+  verifySig(resolver, m.keyId, m.sigMsg, m.sig);
   return m.state;
 }
 
@@ -253,7 +264,7 @@ async function readSourceLeaseAtSeq(exec: PgExecutor, resolver: GuardKeyResolver
  * conflicting revoke UPDATE cannot commit until in-flight FOR SHARE appends finish, then new appends
  * fail here. Missing lease → fail closed.
  */
-export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: GuardKeyResolver, streamId: string, expectedEpoch: number, controlToASkewBoundMs: number): Promise<LeaseState> {
+export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string, expectedEpoch: number, controlToASkewBoundMs: number): Promise<LeaseState> {
   const s = vId(streamId, STREAM_ID_RE, 'streamId');
   const epoch = vInt(expectedEpoch, 'expectedEpoch', 0, MAX_EPOCH);
   const skew = vInt(controlToASkewBoundMs, 'controlToASkewBoundMs', 0, MAX_SKEW_MS);
@@ -261,7 +272,7 @@ export async function assertSourceLeaseWritable(exec: PgExecutor, resolver: Guar
   if (!r) throw new SourceFenceQuarantineError('no source lease — writer is not leased; fail closed');
   const m = rowToLease(s, r);
   if (sha256hex(m.digMsg) !== m.digest) throw new ContractValidationError('lease head digest mismatch');
-  verifyGuard(resolver, m.keyId, m.sigMsg, m.sig);
+  verifySig(resolver, m.keyId, m.sigMsg, m.sig);
   const st = m.state;
   if (st.leaseStatus !== 'active') throw new SourceFenceQuarantineError(`source lease is ${st.leaseStatus} — fenced; fail closed`);
   if (st.leaseEpoch !== epoch) throw new SourceFenceQuarantineError(`source lease epoch ${st.leaseEpoch} != expected ${epoch} — stale writer; fail closed`);
@@ -297,22 +308,22 @@ export async function computeSourceStateDigest(exec: PgExecutor, streamId: strin
 }
 
 /** CONTROL/SOURCE issuer: sign a frozen receipt over the exact canonical tuple (source custody). */
-export function signSourceFrozenReceipt(sourceKeyId: string, sourceSecret: Buffer | string, b: BareFrozenReceipt): SourceFrozenReceipt {
+export function signSourceFrozenReceipt(sourceKeyId: string, sourcePrivateKey: KeyObject | string, b: BareFrozenReceipt): SourceFrozenReceipt {
   if (!KEY_ID_RE.test(sourceKeyId)) throw new ContractValidationError('invalid source keyId');
   vId(b.streamId, STREAM_ID_RE, 'streamId'); vId(b.commandId, ID_RE, 'commandId'); vId(b.sourceNodeId, ID_RE, 'sourceNodeId');
   vInt(b.epoch, 'epoch', 0, MAX_EPOCH); vInt(b.n, 'n', 0, MAX_SEQ);
   if (!DIGEST_RE.test(b.signedHeadDigestAtN)) throw new ContractValidationError('invalid signedHeadDigestAtN');
   if (!DIGEST_RE.test(b.sourceStateDigestAtN)) throw new ContractValidationError('invalid sourceStateDigestAtN');
   const receiptDigest = sha256hex(frozenReceiptMsg(b, ''));
-  const sourceSignature = createHmac('sha256', toSecret(sourceSecret)).update(withKey(sourceKeyId, frozenReceiptMsg(b, receiptDigest))).digest().toString('base64url');
+  const sourceSignature = edSignB64u(sourceKeyId, sourcePrivateKey, frozenReceiptMsg(b, receiptDigest));
   return { ...b, receiptDigest, sourceKeyId, sourceSignature };
 }
 
 /** Verify a frozen receipt's digest + source signature (the resolver holds the source key). */
-export function verifySourceFrozenReceipt(resolver: GuardKeyResolver, r: SourceFrozenReceipt): void {
+export function verifySourceFrozenReceipt(resolver: SourceVerifyKeyResolver, r: SourceFrozenReceipt): void {
   const bare: BareFrozenReceipt = { streamId: r.streamId, commandId: r.commandId, epoch: r.epoch, n: r.n, signedHeadDigestAtN: r.signedHeadDigestAtN, sourceStateDigestAtN: r.sourceStateDigestAtN, sourceNodeId: r.sourceNodeId };
   if (sha256hex(frozenReceiptMsg(bare, '')) !== r.receiptDigest) throw new ContractValidationError('frozen receipt digest mismatch');
-  verifyGuard(resolver, r.sourceKeyId, frozenReceiptMsg(bare, r.receiptDigest), r.sourceSignature);
+  verifySig(resolver, r.sourceKeyId, frozenReceiptMsg(bare, r.receiptDigest), r.sourceSignature);
 }
 
 /**
@@ -321,7 +332,7 @@ export function verifySourceFrozenReceipt(resolver: GuardKeyResolver, r: SourceF
  * head `N` + `signedHeadDigest@N` from the source checkpoint, computes `sourceStateDigest@N`, and
  * source-signs the receipt. Fails closed if the lease is not revoked at `epoch`.
  */
-export async function emitSourceFrozenReceipt(exec: PgExecutor, resolver: GuardKeyResolver, sourceKeyId: string, sourceSecret: Buffer | string, input: { streamId: string; commandId: string; epoch: number; sourceNodeId: string }): Promise<SourceFrozenReceipt> {
+export async function emitSourceFrozenReceipt(exec: PgExecutor, resolver: SourceVerifyKeyResolver, sourceKeyId: string, sourcePrivateKey: KeyObject | string, input: { streamId: string; commandId: string; epoch: number; sourceNodeId: string }): Promise<SourceFrozenReceipt> {
   const s = vId(input.streamId, STREAM_ID_RE, 'streamId');
   const commandId = vId(input.commandId, ID_RE, 'commandId');
   const epoch = vInt(input.epoch, 'epoch', 0, MAX_EPOCH);
@@ -336,7 +347,7 @@ export async function emitSourceFrozenReceipt(exec: PgExecutor, resolver: GuardK
   const headDigest = String(cp.head_digest || '') || GENESIS_HEAD_ZERO;
   if (!DIGEST_RE.test(headDigest)) throw new ContractValidationError('invalid source head_digest at freeze');
   const sourceStateDigestAtN = await computeSourceStateDigest(exec, s, n);
-  return signSourceFrozenReceipt(sourceKeyId, sourceSecret, { streamId: s, commandId, epoch, n, signedHeadDigestAtN: headDigest, sourceStateDigestAtN, sourceNodeId });
+  return signSourceFrozenReceipt(sourceKeyId, sourcePrivateKey, { streamId: s, commandId, epoch, n, signedHeadDigestAtN: headDigest, sourceStateDigestAtN, sourceNodeId });
 }
 
 const GENESIS_HEAD_ZERO = '0'.repeat(64);
@@ -384,7 +395,7 @@ function vHeadDigest(v: unknown, label: string): string {
 }
 
 /** Read + verify the current signed witness head (tamper-evident). Null if none. */
-export async function readSourceWitness(exec: PgExecutor, resolver: GuardKeyResolver, streamId: string): Promise<WitnessState | null> {
+export async function readSourceWitness(exec: PgExecutor, resolver: SourceVerifyKeyResolver, streamId: string): Promise<WitnessState | null> {
   const s = vId(streamId, STREAM_ID_RE, 'streamId');
   const r = (await exec.query('SELECT source_system_id, max_grant_seq, max_source_seq, source_head_digest, witness_seq, prev_witness_digest, witness_digest, guard_key_id, guard_signature FROM tsk_source_witness WHERE stream_id=$1', [s])).rows[0];
   if (!r) return null;
@@ -392,7 +403,7 @@ export async function readSourceWitness(exec: PgExecutor, resolver: GuardKeyReso
   const head = vHeadDigest(r.source_head_digest, 'source_head_digest'), wseq = vInt(r.witness_seq, 'witness_seq', 1, MAX_SEQ);
   const prev = vNullableDigest(r.prev_witness_digest, 'prev_witness_digest'), digest = vHeadDigest(r.witness_digest, 'witness_digest');
   if (sha256hex(witnessMsg(s, sysId, gs, ss, head, wseq, prev, '')) !== digest) throw new ContractValidationError('witness digest mismatch');
-  verifyGuard(resolver, String(r.guard_key_id), witnessMsg(s, sysId, gs, ss, head, wseq, prev, digest), String(r.guard_signature));
+  verifySig(resolver, String(r.guard_key_id), witnessMsg(s, sysId, gs, ss, head, wseq, prev, digest), String(r.guard_signature));
   return { streamId: s, sourceSystemId: sysId, maxGrantSeq: gs, maxSourceSeq: ss, headDigest: head, witnessSeq: wseq, witnessDigest: digest };
 }
 
@@ -411,7 +422,7 @@ export function assertSourceWitnessConsistent(witness: WitnessState | null, live
 
 /** Monotonically advance the external witness (guard-signed forward-CAS). Rejects a regression/fork
  *  (via assertSourceWitnessConsistent against the incoming high-water) before stamping. */
-export async function advanceSourceWitness(exec: PgExecutor, resolver: GuardKeyResolver, guardKeyId: string, guardSecret: Buffer | string, entry: SourceLiveState & { streamId: string }): Promise<WitnessState> {
+export async function advanceSourceWitness(exec: PgExecutor, resolver: SourceVerifyKeyResolver, guardKeyId: string, guardPrivateKey: KeyObject | string, entry: SourceLiveState & { streamId: string }): Promise<WitnessState> {
   const s = vId(entry.streamId, STREAM_ID_RE, 'streamId');
   const sysId = vId(entry.sourceSystemId, ID_RE, 'sourceSystemId');
   const gs = vInt(entry.grantSeq, 'grantSeq', 0, MAX_SEQ), ss = vInt(entry.sourceSeq, 'sourceSeq', 0, MAX_SEQ);
@@ -424,7 +435,7 @@ export async function advanceSourceWitness(exec: PgExecutor, resolver: GuardKeyR
   const wseq = (cur?.witnessSeq ?? 0) + 1;
   const prev = cur?.witnessDigest ?? null;
   const digest = sha256hex(witnessMsg(s, sysId, gs, ss, head, wseq, prev, ''));
-  const sig = createHmac('sha256', toSecret(guardSecret)).update(withKey(guardKeyId, witnessMsg(s, sysId, gs, ss, head, wseq, prev, digest))).digest().toString('base64url');
+  const sig = edSignB64u(guardKeyId, guardPrivateKey, witnessMsg(s, sysId, gs, ss, head, wseq, prev, digest));
   const cols = 'stream_id, source_system_id, max_grant_seq, max_source_seq, source_head_digest, witness_seq, prev_witness_digest, witness_digest, guard_key_id, guard_signature';
   const vals = [s, sysId, gs, ss, head, wseq, prev, digest, guardKeyId, sig];
   await exec.query(`INSERT INTO tsk_source_witness_history (${cols}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, vals);

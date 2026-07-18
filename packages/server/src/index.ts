@@ -100,6 +100,7 @@ export {
   SourceFenceQuarantineError,
 } from './tsk-source-fence.js';
 export type {
+  SourceVerifyKeyResolver,
   LeaseGrant,
   BareLeaseGrant,
   LeaseState as SourceLeaseState,

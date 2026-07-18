@@ -18,7 +18,7 @@ import {
   provisionSchemaVersion, PgTskDurableOutbox, NodePostgresTransactor, RedisFencingStore, ContractValidationError,
   signLeaseGrant, installLeaseGrant, readSourceLease, emitSourceFrozenReceipt, verifySourceFrozenReceipt,
   advanceSourceWitness, readSourceWitness, SourceFenceQuarantineError,
-  type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation, type TskHotpMutation, type GuardKeyResolver,
+  type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation, type TskHotpMutation, type SourceVerifyKeyResolver,
 } from './packages/server/dist/index.js';
 
 const A_URL = process.env['TSK_TEST_SOURCE_PG_URL_A'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -26,9 +26,9 @@ const C_URL = process.env['TSK_TEST_CONTROL_PG_URL'];
 const R_URL: string = process.env['TSK_TEST_REDIS_URL'] ?? process.env['TSK_REDIS_URL'] ?? '';
 if (!A_URL || !C_URL || !R_URL) throw new Error('TSK_TEST_SOURCE_PG_URL_A + TSK_TEST_CONTROL_PG_URL + TSK_TEST_REDIS_URL are required');
 
-const GUARD_KEY = 'guard-1'; const guardSecret = Buffer.alloc(32, 0x2b);
-const SOURCE_KEY = 'source-1'; const sourceSecret = Buffer.alloc(32, 0x5c);
-const resolver: GuardKeyResolver = { resolve: (k) => (k === GUARD_KEY ? guardSecret : k === SOURCE_KEY ? sourceSecret : null) };
+const GUARD_KEY = 'guard-1'; const guard = generateKeyPairSync('ed25519'); const guardSecret = guard.privateKey;
+const SOURCE_KEY = 'source-1'; const source = generateKeyPairSync('ed25519'); const sourceSecret = source.privateKey; // independent custody
+const resolver: SourceVerifyKeyResolver = { resolve: (k) => (k === GUARD_KEY ? guard.publicKey : k === SOURCE_KEY ? source.publicKey : null) };
 const HOUR = 3_600_000;
 const { privateKey } = generateKeyPairSync('ed25519');
 const signer: StreamHeadSigner = { keyId: 'k1', alg: 'ed25519', async sign(d) { return edSign(null, Buffer.from(d, 'utf8'), privateKey).toString('base64url'); } };

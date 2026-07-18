@@ -9,20 +9,22 @@
  * #10 stays OPEN.
  */
 import assert from 'node:assert/strict';
+import { generateKeyPairSync } from 'node:crypto';
 import pg from 'pg';
 import {
   TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_LEASE_TABLES, NodePostgresTransactor,
   signLeaseGrant, installLeaseGrant, assertSourceLeaseWritable, readSourceLease, SourceFenceQuarantineError,
   TSK_SOURCE_WITNESS_SCHEMA, TSK_SOURCE_WITNESS_TABLES, advanceSourceWitness, readSourceWitness, assertSourceWitnessConsistent,
-  type GuardKeyResolver, type BareLeaseGrant, type LeaseGrant, type SourceLiveState,
+  type SourceVerifyKeyResolver, type BareLeaseGrant, type LeaseGrant, type SourceLiveState,
 } from './packages/server/dist/index.js';
 
 const URL = process.env['TSK_TEST_SOURCE_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
 if (!URL) throw new Error('TSK_TEST_SOURCE_PG_URL (source PG16) is required');
 
-const GUARD_KEY = 'guard-1';
-const guardSecret = Buffer.alloc(32, 0x2b);
-const resolver: GuardKeyResolver = { resolve: (kid) => (kid === GUARD_KEY ? guardSecret : null) };
+const GUARD_KEY = 'guard-1'; // ed25519: private signs (control/guard), public verifies (source)
+const guard = generateKeyPairSync('ed25519');
+const guardSecret = guard.privateKey;
+const resolver: SourceVerifyKeyResolver = { resolve: (kid) => (kid === GUARD_KEY ? guard.publicKey : null) };
 const SID = 'tsk:pair:pr2b0/v1';
 const HOUR = 3_600_000;
 
@@ -58,8 +60,8 @@ async function main() {
     await tx.transaction((exec) => installLeaseGrant(exec, resolver, past));
     await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, SID, 0, 0)), /deadline elapsed/);
     await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, 'tsk:unleased/v1', 0, 0)), /not leased/);
-    const forged: GuardKeyResolver = { resolve: () => null };
-    await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, forged, SID, 0, 0)), /unknown or revoked guard keyId/);
+    const forged: SourceVerifyKeyResolver = { resolve: () => null };
+    await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, forged, SID, 0, 0)), /unknown or revoked keyId/);
   });
 
   await check('install rejects: non-monotonic seq, broken prev chain, command reuse with different tuple', async () => {
@@ -73,7 +75,7 @@ async function main() {
 
   await check('tamper: a corrupted head signature fails the guard verify on read', async () => {
     await pool.query("UPDATE tsk_source_lease SET guard_signature='AAAA' WHERE stream_id=$1", [SID]);
-    await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, SID, 0, 0)), /guard signature/);
+    await assert.rejects(() => tx.transaction((exec) => assertSourceLeaseWritable(exec, resolver, SID, 0, 0)), /invalid signature/);
   });
 
   await check('lock-based revoke → the gate fails closed at the fenced epoch', async () => {
@@ -111,7 +113,7 @@ async function main() {
     assert.throws(() => assertSourceWitnessConsistent(w, live({ sourceSystemId: 'sysB' })), /system_identifier changed/);
     assert.doesNotThrow(() => assertSourceWitnessConsistent(null, live({}))); // genesis ok
     await pool.query("UPDATE tsk_source_witness SET guard_signature='AAAA' WHERE stream_id=$1", [WSID]);
-    await assert.rejects(() => tx.transaction((exec) => readSourceWitness(exec, resolver, WSID)), /guard signature/);
+    await assert.rejects(() => tx.transaction((exec) => readSourceWitness(exec, resolver, WSID)), /invalid signature/);
   });
 
   console.log(`\n# ${passed} PR2b-0 source fence-gate checks passed`);

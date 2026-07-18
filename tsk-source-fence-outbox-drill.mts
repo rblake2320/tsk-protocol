@@ -18,17 +18,15 @@ import {
   signLeaseGrant, installLeaseGrant, SourceFenceQuarantineError,
   emitSourceFrozenReceipt, verifySourceFrozenReceipt, computeSourceStateDigest,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation,
-  type TskHotpMutation, type GuardKeyResolver, type BareLeaseGrant,
+  type TskHotpMutation, type SourceVerifyKeyResolver, type BareLeaseGrant,
 } from './packages/server/dist/index.js';
 
 const URL = process.env['TSK_TEST_SOURCE_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
 if (!URL) throw new Error('TSK_TEST_SOURCE_PG_URL (source PG16) is required');
 const SCHEMA = 'public';
-const GUARD_KEY = 'guard-1';
-const guardSecret = Buffer.alloc(32, 0x2b);
-const SOURCE_KEY = 'source-1'; // independent custody from the guard
-const sourceSecret = Buffer.alloc(32, 0x5c);
-const resolver: GuardKeyResolver = { resolve: (kid) => (kid === GUARD_KEY ? guardSecret : kid === SOURCE_KEY ? sourceSecret : null) };
+const GUARD_KEY = 'guard-1'; const guard = generateKeyPairSync('ed25519'); const guardSecret = guard.privateKey;
+const SOURCE_KEY = 'source-1'; const source = generateKeyPairSync('ed25519'); const sourceSecret = source.privateKey; // INDEPENDENT custody (own keypair)
+const resolver: SourceVerifyKeyResolver = { resolve: (kid) => (kid === GUARD_KEY ? guard.publicKey : kid === SOURCE_KEY ? source.publicKey : null) };
 const HOUR = 3_600_000;
 
 const { privateKey } = generateKeyPairSync('ed25519');
