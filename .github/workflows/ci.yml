@@ -48,6 +48,23 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      # control DB: a THIRD independent PostgreSQL 16 INSTANCE / state authority (separate
+      # service, no shared state with A/B or Redis) for the PR2a HA fencing-foundation drill.
+      # NOTE: on a single CI runner these are independent instances, NOT independent physical
+      # failure domains — real fault-domain separation is a deployment/topology responsibility.
+      postgres_control:
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_DB: tsk_test
+          POSTGRES_USER: tsk_test
+          POSTGRES_PASSWORD: tsk-test-only-password
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U tsk_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -89,6 +106,19 @@ jobs:
         env:
           TSK_TEST_POSTGRES_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
           TSK_TEST_POSTGRES_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5433/tsk_test
+      # PR2a HA fencing FOUNDATION drill (#10): pinned full-catalog schema attestation
+      # (+ live per-tx re-attestation), signed per-step provisioning saga, signed epoch
+      # witness, monotonic command-bound lease, replay-over-head / tamper / rotation
+      # defenses, control-clock fence-advance with a signed evidence payload + freeze-
+      # under-PREPARING + idempotent retry, and a BARRIER-controlled concurrent-intent
+      # race. Runs against the THIRD independent control PG16 instance (5434) + the REAL
+      # Redis service (production RedisFencingStore). THROWS if either URL is unset (no
+      # silent skip). Bounded/mechanism-only (single Redis, not a fault-tolerant topology);
+      # does NOT close #10.
+      - run: npm run test:ha-fencing
+        env:
+          TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
+          TSK_TEST_REDIS_URL: redis://127.0.0.1:6379
       - run: npm run test:pack
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
