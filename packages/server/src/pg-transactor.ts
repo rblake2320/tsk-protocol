@@ -294,7 +294,7 @@ export class NodePostgresTransactor implements PgTransactor {
     this.onDisposalError = opts.onDisposalError;
   }
 
-  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T> {
+  async transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal; onBeforeCommit?: (exec: PgExecutor) => Promise<void> }): Promise<T> {
     // ONE controller unifies the caller's signal and the internal total-deadline
     // timer, so a transaction is bounded even when the caller passes no signal.
     const controller = new AbortController();
@@ -310,7 +310,7 @@ export class NodePostgresTransactor implements PgTransactor {
       for (let attempt = 0; ; attempt++) {
         if (controller.signal.aborted) throw abortError(controller.signal);
         try {
-          return await this.runOnce(fn, controller.signal);
+          return await this.runOnce(fn, controller.signal, opts?.onBeforeCommit);
         } catch (error) {
           const code = (error as { code?: unknown })?.code;
           if (
@@ -360,7 +360,7 @@ export class NodePostgresTransactor implements PgTransactor {
     }
   }
 
-  private async runOnce<T>(fn: (exec: PgExecutor) => Promise<T>, signal: AbortSignal): Promise<T> {
+  private async runOnce<T>(fn: (exec: PgExecutor) => Promise<T>, signal: AbortSignal, onBeforeCommit?: (exec: PgExecutor) => Promise<void>): Promise<T> {
     const client = await this.acquire(signal);
     let releaseState: 'open' | 'released' | 'destroyed' | 'failed' = 'open';
     let disposalError: unknown;
@@ -462,6 +462,12 @@ export class NodePostgresTransactor implements PgTransactor {
       // TOCTOU re-check: fsync/full_page_writes could have been reloaded during the
       // callback. The durability that matters is the one in effect AT COMMIT.
       await assertDurableSettings();
+      // (PR2b-0) caller PRE-COMMIT hook — the LAST statement before COMMIT (e.g. the source
+      // lease re-check that catches a tx which passed the start gate then stalled past expiry).
+      // Runs BEFORE commitDispatched, so any failure is an ordinary pre-COMMIT rollback + destroy,
+      // never ambiguous. It CANNOT itself dispatch a COMMIT/ROLLBACK (the continuity nonce was
+      // already verified above and the executor rejects transaction-control statements).
+      if (onBeforeCommit) await abortRace(onBeforeCommit(exec), signal);
       // from here the COMMIT is in flight; a lost response is AMBIGUOUS, not a failure.
       commitDispatched = true;
       const commit = await query('COMMIT');

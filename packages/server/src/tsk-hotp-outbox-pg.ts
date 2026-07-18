@@ -90,7 +90,7 @@ export interface PgExecutor {
  * signal + a conforming test transactor, not a production driver.
  */
 export interface PgTransactor {
-  transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal }): Promise<T>;
+  transaction<T>(fn: (exec: PgExecutor) => Promise<T>, opts?: { signal?: AbortSignal; onBeforeCommit?: (exec: PgExecutor) => Promise<void> }): Promise<T>;
 }
 
 // Bound-tx state: executor + identity of the transactor+schema that produced it,
@@ -619,10 +619,23 @@ export class PgTskDurableOutbox {
   }
 
   async withOutboxTx<T>(fn: (tx: PgTx, exec: PgExecutor) => Promise<T>): Promise<T> {
+    const gate = this.opts.sourceLeaseGate;
     return runScoped(this.scopeDeadlineMs, (signal) => this.db.transaction(async (exec) => {
       await enterCriticalTx(exec, this.schema);
       return withBoundTx(exec, this.db, this.schema, (tx, scoped) => fn(tx, scoped));
-    }, { signal }));
+    }, {
+      signal,
+      // (PR2b-0) pre-commit lease re-check as the LAST statement before COMMIT: re-read the current
+      // fence epoch + re-assert the lease is active + not past its signed deadline on A's clock —
+      // catching a tx that passed the per-append gate then stalled past expiry. FOR SHARE is already
+      // held from the append; this re-affirms it. NOTE (per design §A.2): this does NOT guarantee the
+      // COMMIT lands before the deadline — the lock-based revoke is the freeze authority.
+      onBeforeCommit: gate ? async (exec) => {
+        const fenceRows = (await exec.query('SELECT fence_token FROM tsk_outbox_fence WHERE stream_id = $1 FOR SHARE', [this.opts.streamId])).rows;
+        if (!fenceRows.length) throw new ContractValidationError('no authoritative fence row at pre-commit re-check');
+        await assertSourceLeaseWritable(exec, gate.resolver, this.opts.streamId, Number(BigInt(String(fenceRows[0].fence_token))), gate.controlToASkewBoundMs);
+      } : undefined,
+    }));
   }
 
   /** Append the caller's tumbler mutation: fence check, bounded admission,
