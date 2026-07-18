@@ -4,9 +4,10 @@
  * guard-countersigned export (now binding A's real PG system_identifier). B stages the manifest+chunks
  * into an isolated candidate generation (persisted, crash-resumable, exact-duplicate-ok, same-ordinal
  * conflict-reject), then finalizes: rebuilds FROM STAGING, re-verifies both signatures + bundle bind +
- * independent replay, asserts B's system_identifier is distinct from the SIGNED source id + a validated
- * control set, and installs the BFinalizedReceipt atomically. Negatives: not-distinct (signed A + control
- * set + empty/dup), staging conflict, tampered guard sig, wrong command, refuse-different-generation.
+ * independent replay, asserts B's system_identifier is distinct from the SIGNED source id (B != control
+ * binds to the signed control capability in §4), and installs the BFinalizedReceipt atomically.
+ * Negatives: not-distinct-from-signed-source, composite-key isolation, staging conflict, tampered guard
+ * sig, wrong command, refuse-different-generation, TOCTOU snapshot.
  *
  * Env: TSK_TEST_SOURCE_PG_URL_A (A) + TSK_TEST_RECEIVER_PG_URL_B (B). #10 stays OPEN.
  */
@@ -83,8 +84,7 @@ async function main() {
   const bundle: SourceExportBundle = built.bundle;
   const dual: GuardCountersignedExport = guardCountersignSourceExport(bundle, built.manifest, { guardKeyId: GUARD_KEY, guardPrivateKey: guardSecret, sanitizer, sourceManifestResolver: resolver, headResolver: resolver, frozenResolver: resolver, frozenReceipt: frozen, expectedCommandId: 'promote-1' });
 
-  const CONTROL = ['control-sysid-1'];
-  const ropts = { sanitizer, sourceResolver: resolver, guardResolver: resolver, headResolver: resolver, frozenResolver: resolver, bVerifyResolver: resolver, frozenReceipt: frozen, expectedCommandId: 'promote-1', bKeyId: B_KEY, bPrivateKey: bSecret, controlSystemIds: CONTROL };
+  const ropts = { sanitizer, sourceResolver: resolver, guardResolver: resolver, headResolver: resolver, frozenResolver: resolver, bVerifyResolver: resolver, frozenReceipt: frozen, expectedCommandId: 'promote-1', bKeyId: B_KEY, bPrivateKey: bSecret };
 
   await check('B stage+finalize; BFinalizedReceipt binds the manifest + A/B system_identifiers', async () => {
     const receipt = await stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-1', bundle, dual, ropts);
@@ -129,7 +129,7 @@ async function main() {
     // staged but not installed: no pointer yet
     assert.equal((await readReceiverPointer(bTx, SCHEMA, bReady, resolver, S2)), null);
     await stageReceiverExport(bTx, SCHEMA, bReady, 'gen-s2', b2.bundle, d2, r2); // idempotent re-stage (exact duplicate ok)
-    const rec = await finalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-s2', r2); // finalize rebuilds FROM STAGING
+    const rec = await finalizeReceiverGeneration(bTx, SCHEMA, bReady, S2, 'gen-s2', r2); // finalize rebuilds FROM STAGING
     verifyBFinalizedReceipt(resolver, rec); assert.equal(rec.n, 1);
     const staged = (await bPool.query("SELECT status FROM tsk_receiver_stage WHERE stream_id=$1 AND generation_id=$2", [S2, 'gen-s2'])).rows[0];
     assert.equal(String(staged.status), 'installed', 'generation sealed after finalize');
@@ -141,14 +141,14 @@ async function main() {
     await assert.rejects(() => stageReceiverExport(bTx, SCHEMA, bReady, 'gen-1', badBundle, dual, ropts), /re-stage chunk .* digest conflict|declared byteDigest != recomputed/);
   });
 
-  await check('(H3) B system_identifier NOT distinct — from the SIGNED source id (finalize on A-PG) or the control set', async () => {
+  await check('(H3) B system_identifier must be DISTINCT from the SIGNED source id (finalize where B==A is rejected; B!=control is deferred to §4)', async () => {
     // running finalize where B's PG IS A's PG → bSystemId == manifest.sourceSystemId (signed) → rejected
     await assert.rejects(() => stageAndFinalizeReceiverGeneration(aTx, SCHEMA, aReady, 'gen-onA', bundle, dual, ropts), /== the signed source system_identifier|NOT distinct/);
-    // B in the control set → rejected
-    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-ctl', bundle, dual, { ...ropts, controlSystemIds: [bSysId] }), /in the control set|NOT distinct/);
-    // empty / duplicate control authorities → rejected
-    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-empty', bundle, dual, { ...ropts, controlSystemIds: [] }), /empty/);
-    await assert.rejects(() => stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReady, 'gen-dup', bundle, dual, { ...ropts, controlSystemIds: ['x', 'x'] }), /duplicates/);
+  });
+
+  await check('(H2) the staging lookup is COMPOSITE (stream_id, generation_id) — the same gid under another stream is not selected', async () => {
+    // gen-s2 exists ONLY under stream S2; finalizing it under SID must NOT find it (gid-alone would)
+    await assert.rejects(() => finalizeReceiverGeneration(bTx, SCHEMA, bReady, SID, 'gen-s2', { ...ropts, expectedCommandId: 'promote-2' }), /no staged generation/);
   });
 
   await check('B REJECTS a tampered GUARD signature and a wrong expected command', async () => {
