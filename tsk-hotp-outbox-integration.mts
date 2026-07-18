@@ -109,7 +109,7 @@ const ackVerifier: TskAckReceiptVerifier = { async verify(receipt, record) { if 
 async function applyDDL() { for (const s of TSK_OUTBOX_PG_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s); }
 async function resetSchema() {
   await pool.query('DROP SCHEMA IF EXISTS tsk_alt CASCADE');
-  await pool.query('DROP TABLE IF EXISTS tsk_outbox_rows, tsk_outbox_applied, tsk_outbox_fence, tsk_outbox_source_checkpoint, tsk_outbox_receiver_checkpoint, tsk_outbox_publisher_lease, tsk_outbox_quarantine, tsk_hotp_consumed, tsk_outbox_meta CASCADE');
+  await pool.query('DROP TABLE IF EXISTS tsk_outbox_rows, tsk_outbox_applied, tsk_outbox_fence, tsk_outbox_source_checkpoint, tsk_outbox_receiver_checkpoint, tsk_outbox_publisher_lease, tsk_outbox_quarantine, tsk_hotp_consumed, tsk_outbox_stream_halted, tsk_outbox_meta CASCADE');
   await applyDDL();
   READY = await provisionSchemaVersion(serial, SCHEMA);
 }
@@ -279,20 +279,50 @@ async function main() {
     assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM tsk_outbox_rows WHERE stream_id=$1 AND acked_at IS NOT NULL', [sid])).rows[0].n), 0);
   });
 
-  await check('(MED) durable stream halt: terminal quarantine halts the stream; drain refuses (no spin); operator clears to recover', async () => {
+  await check('(HIGH) durable stream halt survives a publisher restart; clearing the marker is NOT recovery (seq2 stays a permanent reject-gap)', async () => {
     const sid = 'tsk:halt/v1'; await provision(sid);
     const ob = mkOutbox(serial, sid);
     for (const cnt of [1, 2]) await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: cnt }, fenceToken: 0n }));
+    // seq1 diverges TERMINALLY (reject-fork) -> quarantine seq1 + durable halt, in one tx.
+    // The receiver checkpoint never advances past 0, so seq1 is gone for good.
     const forkTransport: TskOutboxTransport = { async deliverAndAwaitAck(record) { return { streamId: record.streamId, sourceEpoch: record.sourceEpoch, sequence: record.sequence, opDigest: record.opDigest, decision: 'reject-fork', receiverId: RID, keyId: KEY_ID, issuedAt: 'now', signature: ackSign(record, 'reject-fork') }; } };
-    const pub = new PgTskPublisher(serial, sid, forkTransport, 'quarantine', sanitizer, ackVerifier, READY, { leaseMs: 30_000 });
-    const r1 = await pub.drainOnce();
+    const r1 = await new PgTskPublisher(serial, sid, forkTransport, 'quarantine', sanitizer, ackVerifier, READY, { leaseMs: 30_000 }).drainOnce();
     assert.equal(r1.quarantined, 1); assert.equal(r1.halted, true);
     assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM tsk_outbox_stream_halted WHERE stream_id=$1', [sid])).rows[0].n), 1);
-    const r2 = await pub.drainOnce(); // refuses — no spin, no reject-gap
+
+    // RESTART: a BRAND-NEW publisher instance still refuses to drain — the halt lives
+    // in the DB (durable), not in the publisher's memory. No spin, no reject-gap loop.
+    const r2 = await new PgTskPublisher(serial, sid, receiverTransport(sid, []), 'quarantine', sanitizer, ackVerifier, READY, { leaseMs: 30_000 }).drainOnce();
     assert.deepEqual(r2, { published: 0, acked: 0, quarantined: 0, retriable: false, halted: true });
-    await pool.query('DELETE FROM tsk_outbox_stream_halted WHERE stream_id=$1', [sid]); // operator recovery
-    const r3 = await new PgTskPublisher(serial, sid, receiverTransport(sid, []), 'quarantine', sanitizer, ackVerifier, READY, { leaseMs: 30_000 }).drainOnce();
-    assert.equal(r3.halted, false); // gate cleared
+
+    // ATTEMPTED CLEAR with no governed repair: deleting the marker does NOT recover the
+    // stream. seq1 is still quarantined, the checkpoint is still 0, so the real receiver
+    // sees seq2 as a GAP forever — exactly the non-productive loop the halt existed to stop.
+    await pool.query('DELETE FROM tsk_outbox_stream_halted WHERE stream_id=$1', [sid]);
+    const decisions: Array<{ seq: number; d: ReceiverDecision }> = [];
+    const r3 = await new PgTskPublisher(serial, sid, receiverTransport(sid, decisions), 'quarantine', sanitizer, ackVerifier, READY, { leaseMs: 30_000 }).drainOnce();
+    assert.equal(r3.halted, false);   // marker is physically gone...
+    assert.equal(r3.acked, 0);        // ...but NOTHING recovered — seq2 did not apply
+    assert.ok(decisions.some((x) => x.seq === 2 && x.d === 'reject-gap'), 'seq2 must be a permanent reject-gap, not a recovery');
+    assert.equal(Number((await pool.query('SELECT sequence FROM tsk_outbox_receiver_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 0); // checkpoint never advanced
+    assert.equal(await unacked(sid), 1); // seq2 stays unacked forever; only a governed repair (unquarantine + epoch-resync) recovers
+  });
+
+  await check('(MED) strict receipt snapshot: a transport ACK receipt carrying an accessor property is rejected (no ack, no advance)', async () => {
+    const sid = 'tsk:receipt-shape/v1'; await provision(sid);
+    const ob = mkOutbox(serial, sid);
+    await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: { tumblerId: 'T1', counter: 1 }, fenceToken: 0n }));
+    const evilTransport: TskOutboxTransport = {
+      async deliverAndAwaitAck(record) {
+        const base: Record<string, unknown> = { streamId: record.streamId, sourceEpoch: record.sourceEpoch, sequence: record.sequence, opDigest: record.opDigest, decision: 'applied', receiverId: RID, keyId: KEY_ID, issuedAt: 'now', signature: ackSign(record, 'applied') };
+        // launder the decision through an accessor — the strict snapshot must refuse it
+        Object.defineProperty(base, 'decision', { get: () => 'applied', enumerable: true, configurable: true });
+        return base as unknown as TskAckReceipt;
+      },
+    };
+    const pub = new PgTskPublisher(serial, sid, evilTransport, 'quarantine', sanitizer, ackVerifier, READY, { leaseMs: 30_000 });
+    await assert.rejects(() => pub.drainOnce(), /receipt/);
+    assert.equal(await unacked(sid), 1); // nothing acked; the row is untouched
   });
 
   await check('(MED) schema grammar: a valid lowercase non-public schema attests; invalid identifiers are rejected', async () => {

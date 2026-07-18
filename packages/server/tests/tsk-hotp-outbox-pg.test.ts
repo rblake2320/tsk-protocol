@@ -1,5 +1,8 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import { createHash, generateKeyPairSync, sign as edSign, verify as edVerify, type KeyObject } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 import {
   ContractValidationError,
@@ -16,23 +19,31 @@ import {
   GENESIS_HEAD,
   PgTskReceiverCheckpoint,
   StreamHeadVerificationUnavailableError,
-  __internalUnsafeMintReadyToken,
+  provisionSchemaVersion,
   type HotpApplier,
   type PgExecutor,
   type PgTransactor,
+  type SchemaReadyToken,
 } from '../src/tsk-hotp-outbox-pg.js';
+
+// Real catalog rows captured from a provisioned PostgreSQL 16, replayed by the
+// fake transactor so attestation GENUINELY runs — the tests obtain a real
+// readiness token exactly like production (no unsafe test-only mint ships).
+const CATALOG = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'tsk-manifest-catalog.fixture.json'), 'utf8')) as {
+  cols: Record<string, unknown>[]; cons: Record<string, unknown>[]; idx: Record<string, unknown>[]; rel: Record<string, unknown>[]; trig: Record<string, unknown>[]; pol: Record<string, unknown>[];
+};
 
 /** Snapshot-based in-memory transactor (LOGIC only): clone → run → commit on
  *  success, discard on throw. Reports SERIALIZABLE + rowCount so the impl's
  *  isolation + exactly-1 write assertions run. It cannot prove lock/concurrency —
  *  that is the real-PG integration. */
 interface Cp { epoch: string; seq: number; head: string }
-interface State { fence: Map<string, bigint>; rcv: Map<string, Cp>; applied: Array<{ s: string; e: string; q: number; d: string }>; hotp: Map<string, number> }
+interface State { fence: Map<string, bigint>; rcv: Map<string, Cp>; applied: Array<{ s: string; e: string; q: number; d: string }>; hotp: Map<string, number>; meta: number | null }
 class MemoryTskPg implements PgTransactor {
   isolation = 'serializable';
-  state: State = { fence: new Map(), rcv: new Map(), applied: [], hotp: new Map() };
+  state: State = { fence: new Map(), rcv: new Map(), applied: [], hotp: new Map(), meta: null };
   private clone(s: State): State {
-    return { fence: new Map(s.fence), rcv: new Map([...s.rcv].map(([k, v]) => [k, { ...v }])), applied: s.applied.map((a) => ({ ...a })), hotp: new Map(s.hotp) };
+    return { fence: new Map(s.fence), rcv: new Map([...s.rcv].map(([k, v]) => [k, { ...v }])), applied: s.applied.map((a) => ({ ...a })), hotp: new Map(s.hotp), meta: s.meta };
   }
   async transaction<T>(fn: (exec: PgExecutor) => Promise<T>, _opts?: { signal?: AbortSignal }): Promise<T> {
     const work = this.clone(this.state);
@@ -53,7 +64,17 @@ function makeExec(s: State, isolation: string): PgExecutor {
       const out = (rows: Record<string, unknown>[], rc?: number) => ({ rows, rowCount: rc ?? rows.length });
       if (sql.includes('SHOW transaction_isolation')) return out([{ transaction_isolation: isolation }]);
       if (sql.includes('set_config')) { pinned = P[1]; return out([{ set_config: P[1] }]); }
-      if (sql.includes('current_schema()')) return out([{ s: pinned }]);
+      if (sql.includes('current_schema() AS s')) return out([{ s: pinned }]);
+      // ── genuine attestation: replay the captured real catalog so schemaManifest()
+      //    computes the real manifest and attestSchema() truly runs (no unsafe mint) ──
+      if (sql.includes('information_schema.columns')) return out(CATALOG.cols);
+      if (sql.includes('pg_get_constraintdef')) return out(CATALOG.cons);
+      if (sql.includes('pg_indexes')) return out(CATALOG.idx);
+      if (sql.includes('pg_get_triggerdef')) return out(CATALOG.trig);
+      if (sql.includes('pg_policy')) return out(CATALOG.pol);
+      if (sql.includes('rel.relkind')) return out(CATALOG.rel);
+      if (sql.includes('INSERT INTO tsk_outbox_meta')) { s.meta = 1; return out([{}], 1); }
+      if (sql.includes('FROM tsk_outbox_meta')) return out(s.meta === null ? [] : [{ schema_version: s.meta }]);
       if (sql.includes('FROM tsk_outbox_fence')) { const t = s.fence.get(P[0]); return out(t === undefined ? [] : [{ fence_token: t.toString() }]); }
       if (sql.includes('FROM tsk_outbox_receiver_checkpoint')) { const c = s.rcv.get(P[0]); return out(c ? [{ source_epoch: c.epoch, sequence: c.seq, head_digest: c.head }] : []); }
       if (sql.includes('FROM tsk_outbox_applied')) { const a = s.applied.find((x) => x.s === P[0] && x.e === P[1] && x.q === Number(P[2])); return out(a ? [{ op_digest: a.d }] : []); }
@@ -96,11 +117,14 @@ function mkRecordHead(seq: number, mut: TskHotpMutation, prevHead: string, fence
 }
 
 describe('PgTskReceiverCheckpoint — HOTP exactly-once + signed hash-linked head (#10)', () => {
-  let db: MemoryTskPg; let rcv: PgTskReceiverCheckpoint;
+  let db: MemoryTskPg; let rcv: PgTskReceiverCheckpoint; let ready: SchemaReadyToken;
   const apply = (r: { record: OutboxRecord<TskHotpMutation>; head: SignedStreamHead }) => rcv.verifyAndApplyTumblerDelivered(r.record, r.head);
-  beforeEach(() => {
+  beforeEach(async () => {
     db = new MemoryTskPg(); db.provision(SID); applied.length = 0;
-    rcv = new PgTskReceiverCheckpoint(db, SID, sanitizer, headVerifier, applier, __internalUnsafeMintReadyToken(db, 'public'));
+    // real attestation path: replays the captured catalog, computes+matches the
+    // manifest, stamps meta, and mints a transactor-bound token — same as production.
+    ready = await provisionSchemaVersion(db, 'public');
+    rcv = new PgTskReceiverCheckpoint(db, SID, sanitizer, headVerifier, applier, ready);
   });
 
   it('applies a fresh in-order record; advances checkpoint (seq+head) and consumes the HOTP counter', async () => {
@@ -121,7 +145,7 @@ describe('PgTskReceiverCheckpoint — HOTP exactly-once + signed hash-linked hea
 
   it('signed head: a TYPED unavailability error retries (re-thrown), does NOT apply/ack/quarantine', async () => {
     const flaky: StreamHeadVerifier = { async verify() { throw new StreamHeadVerificationUnavailableError('HSM offline'); } };
-    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, flaky, applier, __internalUnsafeMintReadyToken(db, 'public'));
+    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, flaky, applier, ready);
     const r = mkRecordHead(1, { tumblerId: 'T1', counter: 1 }, GENESIS_HEAD);
     await expect(r2.verifyAndApplyTumblerDelivered(r.record, r.head)).rejects.toBeInstanceOf(StreamHeadVerificationUnavailableError);
     expect(db.rcvOf(SID).seq).toBe(0); // not applied, not rejected — retry
@@ -130,7 +154,7 @@ describe('PgTskReceiverCheckpoint — HOTP exactly-once + signed hash-linked hea
 
   it('signed head: an UNKNOWN/untyped verifier exception FAILS CLOSED (reject-fork, no ack, no retry loop)', async () => {
     const chaos: StreamHeadVerifier = { async verify() { throw new TypeError('unexpected boom'); } };
-    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, chaos, applier, __internalUnsafeMintReadyToken(db, 'public'));
+    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, chaos, applier, ready);
     const r = mkRecordHead(1, { tumblerId: 'T1', counter: 1 }, GENESIS_HEAD);
     expect(await r2.verifyAndApplyTumblerDelivered(r.record, r.head)).toBe('reject-fork');
     expect(db.rcvOf(SID).seq).toBe(0);
@@ -219,10 +243,96 @@ describe('PgTskReceiverCheckpoint — HOTP exactly-once + signed hash-linked hea
         if (!ok) throw new ContractValidationError('bad');
       },
     };
-    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, mutatingVerifier, applier, __internalUnsafeMintReadyToken(db, 'public'));
+    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, mutatingVerifier, applier, ready);
     expect(await r2.verifyAndApplyTumblerDelivered(r.record, r.head)).toBe('applied');
     expect(applied).toEqual(['1:T1:5']);          // ORIGINAL applied, not 999/EVIL
     expect(db.hotpOf(SID, 'T1')).toBe(5);          // ORIGINAL counter consumed
     expect(db.hotpOf(SID, 'EVIL')).toBeUndefined();
+  });
+
+  it('(gated race) mutating the record TUPLE (sequence/fenceToken/opDigest) mid-verify is defeated by the frozen snapshot', async () => {
+    const r = mkRecordHead(1, { tumblerId: 'T1', counter: 7 }, GENESIS_HEAD);
+    const evil: StreamHeadVerifier = {
+      async verify(head) {
+        // attacker rewrites tuple fields on the caller-owned record AFTER the snapshot
+        (r.record as { sequence: number }).sequence = 999;
+        (r.record as { opDigest: string }).opDigest = 'b'.repeat(64);
+        (r.record as { fenceToken: string }).fenceToken = '5';
+        const ok = edVerify(null, Buffer.from(head.headDigest, 'utf8'), publicKey as KeyObject, Buffer.from(head.signature, 'base64url'));
+        if (!ok) throw new ContractValidationError('bad');
+      },
+    };
+    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, evil, applier, ready);
+    expect(await r2.verifyAndApplyTumblerDelivered(r.record, r.head)).toBe('applied');
+    expect(db.rcvOf(SID).seq).toBe(1);                  // ORIGINAL seq applied, not 999
+    expect(db.rcvOf(SID).head).toBe(r.head.headDigest); // checkpoint advanced to the ORIGINAL head
+    expect(applied).toEqual(['1:T1:7']);
+  });
+
+  it('(gated race) mutating the HEAD (headDigest/opDigest/sequence) mid-verify does not change the persisted checkpoint head', async () => {
+    const r = mkRecordHead(1, { tumblerId: 'T1', counter: 8 }, GENESIS_HEAD);
+    const original = r.head.headDigest;
+    const evil: StreamHeadVerifier = {
+      async verify(head) {
+        // `head` is the FROZEN snapshot; mutating the caller's original head must not matter
+        (r.head as { headDigest: string }).headDigest = 'c'.repeat(64);
+        (r.head as { opDigest: string }).opDigest = 'd'.repeat(64);
+        (r.head as { sequence: number }).sequence = 999;
+        const ok = edVerify(null, Buffer.from(head.headDigest, 'utf8'), publicKey as KeyObject, Buffer.from(head.signature, 'base64url'));
+        if (!ok) throw new ContractValidationError('bad');
+      },
+    };
+    const r2 = new PgTskReceiverCheckpoint(db, SID, sanitizer, evil, applier, ready);
+    expect(await r2.verifyAndApplyTumblerDelivered(r.record, r.head)).toBe('applied');
+    expect(db.rcvOf(SID).head).toBe(original);          // ORIGINAL head digest persisted, not 'cccc…'
+    expect(applied).toEqual(['1:T1:8']);
+  });
+
+  describe('(MED) strict snapshot validator rejects non-plain / accessor / symbol / extra-key shapes', () => {
+    const valid = () => mkRecordHead(1, { tumblerId: 'T1', counter: 5 }, GENESIS_HEAD);
+    const rejects = (record: OutboxRecord<TskHotpMutation>, head: SignedStreamHead) =>
+      expect(rcv.verifyAndApplyTumblerDelivered(record, head)).rejects.toThrow(ContractValidationError);
+
+    it('record: an accessor (getter) property is rejected', async () => {
+      const { record, head } = valid();
+      const bad = { ...record };
+      Object.defineProperty(bad, 'opDigest', { get: () => record.opDigest, enumerable: true, configurable: true });
+      await rejects(bad as OutboxRecord<TskHotpMutation>, head);
+    });
+    it('record: an extra own key is rejected', async () => {
+      const { record, head } = valid();
+      await rejects({ ...record, evil: 1 } as unknown as OutboxRecord<TskHotpMutation>, head);
+    });
+    it('record: a symbol key is rejected', async () => {
+      const { record, head } = valid();
+      await rejects({ ...record, [Symbol('x')]: 1 } as OutboxRecord<TskHotpMutation>, head);
+    });
+    it('record: an inherited (non-plain prototype) value is rejected', async () => {
+      const { record, head } = valid();
+      const bad = Object.assign(Object.create({ contractVersion: '1' }), record);
+      await rejects(bad as OutboxRecord<TskHotpMutation>, head);
+    });
+    it('record.mutation: a nested accessor is rejected', async () => {
+      const { record, head } = valid();
+      const mut: Record<string, unknown> = { tumblerId: 'T1' };
+      Object.defineProperty(mut, 'counter', { get: () => 5, enumerable: true, configurable: true });
+      await rejects({ ...record, mutation: mut } as unknown as OutboxRecord<TskHotpMutation>, head);
+    });
+    it('head: an extra own key is rejected', async () => {
+      const { record, head } = valid();
+      await rejects(record, { ...head, evil: 1 } as unknown as SignedStreamHead);
+    });
+    it('head: an accessor (getter) property is rejected', async () => {
+      const { record, head } = valid();
+      const bad = { ...head };
+      Object.defineProperty(bad, 'signature', { get: () => head.signature, enumerable: true, configurable: true });
+      await rejects(record, bad as SignedStreamHead);
+    });
+    it('head: a missing key is rejected', async () => {
+      const { record, head } = valid();
+      const bad: Record<string, unknown> = { ...head };
+      delete bad.signature;
+      await rejects(record, bad as unknown as SignedStreamHead);
+    });
   });
 });

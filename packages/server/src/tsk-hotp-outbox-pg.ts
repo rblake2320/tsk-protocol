@@ -139,34 +139,69 @@ function deepFreeze<T>(o: T): T {
   if (o && typeof o === 'object') { for (const v of Object.values(o as Record<string, unknown>)) deepFreeze(v); Object.freeze(o); }
   return o;
 }
-/** Frozen snapshot of an OutboxRecord — copies ONLY the known fields (no extra /
- *  prototype-inherited props), asserts shape, and deep-freezes. */
+/**
+ * (MED) STRICT structural gate for an untrusted object: it MUST be a plain object
+ * (Object.prototype or null prototype), have EXACTLY the expected own-enumerable
+ * DATA keys (no missing/extra), no symbol keys, and no accessor (get/set)
+ * properties. This prevents a caller from laundering an inherited value, an
+ * accessor that changes across reads, a Proxy, or extra symbol/non-enumerable
+ * shape past the snapshot. Returns the validated own-data values.
+ */
+function assertPlainData(o: unknown, keys: readonly string[], label: string): Record<string, unknown> {
+  if (o === null || typeof o !== 'object') throw new ContractValidationError(`${label} must be a plain object`);
+  const proto = Object.getPrototypeOf(o);
+  if (proto !== Object.prototype && proto !== null) throw new ContractValidationError(`${label} must have a plain (Object) or null prototype`);
+  const own = Reflect.ownKeys(o);
+  if (own.some((k) => typeof k === 'symbol')) throw new ContractValidationError(`${label} must not have symbol keys`);
+  if (own.length !== keys.length) throw new ContractValidationError(`${label} has an invalid key set`);
+  const values: Record<string, unknown> = {};
+  for (const k of keys) {
+    const d = Object.getOwnPropertyDescriptor(o, k);
+    if (!d || !d.enumerable || typeof d.get === 'function' || typeof d.set === 'function' || !('value' in d)) {
+      throw new ContractValidationError(`${label}.${k} must be an own enumerable data property`);
+    }
+    values[k] = d.value;
+  }
+  return values;
+}
+function reqString(v: unknown, label: string): string { if (typeof v !== 'string') throw new ContractValidationError(`${label} must be a string`); return v; }
+function reqInt(v: unknown, label: string): number { if (typeof v !== 'number' || !Number.isInteger(v)) throw new ContractValidationError(`${label} must be an integer`); return v; }
+
+const RECORD_KEYS = ['contractVersion', 'streamId', 'sourceEpoch', 'sequence', 'fenceToken', 'opDigest', 'mutation'] as const;
+const MUTATION_KEYS = ['tumblerId', 'counter'] as const;
+const HEAD_KEYS = ['streamId', 'sequence', 'prevHeadDigest', 'opDigest', 'keyId', 'alg', 'headDigest', 'signature'] as const;
+const RECEIPT_KEYS = ['streamId', 'sourceEpoch', 'sequence', 'opDigest', 'decision', 'receiverId', 'keyId', 'issuedAt', 'signature'] as const;
+
+/** Frozen, strictly-validated snapshot of an OutboxRecord (plain data only). */
 function snapshotRecord(r: OutboxRecord<TskHotpMutation>): OutboxRecord<TskHotpMutation> {
-  if (!r || typeof r !== 'object') throw new ContractValidationError('record is not an object');
-  const m = r.mutation as unknown as { tumblerId?: unknown; counter?: unknown } | null;
-  if (!m || typeof m !== 'object') throw new ContractValidationError('record.mutation is not an object');
+  const v = assertPlainData(r, RECORD_KEYS, 'record');
+  const m = assertPlainData(v.mutation, MUTATION_KEYS, 'record.mutation');
   return deepFreeze({
-    contractVersion: r.contractVersion, streamId: r.streamId, sourceEpoch: r.sourceEpoch,
-    sequence: r.sequence, fenceToken: r.fenceToken, opDigest: r.opDigest,
-    mutation: { tumblerId: m.tumblerId, counter: m.counter } as SanitizedMutation<TskHotpMutation>,
+    contractVersion: reqString(v.contractVersion, 'record.contractVersion'),
+    streamId: reqString(v.streamId, 'record.streamId'),
+    sourceEpoch: reqString(v.sourceEpoch, 'record.sourceEpoch'),
+    sequence: reqInt(v.sequence, 'record.sequence'),
+    fenceToken: reqString(v.fenceToken, 'record.fenceToken'),
+    opDigest: reqString(v.opDigest, 'record.opDigest'),
+    mutation: { tumblerId: reqString(m.tumblerId, 'record.mutation.tumblerId'), counter: reqInt(m.counter, 'record.mutation.counter') } as SanitizedMutation<TskHotpMutation>,
   }) as OutboxRecord<TskHotpMutation>;
 }
 function snapshotHead(h: SignedStreamHead): SignedStreamHead {
-  if (!h || typeof h !== 'object') throw new ContractValidationError('head is not an object');
+  const v = assertPlainData(h, HEAD_KEYS, 'head');
   return deepFreeze({
-    streamId: h.streamId, sequence: h.sequence, prevHeadDigest: h.prevHeadDigest, opDigest: h.opDigest,
-    keyId: h.keyId, alg: h.alg, headDigest: h.headDigest, signature: h.signature,
+    streamId: reqString(v.streamId, 'head.streamId'), sequence: reqInt(v.sequence, 'head.sequence'),
+    prevHeadDigest: reqString(v.prevHeadDigest, 'head.prevHeadDigest'), opDigest: reqString(v.opDigest, 'head.opDigest'),
+    keyId: reqString(v.keyId, 'head.keyId'), alg: reqString(v.alg, 'head.alg') as StreamHeadAlg,
+    headDigest: reqString(v.headDigest, 'head.headDigest'), signature: reqString(v.signature, 'head.signature'),
   }) as SignedStreamHead;
 }
 function snapshotAckReceipt(r: TskAckReceipt): TskAckReceipt {
-  if (!r || typeof r !== 'object') throw new ContractValidationError('ack receipt is not an object');
-  for (const k of ['streamId', 'sourceEpoch', 'opDigest', 'decision', 'receiverId', 'keyId', 'issuedAt', 'signature'] as const) {
-    if (typeof (r as unknown as Record<string, unknown>)[k] !== 'string') throw new ContractValidationError(`ack receipt field ${k} invalid`);
-  }
-  if (!Number.isInteger(r.sequence)) throw new ContractValidationError('ack receipt sequence invalid');
+  const v = assertPlainData(r, RECEIPT_KEYS, 'ack receipt');
   return deepFreeze({
-    streamId: r.streamId, sourceEpoch: r.sourceEpoch, sequence: r.sequence, opDigest: r.opDigest,
-    decision: r.decision, receiverId: r.receiverId, keyId: r.keyId, issuedAt: r.issuedAt, signature: r.signature,
+    streamId: reqString(v.streamId, 'receipt.streamId'), sourceEpoch: reqString(v.sourceEpoch, 'receipt.sourceEpoch'),
+    sequence: reqInt(v.sequence, 'receipt.sequence'), opDigest: reqString(v.opDigest, 'receipt.opDigest'),
+    decision: reqString(v.decision, 'receipt.decision') as ReceiverDecision, receiverId: reqString(v.receiverId, 'receipt.receiverId'),
+    keyId: reqString(v.keyId, 'receipt.keyId'), issuedAt: reqString(v.issuedAt, 'receipt.issuedAt'), signature: reqString(v.signature, 'receipt.signature'),
   }) as TskAckReceipt;
 }
 
@@ -346,11 +381,13 @@ CREATE TABLE IF NOT EXISTS tsk_hotp_consumed (
   PRIMARY KEY (stream_id, tumbler_id)
 );
 -- DURABLE stream-halt marker: a terminal (fork/stale/unsanitized/epoch) rejection
--- is a divergence that cannot be auto-recovered — the quarantined sequence would
--- otherwise leave every later sequence a permanent reject-gap. Writing this row in
--- the same tx as the quarantine makes the halt DURABLE and EXPLICIT: the publisher
--- refuses to drain a halted stream (no spin) until an operator investigates and
--- deletes this row (recovery is a governed, out-of-band operator action).
+-- is a divergence that cannot be auto-recovered. The quarantined sequence stays
+-- excluded and the receiver checkpoint cannot advance past it, so every later
+-- sequence is a permanent reject-gap. Writing this row in the same tx as the
+-- quarantine makes the halt DURABLE + EXPLICIT so the publisher refuses to spin.
+-- RECOVERY IS A GOVERNED REPAIR (out of this slice): unquarantine/repair the
+-- diverged record and epoch-resync the receiver. Deleting this row ALONE does NOT
+-- recover the stream — the reject-gap persists — so no delete-to-recover is offered.
 CREATE TABLE IF NOT EXISTS tsk_outbox_stream_halted (
   stream_id     text PRIMARY KEY CHECK (length(stream_id) BETWEEN 1 AND 512),
   source_epoch  text NOT NULL CHECK (length(source_epoch) BETWEEN 1 AND 512),
@@ -437,18 +474,11 @@ function requireReady(token: SchemaReadyToken, db?: PgTransactor): string {
   if (st.manifest !== TSK_OUTBOX_SCHEMA_MANIFEST || st.version !== TSK_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError('schema-readiness token attests a different manifest/version');
   return st.schema;
 }
-/**
- * @internal — NOT part of the public package API. It is deliberately EXCLUDED
- * from the package index (`index.ts` uses explicit named exports and omits this),
- * so `import { ... } from '@tsk/server'` cannot mint an unattested token. It is
- * imported test-only via the module path by the hermetic suite, which uses an
- * in-memory fake transactor that cannot perform a real catalog attestation.
- * NEVER call this in production — it bypasses the attestation the real gate does.
- */
-export function __internalUnsafeMintReadyToken(db: PgTransactor, schema: string): SchemaReadyToken {
-  assertSchemaIdentifier(schema);
-  return mintReadyToken({ db, schema, manifest: TSK_OUTBOX_SCHEMA_MANIFEST, version: TSK_OUTBOX_SCHEMA_VERSION });
-}
+// (R2/HIGH) There is NO test-only mint helper: it would ship in dist and permit
+// unattested construction via a deep import. Tests obtain a token the same way
+// production does — via `assertSchemaReady`/`provisionSchemaVersion` — using a fake
+// transactor that replays a real catalog fixture so attestation genuinely runs.
+// `mintReadyToken` stays module-private (never exported).
 
 async function assertVersionInTx(exec: PgExecutor): Promise<void> {
   const rows = (await exec.query('SELECT schema_version FROM tsk_outbox_meta WHERE id = 1')).rows;
@@ -695,7 +725,8 @@ export class PgTskPublisher {
 
   async drainOnce(): Promise<TskDrainResult> {
     // (MED) refuse a durably-halted stream up front — no spin, no permanent
-    // reject-gap loop. Recovery is an operator action (delete the halted row).
+    // reject-gap loop. Recovery is a GOVERNED repair (unquarantine + epoch-resync,
+    // out of this slice); clearing the marker alone does NOT recover the stream.
     if (await this.isHalted()) return { published: 0, acked: 0, quarantined: 0, retriable: false, halted: true };
     const leaseToken = randomUUID();
     if (!(await this.acquireLease(leaseToken))) return { published: 0, acked: 0, quarantined: 0, retriable: true, halted: false };
