@@ -55,6 +55,21 @@ export type {
   PgTskPublisherOptions,
   TskDrainResult,
 } from './tsk-hotp-outbox-pg.js';
+export {
+  HttpOutboxTransport,
+  OutboxTransportError,
+  MemoryReplayNonceStore,
+  PgReplayNonceStore,
+  TSK_TRANSPORT_NONCE_SCHEMA,
+  createHttpOutboxReceiver,
+} from './http-outbox-transport.js';
+export type {
+  ReplayNonceStore,
+  FetchLike,
+  FetchResponseLike,
+  HttpOutboxTransportOptions,
+  HttpOutboxReceiverOptions,
+} from './http-outbox-transport.js';
 
 import { MemoryTumblerStore } from './store.js';
 import { TSKProvisioner } from './provisioner.js';

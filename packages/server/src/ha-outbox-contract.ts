@@ -59,6 +59,17 @@ export class ContractValidationError extends Error {
   }
 }
 
+/**
+ * Generic transport-failure contract (kept in core to avoid a circular import between
+ * the publisher and a concrete transport). A transport error carrying `retriable === false`
+ * is TERMINAL — the delivery can never succeed (auth/protocol/validation), so the
+ * publisher must quarantine + halt rather than retry it forever. Anything else (a plain
+ * throw, `retriable === true`, or no marker) is TRANSIENT — left undelivered for retry.
+ */
+export function isTerminalTransportError(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { retriable?: unknown }).retriable === false;
+}
+
 function assertId(value: string, label: string): void {
   if (typeof value !== 'string' || !ID_PATTERN.test(value)) {
     throw new ContractValidationError(`${label} must match ${ID_PATTERN} (bounded, no separators)`);

@@ -69,6 +69,9 @@ export interface UltraVerifyOptions {
   tskConfig?: TSKServerConfig;
   /** Maximum age/skew accepted for the per-request BPC snapshot. Default 60s. */
   bpcSnapshotMaxAgeMs?: number;
+  /** Injectable clock (default Date.now) so snapshot age/skew can be evaluated against a
+   *  FIXED reference time — deterministic under test, unchanged in production. */
+  now?: () => number;
   /** Resolve a verified BPC pairId to the only allowed TSK clientId. */
   identityBinding: {
     resolve: (pairId: string) => Promise<string | null>;
@@ -160,7 +163,8 @@ export async function verifyUltraRequest(
       return { ok: false, pairId: resultPairId, error: 'BPC: INVALID_SNAPSHOT_MAX_AGE', layers: [] };
     }
     const resultSnapshot = ownDataValue(result, 'snapshot');
-    if (!validSnapshot(resultSnapshot, resultPairId, Date.now(), configuredMaxAge)) {
+    const nowMs = (options.now ?? Date.now)();
+    if (!validSnapshot(resultSnapshot, resultPairId, nowMs, configuredMaxAge)) {
       return { ok: false, pairId: resultPairId, error: 'BPC: INVALID_AUTH_SNAPSHOT', layers: [] };
     }
 
