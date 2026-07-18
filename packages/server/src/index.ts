@@ -73,8 +73,9 @@ export {
   verifyGuard,
   fenceTokenForEpoch,
   encodeEvidence,
+  decodeEvidence,
   assertRedisAuthority,
-  assertFencedAuthority,
+  reconcileFencedRedis,
   provisionControlSchema,
   assertControlSchemaReady,
   FenceAuthorityQuarantineError,
@@ -82,6 +83,7 @@ export {
 export type {
   GuardKeyResolver,
   ControlSchemaReadyToken,
+  HaControlPolicy,
   ProvisioningState,
   LeaseState,
   WitnessState,

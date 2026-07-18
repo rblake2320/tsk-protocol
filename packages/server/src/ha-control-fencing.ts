@@ -154,12 +154,24 @@ export function assertRedisAuthority(r: FenceRecord | null, witnessEpoch: number
   }
 }
 
-/** (H4) On an idempotent post-FENCED retry, the Redis authority MUST still reflect the fenced
- *  epoch (or a later one) — a NULL/rolled-back record means the authority was lost since the fence
- *  and the promotion cannot be reported as durable. Pure/deterministic. */
-export function assertFencedAuthority(r: FenceRecord | null, fencedEpoch: number): void {
+/** (H4 + R5-H2) Reconcile the Redis authority on an idempotent post-FENCED retry against the
+ *  SIGNED FENCED evidence. At the fenced epoch the Redis record must EXACTLY match the signed
+ *  tuple (active + node + command + expiry + claim digest) — a wrong node/command, inactive,
+ *  or altered-expiry record is a loss/tamper → quarantine. A LATER Redis epoch is admissible
+ *  ONLY when the signed witness has itself advanced to at least that epoch (a real later
+ *  promotion); a null/rolled-back record is a loss. Pure/deterministic — exhaustively tested. */
+export function reconcileFencedRedis(r: FenceRecord | null, evidence: FenceEvidence, witnessEpoch: number, commandId: string): void {
   if (r === null) throw new FenceAuthorityQuarantineError('Redis authority absent on a FENCED retry — loss/rollback; quarantine');
-  if (r.fenceEpoch < fencedEpoch) throw new FenceAuthorityQuarantineError(`Redis epoch ${r.fenceEpoch} < fenced ${fencedEpoch} on retry — rollback; quarantine`);
+  const fenced = evidence.witnessTo;
+  if (r.fenceEpoch < fenced) throw new FenceAuthorityQuarantineError(`Redis epoch ${r.fenceEpoch} < fenced ${fenced} on retry — rollback; quarantine`);
+  if (r.fenceEpoch === fenced) {
+    if (r.active !== true || r.nodeId !== evidence.redisNodeId || r.commandId !== commandId || r.expiresAt !== evidence.redisExpiresMs || claimDigest(r) !== evidence.redisClaimDigest) {
+      throw new FenceAuthorityQuarantineError('Redis record does not match the signed FENCED evidence tuple on retry — quarantine');
+    }
+    return;
+  }
+  // r.fenceEpoch > fenced: only admissible if the SIGNED witness backs the later epoch.
+  if (witnessEpoch < r.fenceEpoch) throw new FenceAuthorityQuarantineError(`Redis epoch ${r.fenceEpoch} ahead of the signed witness ${witnessEpoch} on retry — quarantine`);
 }
 const CUTOVER_TERMINAL = new Set(['ACTIVE', 'ABORTED']);
 const CUTOVER_FROZEN = new Set(['PREPARING', 'FENCED', 'IMPORTING', 'READY']); // lease grants frozen while a promotion is in-flight
@@ -354,10 +366,14 @@ async function controlManifest(exec: PgExecutor): Promise<string> {
   ].join('\n');
 }
 
-/** COMPILED expected full-catalog manifest digest (pinned; computed from HA_CONTROL_PG_SCHEMA on
- *  PostgreSQL 16). Attestation compares the LIVE catalog to THIS — a dropped/added CHECK, column,
- *  index, trigger, or policy fails closed. Env override supports the pin-capture bootstrap only. */
-export const HA_CONTROL_MANIFEST_DIGEST = process.env['TSK_HA_CONTROL_MANIFEST_DIGEST'] ?? '87ac344f15ce054c71c8e8e6b26884371432b2ddf989c27a96ed9f067a4398c0';
+/** COMPILED expected full-catalog manifest digest — pinned in source, computed from
+ *  HA_CONTROL_PG_SCHEMA on PostgreSQL 16. Attestation compares the LIVE catalog to THIS; a
+ *  dropped/added CHECK, column, index, trigger, or policy fails closed. There is deliberately NO
+ *  runtime/env override (R5-H1: that would let a deployment bless an arbitrary live schema and
+ *  defeat the pin). To RE-PIN after an intentional DDL change, run provisionControlSchema against
+ *  the new schema in an OFFLINE, code-reviewed step and copy the digest reported in the attestation
+ *  error ("live catalog digest <D>") into this constant. */
+export const HA_CONTROL_MANIFEST_DIGEST = '87ac344f15ce054c71c8e8e6b26884371432b2ddf989c27a96ed9f067a4398c0';
 
 /** Attest the live catalog hashes to the pinned expected manifest (fail-closed, NOT TOFU). */
 async function attestControlSchema(exec: PgExecutor): Promise<string> {
@@ -394,11 +410,14 @@ export async function assertControlSchemaReady(db: PgTransactor, schema: string)
   await db.transaction(async (exec) => {
     await enterCriticalTx(exec, schema);
     manifestDigest = await attestControlSchema(exec); // live catalog === COMPILED pinned expected (not TOFU)
-    const rows = (await exec.query('SELECT version FROM tsk_ha_schema WHERE id = 1')).rows;
+    const rows = (await exec.query('SELECT version, catalog_manifest FROM tsk_ha_schema WHERE id = 1')).rows;
     if (!rows.length) throw new ContractValidationError('control schema is not provisioned (no tsk_ha_schema row)');
     if (vInt(rows[0].version, 'schema version', 1, MAX_EPOCH) !== CONTROL_SCHEMA_VERSION) {
       throw new ContractValidationError(`control schema version mismatch: db=${rows[0].version} expected=${CONTROL_SCHEMA_VERSION}`);
     }
+    // (R5-H3) the PERSISTED authority row must also equal the compiled pinned digest — catch an
+    // altered stamp even if the live catalog was reverted to match.
+    if (String(rows[0].catalog_manifest) !== HA_CONTROL_MANIFEST_DIGEST) throw new ContractValidationError('control schema authority row (catalog_manifest) does not match the compiled pinned digest');
   });
   return mintReady({ db, schema, version: CONTROL_SCHEMA_VERSION, manifestDigest });
 }
@@ -410,9 +429,12 @@ export async function provisionControlSchema(db: PgTransactor, schema: string): 
   await db.transaction(async (exec) => {
     await enterCriticalTx(exec, schema);
     manifestDigest = await attestControlSchema(exec); // fail-closed against the compiled pinned manifest
-    const rows = (await exec.query('SELECT version FROM tsk_ha_schema WHERE id = 1 FOR UPDATE')).rows;
+    const rows = (await exec.query('SELECT version, catalog_manifest FROM tsk_ha_schema WHERE id = 1 FOR UPDATE')).rows;
     if (rows.length) {
-      if (vInt(rows[0].version, 'schema version', 1, MAX_EPOCH) === CONTROL_SCHEMA_VERSION) return;
+      if (vInt(rows[0].version, 'schema version', 1, MAX_EPOCH) === CONTROL_SCHEMA_VERSION) {
+        if (String(rows[0].catalog_manifest) !== HA_CONTROL_MANIFEST_DIGEST) throw new ContractValidationError('control schema authority row (catalog_manifest) does not match the compiled pinned digest'); // R5-H3
+        return;
+      }
       throw new ContractValidationError('control schema already provisioned at a different version');
     }
     affectedOne(await exec.query('INSERT INTO tsk_ha_schema (id, version, catalog_manifest) VALUES (1, $1, $2)', [CONTROL_SCHEMA_VERSION, manifestDigest]), 'fresh control schema provision');
@@ -427,14 +449,18 @@ export interface WitnessState { streamId: string; epoch: number; state: 'incompl
 export interface LeaseState { streamId: string; leaseId: string; holderNodeId: string; epoch: number; grantSeq: number; status: 'active' | 'revoked'; grantedMaxExpiryMs: number; grantCommandId: string; grantDigest: string; }
 export interface CutoverState { streamId: string; epoch: number; commandId: string; seqno: number; phase: 'PREPARING' | 'FENCED' | 'IMPORTING' | 'READY' | 'ACTIVE' | 'ABORTED'; evidence: string | null; stateDigest: string; }
 /** Caller-supplied bounds for a fence-advance. The control clock is read IN-TX (never trusted
- *  from the caller); only the bounded margins + the Redis claim TTL come from the caller. */
+ *  from the caller); only the bounded safety margin + the Redis claim TTL come from the caller.
+ *  The min-claim-remaining budget is NOT here — it is a deployment policy bound to the authority
+ *  (HaControlFencing) so a caller cannot weaken it per call (R5-M1). */
 export interface FenceProof {
   safetyMarginMs: number;
   claimExpiresAtMs: number;
-  /** Configured worst-case (final-tx + commit + clock-skew) budget the Redis claim TTL MUST still
-   *  cover at the FENCED commit, validated against the control-DB clock IN the final tx. This is
-   *  MECHANISM EVIDENCE only — NOT a universal commit-time or source-precommit guarantee; the
-   *  non-bypassable in-tx SOURCE fence is a later milestone. */
+}
+/** Deployment policy bound to the control authority (NOT per call). */
+export interface HaControlPolicy {
+  /** STRICTLY-POSITIVE configured worst-case (final-tx + commit + clock-skew) budget the Redis
+   *  claim TTL MUST still cover at the FENCED commit, validated against the control-DB clock IN the
+   *  final tx. MECHANISM EVIDENCE only — NOT a universal commit-time/source-precommit guarantee. */
   minClaimRemainingMs: number;
 }
 export interface FenceEvidence {
@@ -476,13 +502,16 @@ function verifyChain(resolver: GuardKeyResolver, history: Linked[], head: Linked
  */
 export class HaControlFencing {
   private readonly schema: string;
+  private readonly minClaimRemainingMs: number;
   constructor(
     private readonly db: PgTransactor,
     private readonly signer: GuardSigner,
     private readonly resolver: GuardKeyResolver,
     ready: ControlSchemaReadyToken,
+    policy: HaControlPolicy,
   ) {
     this.schema = requireReady(ready, db).schema;
+    this.minClaimRemainingMs = vInt(policy?.minClaimRemainingMs, 'policy.minClaimRemainingMs', 1, MAX_CLAIM_REMAINING_MS); // strictly positive
   }
 
   /** Exact-session SERIALIZABLE + pinned schema + per-stream advisory lock. */
@@ -752,22 +781,25 @@ export class HaControlFencing {
     const newHolder = vId(holderNodeId, ID_RE, 'holderNodeId');
     const margin = vInt(proof.safetyMarginMs, 'safetyMarginMs', 0, MAX_SAFETY_MARGIN_MS);
     const claimExpiry = vInt(proof.claimExpiresAtMs, 'claimExpiresAtMs', 1, MAX_MS);
-    const minRemaining = vInt(proof.minClaimRemainingMs, 'minClaimRemainingMs', 0, MAX_CLAIM_REMAINING_MS);
+    const minRemaining = this.minClaimRemainingMs; // deployment policy (strictly positive), not per call (R5-M1)
 
     // Tx1: preconditions + capture the FROZEN revoked-lease evidence + Redis-not-lost cross-check.
     const pre = await this.criticalTx(s, async (exec) => {
       const cut = await this.readCutover(exec, s);
-      if (cut && cut.phase === 'FENCED' && cut.commandId === cmd && cut.epoch === target) return { done: true as const };
-      if (!cut || cut.phase !== 'PREPARING' || cut.commandId !== cmd || cut.epoch !== target) throw new ContractValidationError('no matching PREPARING intent for this promotion');
       const w = await this.readWitness(exec, s);
+      if (cut && cut.phase === 'FENCED' && cut.commandId === cmd && cut.epoch === target) {
+        return { done: true as const, evidence: cut.evidence, witnessEpoch: w ? w.epoch : -1 };
+      }
+      if (!cut || cut.phase !== 'PREPARING' || cut.commandId !== cmd || cut.epoch !== target) throw new ContractValidationError('no matching PREPARING intent for this promotion');
       if (!w || w.state !== 'provisioned') throw new FenceAuthorityQuarantineError('stream not provisioned');
       if (w.epoch !== target - 1) throw new ContractValidationError(`witness epoch ${w.epoch} is not targetEpoch-1 (${target - 1})`);
       const ev = await this.proveOldFenced(exec, s, target, margin);
       assertRedisAuthority(await fencingStore.current(), w.epoch, cmd, target);
       return { done: false as const, ev, witnessFrom: w.epoch };
     });
-    if (pre.done) { // H7 idempotent retry — but still RECONCILE Redis (H4), never report success blind
-      assertFencedAuthority(await fencingStore.current(), target);
+    if (pre.done) { // H7 idempotent retry — RECONCILE Redis vs the SIGNED FENCED evidence (R5-H2), never blind
+      if (!pre.evidence) throw new FenceAuthorityQuarantineError('FENCED cutover is missing its signed evidence — quarantine');
+      reconcileFencedRedis(await fencingStore.current(), decodeEvidence(pre.evidence), pre.witnessEpoch, cmd);
       return { epoch: target, fenceToken: fenceTokenForEpoch(target), evidence: null, idempotent: true };
     }
 
@@ -783,7 +815,9 @@ export class HaControlFencing {
     return this.criticalTx(s, async (exec) => {
       const cut = await this.readCutover(exec, s);
       if (cut && cut.phase === 'FENCED' && cut.commandId === cmd && cut.epoch === target) {
-        assertFencedAuthority(await fencingStore.current(), target); // H4: reconcile Redis on retry
+        const wr = await this.readWitness(exec, s); // R5-H2: reconcile Redis vs signed evidence on retry
+        if (!cut.evidence) throw new FenceAuthorityQuarantineError('FENCED cutover is missing its signed evidence — quarantine');
+        reconcileFencedRedis(await fencingStore.current(), decodeEvidence(cut.evidence), wr ? wr.epoch : -1, cmd);
         return { epoch: target, fenceToken: fenceTokenForEpoch(target), evidence: null, idempotent: true };
       }
       if (!cut || cut.phase !== 'PREPARING' || cut.commandId !== cmd || cut.epoch !== target) throw new ContractValidationError('intent changed under promotion — abort');
@@ -825,4 +859,43 @@ export class HaControlFencing {
 /** Canonical, order-fixed evidence encoding bound into the signed FENCED transition (H6). */
 export function encodeEvidence(e: FenceEvidence): string {
   return b64u(frame('tsk_ha_evidence/v1', e.holderNodeId, e.grantSeq, e.grantDigest, e.maxExpiryMs, e.controlNowMs, e.safetyMarginMs, e.redisNodeId, e.redisEpoch, e.redisExpiresMs, e.redisClaimDigest, e.witnessFrom, e.witnessTo, e.proofMode));
+}
+
+/** Parse the tagged length-prefixed framing back into field strings (evidence has no null fields). */
+function unframe(buf: Buffer): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < buf.length) {
+    const tag = buf[i]; i += 1;
+    if (tag === 0) { out.push(' '); continue; }
+    if (tag !== 1) throw new ContractValidationError('malformed evidence frame tag');
+    if (i + 4 > buf.length) throw new ContractValidationError('truncated evidence frame length');
+    const len = buf.readUInt32BE(i); i += 4;
+    if (i + len > buf.length) throw new ContractValidationError('truncated evidence frame body');
+    out.push(buf.subarray(i, i + len).toString('utf8')); i += len;
+  }
+  return out;
+}
+
+/** Decode + validate a signed FENCED evidence string (inverse of encodeEvidence). */
+export function decodeEvidence(s: string): FenceEvidence {
+  if (typeof s !== 'string' || !B64U_CANON.test(s)) throw new ContractValidationError('invalid evidence encoding');
+  const f = unframe(Buffer.from(s, 'base64url'));
+  if (f.length !== 14 || f[0] !== 'tsk_ha_evidence/v1') throw new ContractValidationError('unexpected evidence layout');
+  if (f[13] !== 'lease-expiry-control-clock') throw new ContractValidationError('unknown evidence proofMode');
+  return {
+    holderNodeId: vId(f[1], ID_RE, 'evidence.holderNodeId'),
+    grantSeq: vInt(f[2], 'evidence.grantSeq', 1, MAX_SEQ),
+    grantDigest: vDigest(f[3], 'evidence.grantDigest'),
+    maxExpiryMs: vInt(f[4], 'evidence.maxExpiryMs', 0, MAX_MS),
+    controlNowMs: vInt(f[5], 'evidence.controlNowMs', 0, MAX_MS),
+    safetyMarginMs: vInt(f[6], 'evidence.safetyMarginMs', 0, MAX_SAFETY_MARGIN_MS),
+    redisNodeId: vId(f[7], ID_RE, 'evidence.redisNodeId'),
+    redisEpoch: vInt(f[8], 'evidence.redisEpoch', 1, MAX_EPOCH),
+    redisExpiresMs: vInt(f[9], 'evidence.redisExpiresMs', 0, MAX_MS),
+    redisClaimDigest: vDigest(f[10], 'evidence.redisClaimDigest'),
+    witnessFrom: vInt(f[11], 'evidence.witnessFrom', 0, MAX_EPOCH),
+    witnessTo: vInt(f[12], 'evidence.witnessTo', 1, MAX_EPOCH),
+    proofMode: 'lease-expiry-control-clock',
+  };
 }

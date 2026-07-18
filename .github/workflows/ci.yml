@@ -48,8 +48,10 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
-      # control DB: a THIRD genuinely independent PostgreSQL 16 (distinct failure
-      # domain from A/B and from Redis) for the PR2a HA fencing-foundation drill.
+      # control DB: a THIRD independent PostgreSQL 16 INSTANCE / state authority (separate
+      # service, no shared state with A/B or Redis) for the PR2a HA fencing-foundation drill.
+      # NOTE: on a single CI runner these are independent instances, NOT independent physical
+      # failure domains — real fault-domain separation is a deployment/topology responsibility.
       postgres_control:
         image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:

@@ -19,8 +19,8 @@ import { Redis } from 'ioredis';
 import {
   HA_CONTROL_PG_SCHEMA, HA_CONTROL_TABLES, HaControlFencing, GuardSigner,
   NodePostgresTransactor, RedisFencingStore, FenceAuthorityQuarantineError,
-  provisionControlSchema, assertControlSchemaReady, assertRedisAuthority, assertFencedAuthority,
-  type GuardKeyResolver, type FenceProof, type ControlSchemaReadyToken,
+  provisionControlSchema, assertControlSchemaReady, assertRedisAuthority, reconcileFencedRedis,
+  type GuardKeyResolver, type FenceProof, type ControlSchemaReadyToken, type FenceEvidence, type HaControlPolicy,
 } from './packages/server/dist/index.js';
 
 const PG_URL = process.env['TSK_TEST_CONTROL_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -34,7 +34,9 @@ const resolver: GuardKeyResolver = { resolve: (kid) => (kid === GUARD_KEY ? guar
 const revokedResolver: GuardKeyResolver = { resolve: () => null };
 const signer = new GuardSigner(GUARD_KEY, guardSecret);
 const HOUR = 3_600_000;
+const POLICY: HaControlPolicy = { minClaimRemainingMs: 5_000 }; // strictly-positive deployment budget (R5-M1)
 const rec = (nodeId: string, fenceEpoch: number, commandId: string, expiresAt = 1) => ({ nodeId, fenceEpoch, expiresAt, commandId, active: true });
+const evi = (over: Partial<FenceEvidence>): FenceEvidence => ({ holderNodeId: 'A', grantSeq: 1, grantDigest: '0'.repeat(64), maxExpiryMs: 0, controlNowMs: 0, safetyMarginMs: 0, redisNodeId: 'B', redisEpoch: 1, redisExpiresMs: 1000, redisClaimDigest: '0'.repeat(64), witnessFrom: 0, witnessTo: 1, proofMode: 'lease-expiry-control-clock', ...over });
 
 let passed = 0;
 async function check(name: string, fn: () => Promise<void>) { await fn(); passed++; console.log(`  ok - ${name}`); }
@@ -52,11 +54,11 @@ async function main() {
   const histCount = async (t: string, sid: string) => Number((await pool.query(`SELECT count(*)::int AS n FROM ${t} WHERE stream_id=$1`, [sid])).rows[0].n);
 
   const ready: ControlSchemaReadyToken = await provisionControlSchema(tx as never, 'public');
-  const ctl = new HaControlFencing(tx as never, signer, resolver, ready);
+  const ctl = new HaControlFencing(tx as never, signer, resolver, ready, POLICY);
 
   // ── schema attestation (pinned, not TOFU) + drift + stale-token ─────────────
   await check('attestation: forged/foreign readiness token rejected', async () => {
-    assert.throws(() => new HaControlFencing(tx as never, signer, resolver, Object.freeze({}) as unknown as ControlSchemaReadyToken), /forged or foreign token/);
+    assert.throws(() => new HaControlFencing(tx as never, signer, resolver, Object.freeze({}) as unknown as ControlSchemaReadyToken, POLICY), /forged or foreign token/);
   });
   await check('attestation: catalog drift + a stale token cannot be re-minted (fail closed vs pinned)', async () => {
     await pool.query('ALTER TABLE tsk_ha_lease_head ADD COLUMN drift_col int');
@@ -116,7 +118,7 @@ async function main() {
     await assert.rejects(() => ctl.lease(SID), /guard signature/);
     await pool.query('DELETE FROM tsk_ha_lease_head WHERE stream_id=$1', [SID]);
     await pool.query(`INSERT INTO tsk_ha_lease_head SELECT * FROM (SELECT stream_id, lease_id, holder_node_id, epoch, grant_seq, status, granted_max_expiry_ms, grant_command_id, prev_grant_digest, grant_digest, guard_key_id, guard_signature FROM tsk_ha_lease_history WHERE stream_id=$1 AND grant_seq=3) x`, [SID]);
-    const ctlRevoked = new HaControlFencing(tx as never, signer, revokedResolver, ready);
+    const ctlRevoked = new HaControlFencing(tx as never, signer, revokedResolver, ready, POLICY);
     await assert.rejects(() => ctlRevoked.lease(SID), /unknown or revoked guard keyId/);
   });
 
@@ -128,9 +130,18 @@ async function main() {
     assert.throws(() => assertRedisAuthority(rec('B', 5, 'other'), 2, 'c', 3), FenceAuthorityQuarantineError); // R>W not our intent
     assert.doesNotThrow(() => assertRedisAuthority(rec('B', 3, 'c'), 2, 'c', 3));            // R>W == exact active intent
     assert.doesNotThrow(() => assertRedisAuthority(rec('B', 2, 'c'), 2, 'c', 3));            // R==W
-    assert.throws(() => assertFencedAuthority(null, 1), FenceAuthorityQuarantineError);       // fenced retry, Redis lost
-    assert.throws(() => assertFencedAuthority(rec('B', 0 as never, 'c'), 2), FenceAuthorityQuarantineError); // fenced retry, rollback
-    assert.doesNotThrow(() => assertFencedAuthority(rec('B', 2, 'c'), 2));
+  });
+  await check('FENCED-retry reconcile (R5-H2): rejects null/rollback/wrong-node/wrong-command/inactive/expiry/digest; later epoch needs witness', async () => {
+    const e = evi({ witnessTo: 1, redisNodeId: 'B', redisExpiresMs: 1000, redisClaimDigest: '0'.repeat(64) });
+    assert.throws(() => reconcileFencedRedis(null, e, 1, 'c'), FenceAuthorityQuarantineError);                                   // lost
+    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'c', 1000), evi({ witnessTo: 2 }), 2, 'c'), FenceAuthorityQuarantineError); // R<fenced rollback
+    assert.throws(() => reconcileFencedRedis(rec('X', 1, 'c', 1000), e, 1, 'c'), FenceAuthorityQuarantineError);                 // wrong node
+    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'other', 1000), e, 1, 'c'), FenceAuthorityQuarantineError);             // wrong command
+    assert.throws(() => reconcileFencedRedis({ ...rec('B', 1, 'c', 1000), active: false }, e, 1, 'c'), FenceAuthorityQuarantineError); // inactive
+    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'c', 999), e, 1, 'c'), FenceAuthorityQuarantineError);                  // altered expiry
+    assert.throws(() => reconcileFencedRedis(rec('B', 1, 'c', 1000), e, 1, 'c'), FenceAuthorityQuarantineError);                 // digest mismatch (bogus pinned digest)
+    assert.throws(() => reconcileFencedRedis(rec('B', 2, 'c', 1000), e, 1, 'c'), FenceAuthorityQuarantineError);                 // later epoch, witness behind
+    assert.doesNotThrow(() => reconcileFencedRedis(rec('B', 2, 'c', 1000), e, 2, 'c'));                                          // later epoch, witness backs it
   });
 
   // ── control-clock fence-advance with REAL Redis (null/W0 allowed end-to-end) ─
@@ -142,7 +153,7 @@ async function main() {
     await ctl.writeLease({ streamId: SID2, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a1' });
     await ctl.beginPromotionIntent(SID2, 'c1', 1);
     await assert.rejects(() => ctl.writeLease({ streamId: SID2, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a2' }), /frozen while a promotion is in-flight/);
-    const proof: FenceProof = { safetyMarginMs: 0, minClaimRemainingMs: 5_000, claimExpiresAtMs: (await nowMs()) + HOUR };
+    const proof: FenceProof = { safetyMarginMs: 0, claimExpiresAtMs: (await nowMs()) + HOUR };
     await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, proof), FenceAuthorityQuarantineError); // not revoked
     await ctl.writeLease({ streamId: SID2, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: past, grantCommandId: 'a3' });
     await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, { ...proof, safetyMarginMs: HOUR }), /not proven fenced/); // margin keeps A inside horizon
@@ -165,7 +176,7 @@ async function main() {
     await ctl.beginPromotionIntent(SID3, 'c1', 1);
     await ctl.writeLease({ streamId: SID3, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: past, grantCommandId: 't2' });
     const tooSoon = (await nowMs()) + 2_000; // remaining 2s < 5s budget
-    await assert.rejects(() => ctl.advanceEpoch(SID3, 'c1', 1, 'B', storeFor(SID3), { safetyMarginMs: 0, minClaimRemainingMs: 5_000, claimExpiresAtMs: tooSoon }), /below the configured min budget/);
+    await assert.rejects(() => ctl.advanceEpoch(SID3, 'c1', 1, 'B', storeFor(SID3), { safetyMarginMs: 0, claimExpiresAtMs: tooSoon }), /below the configured min budget/);
   });
 
   await check('one active intent + target==witness+1 + integer-range rejection', async () => {
@@ -183,8 +194,8 @@ async function main() {
     const SID5 = 'tsk:pair:race/v1';
     await ctl.provision(SID5, 'g-race');
     const txA = new NodePostgresTransactor(pool as never), txB = new NodePostgresTransactor(pool as never);
-    const ctlA = new HaControlFencing(txA as never, signer, resolver, await assertControlSchemaReady(txA as never, 'public'));
-    const ctlB = new HaControlFencing(txB as never, signer, resolver, await assertControlSchemaReady(txB as never, 'public'));
+    const ctlA = new HaControlFencing(txA as never, signer, resolver, await assertControlSchemaReady(txA as never, 'public'), POLICY);
+    const ctlB = new HaControlFencing(txB as never, signer, resolver, await assertControlSchemaReady(txB as never, 'public'), POLICY);
     const gate = await pool.connect();
     await gate.query('BEGIN');
     await gate.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [SID5]); // hold the per-stream lock
