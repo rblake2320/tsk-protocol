@@ -29,26 +29,39 @@ pinned canonical encoding (JCS / I-JSON) before hashing/signing.
   `{command_id, epoch, N, signedHeadDigest@N, sourceStateDigest@N, sourceNodeId, sourceSig}`, where
   `N` = the max committed source head at freeze, `signedHeadDigest@N` from the existing head chain, and
   `sourceStateDigest@N` = a digest over the complete canonical sorted state-at-`N`.
+- The fence/status is **one authoritative A-PG row**; the append lock+check and the revoke + read of
+  `N`/head/state are **linearized by SERIALIZABLE tx ordering** on that row.
 - **Control binds the `SourceFrozenReceipt` BEFORE the Redis/witness `FENCED` advance** — a new
   versioned **`SOURCE_FENCED`** cutover phase (`PREPARING → SOURCE_FENCED → FENCED`), a signed
   forward-CAS on the PR2a cutover head. The migration bumps `CONTROL_SCHEMA_VERSION` + re-pins the
   manifest digest (offline, code-reviewed — PR2a R5-H1). Frozen `N` is provable ONLY after the A-PG
-  revoke commits (or STONITH/reaper); a source-PG restore that rolls back is caught by the PR2b-0
-  external witness (binds `system_identifier` + max seq + `signedHeadDigest@N`).
+  revoke commits (or STONITH/reaper), and the external witness **synchronously + monotonically binds
+  the EXACT frozen `N` + `signedHeadDigest@N` + `sourceStateDigest@N` BEFORE `SOURCE_FENCED`** (a
+  stale periodic witness misses a suffix rollback); a source-PG restore/regression → quarantine.
 
 ## 2. Complete export (A frozen) — one manifest root, dual independent signatures
 
-- With A frozen, export the **complete canonical source history `1..N`** (each record's immutable
-  fields + `opDigest`) **and** the **complete sorted state-at-`N`** in **bounded chunks**
-  (`maxChunkBytes`/`maxChunkItems`). Each chunk carries a **chunk digest**; all chunk digests roll (in
-  pinned order) into **one `manifestRoot`**.
-- The `SourceAuthoritySnapshot` manifest =
-  `{manifestSchemaVersion, streamId, epoch, N, signedHeadDigest@N, sourceStateDigest@N, chunkCount,
-  manifestRoot, canonicalDigest}`. **Source signs** it. The **guard INDEPENDENTLY replays the full
-  history `1..N` (recomputing the head chain from `opDigest`s) + the full state-at-`N`, matches
-  `signedHeadDigest@N` / `sourceStateDigest@N` / `manifestRoot`, and signs** — dual signatures under
-  **independent custody** (source sig then guard sig; not one atomic tx). **NO MMR, no historical
-  `S`/`C`, no tail, no new registry/state-map.**
+- With A frozen, export the **complete canonical source history `1..N`** — for every record the
+  **FULL canonical sanitized mutation PAYLOAD + all signed-head fields (sequence, prev/head digest,
+  signature, keyId, alg)** (not merely immutable fields + `opDigest` — `opDigest` alone cannot replay
+  or materialize state) — **and** the complete sorted state-at-`N`, in **bounded chunks**
+  (`maxChunkBytes`/`maxChunkItems`).
+- **A single versioned canonical REPLAY function** is the one authority: guard/B **recompute
+  `opDigest` from the payload, verify every head signature + prev/head link `1..N`, and DERIVE state
+  by replay** — **never trusting the exported state-at-`N`**. `signedHeadDigest@N` and
+  `sourceStateDigest@N` are **comparison OUTPUTS** of that replay, **never replay inputs**; the frozen
+  receipt (§1) uses the same function.
+- **Historical verification keys** required by `1..N` must resolve under the **EXISTING verifier
+  policy** (#10 key handling); a missing / revoked / unknown key **fails closed**. **No new registry.**
+- **`manifestRoot` is versioned + length-prefixed over an EXACT ordered chunk INVENTORY** — each entry
+  `{kind, ordinal, seqFrom, seqTo, itemCount, byteDigest}` covering exactly `1..N` with **no gaps /
+  extras**, so reorder / truncation / substitution / a missing or duplicate chunk fail. Manifest =
+  `{manifestSchemaVersion, streamId, epoch, commandId, sourceNodeId, N, frozenReceiptDigest,
+  signedHeadDigest@N, sourceStateDigest@N, chunkCount, inventory, manifestRoot, canonicalDigest}`
+  (binds the `commandId`, `sourceNodeId`, and `frozenReceiptDigest`). **Source signs**; the **guard
+  verifies the exact active cutover command + the frozen receipt FIRST, then INDEPENDENTLY replays +
+  verifies + signs** — dual signatures under **independent custody** (source sig then guard sig; not
+  one atomic tx). **NO MMR, no historical `S`/`C`, no tail, no new registry/state-map.**
 
 ## 3. Receiver B — stage, replay, verify, one atomic flip, `BFinalizedReceipt`
 
@@ -60,18 +73,23 @@ pinned canonical encoding (JCS / I-JSON) before hashing/signing.
   `manifestRoot`** and matches the manifest; verifies **both** source and guard signatures; verifies
   `epoch`/`streamId`/`sourceNodeId` and **B `system_identifier` distinct from A and control**
   (attested). B never reads the control DB in its tx (verifies the signed manifest bundle).
-- Only if all pass: **one atomic pointer flip** makes the generation B's authoritative
-  **receiver/candidate** state (NOT writable source — that is PR2c), and B emits a signed
-  **`BFinalizedReceipt`** = `{command_id, epoch, N, generationId, signedHeadDigest@N,
-  sourceStateDigest@N, B system_identifier, bSig}`.
+- Only if all pass, B **seals** the generation, then **ONE SERIALIZABLE CAS tx** installs
+  checkpoint/head/state, **flips the singleton generation pointer**, and **durably stores the exact
+  immutable signed receipt body** — so post-flip crash recovery can never reconstruct an *unbound*
+  receipt. The generation is authoritative **receiver/candidate** state (NOT writable source — PR2c).
+  **`BFinalizedReceipt`** binds `{commandId, epoch, N, generationId, frozenReceiptDigest,
+  manifestDigest, manifestRoot, sourceSigId+digest, guardSigId+digest, signedHeadDigest@N,
+  sourceStateDigest@N, B system_identifier, bSig}` — the `commandId` and all digests are **derived
+  from the manifest**, not free-standing.
 
 ## 4. Control cutover ordering (no ready-before-flip ambiguity)
 
 `PREPARING → SOURCE_FENCED` (bind `SourceFrozenReceipt`) `→ FENCED` (PR2a Redis+witness) `→ IMPORTING`
 (**only after** the freeze receipt is bound) `→ READY` (**only AFTER** control verifies the
-`BFinalizedReceipt` — B has already flipped). Each transition is a signed forward-CAS on the PR2a
-cutover head. `READY → ACTIVE` is **PR2c**. Every step is individually durable + crash-resumable; no
-implied cross-DB atomicity.
+`BFinalizedReceipt` and **compares its `commandId` / `frozenReceiptDigest` / `manifestDigest+root` /
+signature identities against the ACTIVE cutover command** — B has already flipped). Each transition is
+a signed forward-CAS on the PR2a cutover head. `READY → ACTIVE` is **PR2c**. Every step is
+individually durable + crash-resumable; no implied cross-DB atomicity.
 
 ## 5. Idempotent crash-resume
 
