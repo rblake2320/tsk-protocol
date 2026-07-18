@@ -17,8 +17,8 @@
  */
 import { createHash, sign as edSign, verify as edVerify, createPrivateKey, type KeyObject } from 'node:crypto';
 
-import { ContractValidationError, assertStreamHeadBinds } from './ha-outbox-contract.js';
-import type { OutboxRecordHeader, SignedStreamHead, StreamHeadAlg } from './ha-outbox-contract.js';
+import { ContractValidationError, assertStreamHeadBinds, canonicalOpDigest } from './ha-outbox-contract.js';
+import type { OutboxRecordHeader, SignedStreamHead, StreamHeadAlg, SanitizedMutation, MutationSanitizer } from './ha-outbox-contract.js';
 import type { PgExecutor, PgTransactor } from './tsk-hotp-outbox-pg.js';
 
 // ── bounds + grammar ─────────────────────────────────────────────────────────
@@ -380,9 +380,16 @@ export async function computeSourceStateDigest(exec: PgExecutor, streamId: strin
   // re-imposed in JS by raw tumblerId bytes — the DB's ORDER BY collation never reaches the digest.
   const rows = (await exec.query('SELECT DISTINCT ON (tumbler_id) tumbler_id, hotp_counter FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence <= $2 ORDER BY tumbler_id, sequence DESC', [s, N])).rows;
   const pairs = rows.map((r) => [String(r.tumbler_id), vInt(r.hotp_counter, 'hotp_counter', 1, 2 ** 31 - 1)] as [string, number]);
-  pairs.sort((a, b) => Buffer.compare(Buffer.from(a[0], 'utf8'), Buffer.from(b[0], 'utf8')));
-  const parts: (string | number)[] = ['tsk_source_state/v1', s, N, pairs.length];
-  for (const [t, c] of pairs) parts.push(t, c);
+  return stateDigestFromPairs(s, N, pairs);
+}
+
+/** The ONE canonical (tumblerId → latest counter) state digest — sorted APPLICATION-CANONICALLY by
+ *  tumblerId bytes (never DB collation). Used by `computeSourceStateDigest` (DB read) AND the replay
+ *  (state DERIVED from the payloads), so a source-side digest and an independent replay must agree. */
+function stateDigestFromPairs(streamId: string, n: number, pairs: [string, number][]): string {
+  const sorted = pairs.slice().sort((a, b) => Buffer.compare(Buffer.from(a[0], 'utf8'), Buffer.from(b[0], 'utf8')));
+  const parts: (string | number)[] = ['tsk_source_state/v1', streamId, n, sorted.length];
+  for (const [t, c] of sorted) parts.push(t, c);
   return sha256hex(frame(...parts));
 }
 
@@ -890,4 +897,220 @@ export async function issueSourceCheckpointReceipt(db: PgTransactor, schema: str
     if (headAtN !== headN) throw new SourceFenceQuarantineError('range head@N != checkpoint head@N — quarantine');
     return signSourceCheckpointReceipt(opts.sourceKeyId, opts.sourcePrivateKey, { streamId: s, sourceSystemId: sysId, sourceSeq: n, sourceHeadDigest: headN, grantSeq: lease.leaseGrantSeq, priorSeq: priorW, priorHeadDigest });
   });
+}
+
+// ── PR2b-1: complete canonical 1..N export + ONE replay authority + dual independent signatures ──
+//
+// (design §2) With A frozen at N, export the COMPLETE canonical history 1..N — for every record the
+// FULL sanitized payload + all signed-head fields — in bounded chunks, plus the sorted state-at-N.
+// A single versioned REPLAY function is the authority: recompute opDigest FROM the payload, verify
+// every head binding + signature + prev/head link 1..N, and DERIVE state — never trusting the exported
+// state. signedHeadDigest@N and sourceStateDigest@N are comparison OUTPUTS of the replay, never inputs.
+// The source signs the manifest; the guard verifies the active command + frozen receipt, then
+// INDEPENDENTLY replays + verifies + signs (dual signatures, independent custody). NO MMR / tail /
+// registry / state-map. O(N) export/replay is an explicit v1 tradeoff.
+
+const EXPORT_MANIFEST_VERSION = 'tsk_source_manifest/v1';
+const DEFAULT_MAX_CHUNK_ITEMS = 1024;
+
+/** A single exported source record: the FULL sanitized payload + all signed-head fields (so B/guard
+ *  can recompute opDigest from the payload and re-verify the head — opDigest alone cannot replay). */
+export interface ExportedSourceRecord {
+  sequence: number; sourceEpoch: string; fenceToken: string; opDigest: string;
+  prevHeadDigest: string; headDigest: string; keyId: string; alg: string; signature: string; payload: string;
+}
+export interface ExportChunkInventoryEntry { kind: 'history' | 'state'; ordinal: number; seqFrom: number; seqTo: number; itemCount: number; byteDigest: string; }
+export interface ExportHistoryChunk { kind: 'history'; ordinal: number; seqFrom: number; seqTo: number; records: ExportedSourceRecord[]; byteDigest: string; }
+export interface ExportStateChunk { kind: 'state'; ordinal: number; itemCount: number; pairs: [string, number][]; byteDigest: string; }
+export interface SourceExportBundle { historyChunks: ExportHistoryChunk[]; stateChunk: ExportStateChunk; }
+/** The signed manifest binding the exact ordered chunk inventory + the replay-derived head/state @N. */
+export interface SourceExportManifest {
+  manifestSchemaVersion: string; streamId: string; epoch: number; commandId: string; sourceNodeId: string; n: number;
+  frozenReceiptDigest: string; signedHeadDigestAtN: string; sourceStateDigestAtN: string;
+  chunkCount: number; inventory: ExportChunkInventoryEntry[]; manifestRoot: string;
+  canonicalDigest: string; sourceKeyId: string; sourceSignature: string;
+}
+export interface GuardCountersignedExport extends SourceExportManifest { guardKeyId: string; guardSignature: string; }
+
+/** Byte digest of a history chunk — a canonical framing over every record's exact fields. */
+function historyChunkByteDigest(records: ExportedSourceRecord[]): string {
+  const parts: (string | number | null)[] = ['tsk_export_hist/v1', records.length];
+  for (const r of records) parts.push(r.sequence, r.sourceEpoch, r.fenceToken, r.opDigest, r.prevHeadDigest, r.headDigest, r.keyId, r.alg, r.signature, r.payload);
+  return sha256hex(frame(...parts));
+}
+function stateChunkByteDigest(pairs: [string, number][]): string {
+  const parts: (string | number)[] = ['tsk_export_state/v1', pairs.length];
+  for (const [t, c] of pairs) parts.push(t, c);
+  return sha256hex(frame(...parts));
+}
+/** manifestRoot = versioned + length-prefixed over the EXACT ordered chunk inventory, so reorder /
+ *  truncation / substitution / a missing or duplicate chunk changes the root. */
+function computeManifestRoot(inventory: ExportChunkInventoryEntry[]): string {
+  const parts: (string | number)[] = ['tsk_manifest_root/v1', inventory.length];
+  for (const e of inventory) parts.push(e.kind, e.ordinal, e.seqFrom, e.seqTo, e.itemCount, e.byteDigest);
+  return sha256hex(frame(...parts));
+}
+function manifestMsg(m: Omit<SourceExportManifest, 'canonicalDigest' | 'sourceKeyId' | 'sourceSignature'>): Buffer {
+  return frame(EXPORT_MANIFEST_VERSION, m.manifestSchemaVersion, m.streamId, m.epoch, m.commandId, m.sourceNodeId, m.n,
+    m.frozenReceiptDigest, m.signedHeadDigestAtN, m.sourceStateDigestAtN, m.chunkCount, m.manifestRoot);
+}
+
+/** THE ONE canonical replay authority. For each exported record 1..N: recompute opDigest FROM the
+ *  sanitized payload, reconstruct + BIND the signed head (assertStreamHeadBinds recomputes the head
+ *  digest and checks it commits to the recomputed opDigest), verify the ed25519 head signature, require
+ *  the exact prev/head link, and DERIVE state. Returns head@N + the DERIVED state digest@N. A payload
+ *  substitution, a reordered/missing record, a forged head, or a broken link fails closed. */
+export function replaySourceExport<Clean>(sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'sanitize'>, headResolver: SourceVerifyKeyResolver, streamId: string, records: ExportedSourceRecord[]): { signedHeadDigestAtN: string; sourceStateDigestAtN: string; n: number } {
+  const s = vId(streamId, STREAM_ID_RE, 'streamId');
+  if (records.length === 0) throw new SourceFenceQuarantineError('empty export — nothing to replay');
+  let prev = GENESIS_HEAD_ZERO;
+  const state = new Map<string, number>();
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (vInt(r.sequence, 'record sequence', 1, MAX_SEQ) !== i + 1) throw new SourceFenceQuarantineError(`export record seq ${r.sequence} != expected ${i + 1} — gap/reorder; quarantine`);
+    let parsed: unknown;
+    try { parsed = JSON.parse(r.payload); } catch { throw new SourceFenceQuarantineError(`export record @${r.sequence} payload is not valid JSON`); }
+    const mutation = sanitizer.sanitize(parsed) as SanitizedMutation<Clean>; // recompute FROM the payload
+    const opDigest = canonicalOpDigest<Clean>({ streamId: s, sourceEpoch: r.sourceEpoch, sequence: r.sequence, fenceToken: r.fenceToken, mutation });
+    if (opDigest !== r.opDigest) throw new SourceFenceQuarantineError(`export record @${r.sequence} opDigest does not match the payload — substitution; quarantine`);
+    const alg = String(r.alg) as StreamHeadAlg;
+    const header: OutboxRecordHeader = { contractVersion: '1', streamId: s, sourceEpoch: r.sourceEpoch, sequence: r.sequence, fenceToken: r.fenceToken, opDigest };
+    const head: SignedStreamHead = { streamId: s, sequence: r.sequence, prevHeadDigest: r.prevHeadDigest, opDigest, keyId: r.keyId, alg, headDigest: r.headDigest, signature: r.signature };
+    assertStreamHeadBinds(header, head); // recompute canonical head digest + binding
+    if (alg !== 'ed25519') throw new ContractValidationError(`unsupported head alg '${alg}' in export`);
+    if (!B64U_CANON.test(r.signature)) throw new ContractValidationError('invalid export head signature encoding');
+    const pub = headResolver.resolve(r.keyId);
+    if (pub === null) throw new ContractValidationError('unknown or revoked export head keyId'); // existing verifier policy — no new registry
+    if (!edVerify(null, Buffer.from(r.headDigest, 'utf8'), toPublicKey(pub), Buffer.from(r.signature, 'base64url'))) throw new SourceFenceQuarantineError(`export head signature invalid @${r.sequence} — quarantine`);
+    if (r.prevHeadDigest !== prev) throw new SourceFenceQuarantineError(`export record @${r.sequence} prev head does not chain — fork; quarantine`);
+    const hotp = mutation as unknown as { tumblerId: string; counter: number };
+    state.set(hotp.tumblerId, hotp.counter); // DERIVE state (latest counter per tumbler)
+    prev = r.headDigest;
+  }
+  return { signedHeadDigestAtN: prev, sourceStateDigestAtN: stateDigestFromPairs(s, records.length, [...state.entries()]), n: records.length };
+}
+
+/** Read the committed 1..N history from the SIGNED ledger + the sorted state-at-N, packed into bounded
+ *  chunks. The history records carry the FULL payload + signed-head fields; the state chunk is the
+ *  sorted (tumblerId -> latest counter) map. (Export only — the REPLAY re-verifies everything.) */
+export async function exportSourceHistory(exec: PgExecutor, streamId: string, epoch: string, n: number, opts?: { maxChunkItems?: number }): Promise<SourceExportBundle> {
+  const s = vId(streamId, STREAM_ID_RE, 'streamId');
+  const N = vInt(n, 'n', 1, MAX_SEQ);
+  const maxItems = vInt(opts?.maxChunkItems ?? DEFAULT_MAX_CHUNK_ITEMS, 'maxChunkItems', 1, 100_000);
+  const historyChunks: ExportHistoryChunk[] = [];
+  let ordinal = 0;
+  for (let from = 1; from <= N; from += maxItems) {
+    const to = Math.min(from + maxItems - 1, N);
+    const rows = (await exec.query(`SELECT sequence, source_epoch, fence_token, op_digest, head_prev, head_digest, head_key_id, head_alg, head_sig, mutation FROM tsk_outbox_rows WHERE stream_id=$1 AND source_epoch=$2 AND sequence >= $3 AND sequence <= $4 ORDER BY sequence ASC`, [s, epoch, from, to])).rows;
+    if (rows.length !== to - from + 1) throw new SourceFenceQuarantineError(`export gap in [${from},${to}] — expected ${to - from + 1} rows, got ${rows.length}`);
+    const records: ExportedSourceRecord[] = rows.map((r) => ({
+      sequence: vInt(r.sequence, 'sequence', 1, MAX_SEQ), sourceEpoch: String(r.source_epoch), fenceToken: String(r.fence_token),
+      opDigest: vHeadDigest(r.op_digest, 'op_digest'), prevHeadDigest: vHeadDigest(r.head_prev, 'head_prev'), headDigest: vHeadDigest(r.head_digest, 'head_digest'),
+      keyId: String(r.head_key_id), alg: String(r.head_alg), signature: String(r.head_sig), payload: typeof r.mutation === 'string' ? r.mutation : JSON.stringify(r.mutation),
+    }));
+    historyChunks.push({ kind: 'history', ordinal: ordinal++, seqFrom: from, seqTo: to, records, byteDigest: historyChunkByteDigest(records) });
+  }
+  const st = (await exec.query('SELECT DISTINCT ON (tumbler_id) tumbler_id, hotp_counter FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence <= $2 ORDER BY tumbler_id, sequence DESC', [s, N])).rows;
+  const pairs = st.map((r) => [String(r.tumbler_id), vInt(r.hotp_counter, 'hotp_counter', 1, 2 ** 31 - 1)] as [string, number]);
+  pairs.sort((a, b) => Buffer.compare(Buffer.from(a[0], 'utf8'), Buffer.from(b[0], 'utf8')));
+  const stateChunk: ExportStateChunk = { kind: 'state', ordinal: ordinal++, itemCount: pairs.length, pairs, byteDigest: stateChunkByteDigest(pairs) };
+  return { historyChunks, stateChunk };
+}
+
+function bundleInventory(bundle: SourceExportBundle): ExportChunkInventoryEntry[] {
+  const inv: ExportChunkInventoryEntry[] = bundle.historyChunks.map((c) => ({ kind: 'history' as const, ordinal: c.ordinal, seqFrom: c.seqFrom, seqTo: c.seqTo, itemCount: c.records.length, byteDigest: c.byteDigest }));
+  inv.push({ kind: 'state', ordinal: bundle.stateChunk.ordinal, seqFrom: 0, seqTo: 0, itemCount: bundle.stateChunk.itemCount, byteDigest: bundle.stateChunk.byteDigest });
+  return inv;
+}
+function allRecords(bundle: SourceExportBundle): ExportedSourceRecord[] {
+  return bundle.historyChunks.flatMap((c) => c.records);
+}
+
+/** Options for the owned source-side export builder. */
+export interface SourceExportOptions<Clean> {
+  sourceKeyId: string; sourcePrivateKey: KeyObject | string;
+  sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'sanitize'>;
+  leaseResolver: SourceVerifyKeyResolver; headResolver: SourceVerifyKeyResolver;
+  frozenReceipt: SourceFrozenReceipt; maxChunkItems?: number;
+}
+/** (§2) SOURCE side: owned, serializable, schema-pinned. Verify the frozen receipt; export 1..N + the
+ *  state chunk; REPLAY (the head/state @N are replay OUTPUTS, cross-checked against the frozen receipt);
+ *  build the manifest binding the exact chunk inventory + commandId + sourceNodeId + frozenReceiptDigest;
+ *  SOURCE-sign. Returns the bundle + the source-signed manifest. */
+export async function buildSourceExportManifest<Clean>(db: PgTransactor, schema: string, input: { streamId: string; epoch: number; commandId: string; sourceNodeId: string }, opts: SourceExportOptions<Clean>): Promise<{ bundle: SourceExportBundle; manifest: SourceExportManifest }> {
+  const s = vId(input.streamId, STREAM_ID_RE, 'streamId');
+  const commandId = vId(input.commandId, ID_RE, 'commandId');
+  const sourceNodeId = vId(input.sourceNodeId, ID_RE, 'sourceNodeId');
+  const epoch = vInt(input.epoch, 'epoch', 0, MAX_EPOCH);
+  verifySourceFrozenReceipt(opts.leaseResolver, opts.frozenReceipt); // the frozen N is proven (§1)
+  const fr = opts.frozenReceipt;
+  if (fr.streamId !== s || fr.epoch !== epoch || fr.commandId !== commandId || fr.sourceNodeId !== sourceNodeId) throw new SourceFenceQuarantineError('frozen receipt does not bind the export command/stream/epoch/node');
+  return db.transaction(async (exec) => {
+    await enterSourceTx(exec, schema);
+    await attestSourceLease(exec);
+    const cp = (await exec.query('SELECT source_epoch, sequence, head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1 FOR SHARE', [s])).rows[0];
+    if (!cp) throw new SourceFenceQuarantineError('no source checkpoint');
+    const n = vInt(cp.sequence, 'N', 1, MAX_SEQ);
+    if (n !== fr.n) throw new SourceFenceQuarantineError(`checkpoint N ${n} != frozen receipt N ${fr.n} — quarantine`);
+    const bundle = await exportSourceHistory(exec, s, String(cp.source_epoch), n, { maxChunkItems: opts.maxChunkItems });
+    // REPLAY is the authority — head/state @N are OUTPUTS, cross-checked to the frozen receipt
+    const replay = replaySourceExport(opts.sanitizer, opts.headResolver, s, allRecords(bundle));
+    if (replay.n !== n) throw new SourceFenceQuarantineError(`replay N ${replay.n} != N ${n}`);
+    if (replay.signedHeadDigestAtN !== fr.signedHeadDigestAtN) throw new SourceFenceQuarantineError('replay head@N != frozen receipt head@N — quarantine');
+    if (replay.sourceStateDigestAtN !== fr.sourceStateDigestAtN) throw new SourceFenceQuarantineError('replay state@N != frozen receipt state@N — quarantine');
+    const inventory = bundleInventory(bundle);
+    const manifestRoot = computeManifestRoot(inventory);
+    const bare = { manifestSchemaVersion: EXPORT_MANIFEST_VERSION, streamId: s, epoch, commandId, sourceNodeId, n, frozenReceiptDigest: fr.receiptDigest, signedHeadDigestAtN: replay.signedHeadDigestAtN, sourceStateDigestAtN: replay.sourceStateDigestAtN, chunkCount: inventory.length, inventory, manifestRoot };
+    const canonicalDigest = sha256hex(manifestMsg(bare));
+    const sourceSignature = edSignB64u(opts.sourceKeyId, opts.sourcePrivateKey, Buffer.concat([manifestMsg(bare), frame('tsk_manifest_digest', canonicalDigest)]));
+    return { bundle, manifest: { ...bare, canonicalDigest, sourceKeyId: opts.sourceKeyId, sourceSignature } };
+  });
+}
+
+/** Verify a source-signed manifest's canonical digest + the source signature over it. */
+export function verifySourceExportManifest(resolver: SourceVerifyKeyResolver, m: SourceExportManifest): void {
+  const bare = { manifestSchemaVersion: m.manifestSchemaVersion, streamId: m.streamId, epoch: m.epoch, commandId: m.commandId, sourceNodeId: m.sourceNodeId, n: m.n, frozenReceiptDigest: m.frozenReceiptDigest, signedHeadDigestAtN: m.signedHeadDigestAtN, sourceStateDigestAtN: m.sourceStateDigestAtN, chunkCount: m.chunkCount, inventory: m.inventory, manifestRoot: m.manifestRoot };
+  if (computeManifestRoot(m.inventory) !== m.manifestRoot) throw new ContractValidationError('manifestRoot != inventory');
+  if (sha256hex(manifestMsg(bare)) !== m.canonicalDigest) throw new ContractValidationError('manifest canonicalDigest mismatch');
+  verifySig(resolver, m.sourceKeyId, Buffer.concat([manifestMsg(bare), frame('tsk_manifest_digest', m.canonicalDigest)]), m.sourceSignature);
+}
+
+/** Options for the GUARD counter-signature. */
+export interface GuardCountersignOptions<Clean> {
+  guardKeyId: string; guardPrivateKey: KeyObject | string;
+  sanitizer: Pick<MutationSanitizer<unknown, Clean>, 'sanitize'>;
+  sourceManifestResolver: SourceVerifyKeyResolver; headResolver: SourceVerifyKeyResolver; frozenResolver: SourceVerifyKeyResolver;
+  frozenReceipt: SourceFrozenReceipt; activeCommandId: string;
+}
+/** (§2) GUARD side — INDEPENDENT custody (a separate step, NOT one A tx). The guard verifies the exact
+ *  ACTIVE cutover command + the frozen receipt FIRST, verifies the source signature + manifestRoot,
+ *  re-digests every chunk, then INDEPENDENTLY REPLAYS the history from the chunks (its own authority)
+ *  and requires the replay head/state @N to equal the manifest before guard-signing. */
+export function guardCountersignSourceExport<Clean>(bundle: SourceExportBundle, manifest: SourceExportManifest, opts: GuardCountersignOptions<Clean>): GuardCountersignedExport {
+  // (1) active command + frozen receipt FIRST
+  if (manifest.commandId !== vId(opts.activeCommandId, ID_RE, 'activeCommandId')) throw new SourceFenceQuarantineError('manifest commandId != active cutover command — quarantine');
+  verifySourceFrozenReceipt(opts.frozenResolver, opts.frozenReceipt);
+  if (opts.frozenReceipt.receiptDigest !== manifest.frozenReceiptDigest || opts.frozenReceipt.commandId !== manifest.commandId || opts.frozenReceipt.streamId !== manifest.streamId || opts.frozenReceipt.n !== manifest.n) throw new SourceFenceQuarantineError('frozen receipt does not bind the manifest — quarantine');
+  // (2) source signature + manifestRoot + re-digest every chunk against the inventory
+  verifySourceExportManifest(opts.sourceManifestResolver, manifest);
+  const inv = bundleInventory(bundle);
+  if (computeManifestRoot(inv) !== manifest.manifestRoot) throw new SourceFenceQuarantineError('recomputed bundle root != manifest root — chunk tamper; quarantine');
+  if (inv.length !== manifest.inventory.length) throw new SourceFenceQuarantineError('chunk count mismatch — quarantine');
+  for (let i = 0; i < inv.length; i++) {
+    const a = inv[i], b = manifest.inventory[i];
+    if (a.kind !== b.kind || a.ordinal !== b.ordinal || a.seqFrom !== b.seqFrom || a.seqTo !== b.seqTo || a.itemCount !== b.itemCount || a.byteDigest !== b.byteDigest) throw new SourceFenceQuarantineError(`chunk inventory entry ${i} mismatch — quarantine`);
+  }
+  // (3) INDEPENDENT replay (guard's own authority) — head/state @N are OUTPUTS, must equal the manifest
+  const replay = replaySourceExport(opts.sanitizer, opts.headResolver, manifest.streamId, allRecords(bundle));
+  if (replay.n !== manifest.n || replay.signedHeadDigestAtN !== manifest.signedHeadDigestAtN || replay.sourceStateDigestAtN !== manifest.sourceStateDigestAtN) throw new SourceFenceQuarantineError('guard replay head/state @N != manifest — quarantine');
+  if (stateChunkByteDigest(bundle.stateChunk.pairs) !== bundle.stateChunk.byteDigest) throw new SourceFenceQuarantineError('state chunk byte digest mismatch');
+  // (4) guard counter-signs the exact source-signed canonical digest (independent custody)
+  const guardSignature = edSignB64u(opts.guardKeyId, opts.guardPrivateKey, frame('tsk_guard_countersign/v1', manifest.canonicalDigest, manifest.sourceKeyId, manifest.sourceSignature));
+  return { ...manifest, guardKeyId: opts.guardKeyId, guardSignature };
+}
+
+/** Verify the guard counter-signature over a source-signed manifest (both signatures, independent custody). */
+export function verifyGuardCountersignedExport(sourceResolver: SourceVerifyKeyResolver, guardResolver: SourceVerifyKeyResolver, m: GuardCountersignedExport): void {
+  verifySourceExportManifest(sourceResolver, m);
+  verifySig(guardResolver, m.guardKeyId, frame('tsk_guard_countersign/v1', m.canonicalDigest, m.sourceKeyId, m.sourceSignature), m.guardSignature);
 }

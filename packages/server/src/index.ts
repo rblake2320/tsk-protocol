@@ -108,6 +108,12 @@ export {
   requireSourceFenceReady,
   assertSourceWitnessReady,
   requireSourceWitnessReady,
+  replaySourceExport,
+  exportSourceHistory,
+  buildSourceExportManifest,
+  verifySourceExportManifest,
+  guardCountersignSourceExport,
+  verifyGuardCountersignedExport,
 } from './tsk-source-fence.js';
 export type {
   SourceFenceReadyToken,
@@ -120,6 +126,15 @@ export type {
   FrozenReceiptOptions,
   SourceCheckpointReceipt,
   CheckpointIssueOptions,
+  ExportedSourceRecord,
+  ExportChunkInventoryEntry,
+  ExportHistoryChunk,
+  ExportStateChunk,
+  SourceExportBundle,
+  SourceExportManifest,
+  GuardCountersignedExport,
+  SourceExportOptions,
+  GuardCountersignOptions,
   SourceLiveState,
   WitnessState as SourceWitnessState,
 } from './tsk-source-fence.js';
