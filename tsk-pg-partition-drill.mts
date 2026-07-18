@@ -32,6 +32,9 @@ const u = new URL(PG_URL);
 const PG_HOST = u.hostname;
 const PG_PORT = Number(u.port || 5432);
 const PROXY_PORT = 55491;
+const STALL_DIAL_MS = 1_500; // in stallC, the upstream is dialed only AFTER this delay, so a
+                             // connection ARRIVES LATE (after a shorter acquire deadline) and
+                             // must be destroyed rather than leaked into the pool.
 const conn = { host: '127.0.0.1', port: PROXY_PORT, user: decodeURIComponent(u.username), password: decodeURIComponent(u.password), database: u.pathname.slice(1) };
 const { Pool } = pg;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -49,10 +52,25 @@ function startProxy(): Promise<Proxy> {
   let mode: Mode = 'pass';
   const state = { cuts: 0 };
   const stalled: net.Socket[] = [];
+  const stallTimers: ReturnType<typeof setTimeout>[] = [];
   const server = net.createServer((client) => {
     const m = mode;
     client.on('error', () => {});
-    if (m === 'stallC') { stalled.push(client); return; } // accept but never dial upstream: the client startup stalls
+    if (m === 'stallC') {
+      // accept, then dial upstream only AFTER STALL_DIAL_MS: the client's startup
+      // stalls past a shorter acquire deadline, then the connection completes LATE.
+      stalled.push(client);
+      stallTimers.push(setTimeout(() => {
+        if (client.destroyed) return;
+        const up = net.connect(PG_PORT, PG_HOST);
+        up.on('error', () => {});
+        client.on('data', (d) => { if (!up.destroyed) up.write(d); });
+        up.on('data', (d) => { if (!client.destroyed) client.write(d); });
+        const cl = () => { try { up.destroy(); } catch { /* gone */ } try { client.destroy(); } catch { /* gone */ } };
+        client.on('close', cl); up.on('close', cl);
+      }, STALL_DIAL_MS));
+      return;
+    }
     const upstream = net.connect(PG_PORT, PG_HOST);
     upstream.on('error', () => {});
     let commitForwarded = false;
@@ -86,7 +104,7 @@ function startProxy(): Promise<Proxy> {
   });
   return new Promise((resolve) => server.listen(PROXY_PORT, '127.0.0.1', () => resolve({
     setMode: (x) => { mode = x; },
-    flushStalled: () => { while (stalled.length) { try { stalled.pop()!.destroy(); } catch { /* gone */ } } },
+    flushStalled: () => { while (stallTimers.length) clearTimeout(stallTimers.pop()!); while (stalled.length) { try { stalled.pop()!.destroy(); } catch { /* gone */ } } },
     state,
     close: () => new Promise((r) => server.close(() => r())),
   })));
@@ -136,7 +154,11 @@ async function main() {
       assert.equal(err.committed, 'unknown');
       assert.ok(ms < 8_500, `B: must be bounded (was ${ms}ms)`);
       // 2) authoritative reconciliation by idempotency key (PK models the outbox tuple):
-      //    the server DID commit (we dropped the reply only AFTER its CommandComplete)
+      //    the server DID commit (we dropped the reply only AFTER its CommandComplete).
+      //    Crash-durability of that commit holds only if the WAL is flushed on COMMIT,
+      //    i.e. synchronous_commit != off — assert it so the durability claim is real.
+      const sc = String((await direct.query('SHOW synchronous_commit')).rows[0].synchronous_commit);
+      assert.notEqual(sc, 'off', `B: crash-durability requires synchronous_commit != off (was '${sc}')`);
       const rows = (await direct.query('SELECT tag FROM partition_probe WHERE id = 1')).rows;
       assert.equal(rows.length, 1, 'B: the commit MUST be durable server-side despite the dropped ack');
       assert.equal(rows[0].tag, 'B');
@@ -148,17 +170,22 @@ async function main() {
       assert.equal(inUse(), 0, 'B: no checked-out connection leaked after an ambiguous commit');
     });
 
-    await check('(C) acquire-phase partition is bounded by the acquire deadline; late connection destroyed', async () => {
+    await check('(C) acquire-phase partition is bounded by the acquire deadline; the late-arriving connection is destroyed, not leaked', async () => {
       proxy.setMode('stallC');
       const poolC = new Pool({ ...conn, max: 1 }); poolC.on('error', () => {});
-      const txC = new NodePostgresTransactor(poolC as unknown as ConstructorParameters<typeof NodePostgresTransactor>[0], { acquireTimeoutMs: 800, transactionTimeoutMs: 5_000 });
+      const txC = new NodePostgresTransactor(poolC as unknown as ConstructorParameters<typeof NodePostgresTransactor>[0], { acquireTimeoutMs: 800, transactionTimeoutMs: 6_000 });
       const t0 = Date.now();
       const err = await txC.transaction(async (exec) => exec.query('SELECT 1')).then(() => null).catch((e) => e);
       const ms = Date.now() - t0;
-      proxy.setMode('pass');
       assert.ok(err && /acquisition timed out/.test(String(err.message)), `C: expected acquire timeout, got ${err?.message}`);
-      assert.ok(ms >= 700 && ms < 3_000, `C: must fire near the acquire deadline, bounded (was ${ms}ms)`);
-      proxy.flushStalled(); // release the stalled socket so pool teardown cannot hang
+      // fired AT the ~800ms acquire deadline, strictly BEFORE the ~1500ms late arrival
+      assert.ok(ms >= 700 && ms < 1_400, `C: must fire at the acquire deadline, before the late arrival (was ${ms}ms)`);
+      // the connection then ARRIVES late (~1500ms). It MUST be destroyed, never pooled:
+      await sleep(STALL_DIAL_MS - ms + 400);
+      assert.equal(poolC.totalCount, 0, 'C: the late-arriving connection was destroyed, not returned to the pool');
+      assert.equal(poolC.totalCount - poolC.idleCount, 0, 'C: no checked-out connection leaked');
+      proxy.setMode('pass');
+      proxy.flushStalled();
       await Promise.race([poolC.end().catch(() => {}), sleep(800)]);
     });
 

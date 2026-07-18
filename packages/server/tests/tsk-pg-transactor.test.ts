@@ -18,6 +18,7 @@ interface ClientScript {
   commit?: string | (() => Promise<never>);    // COMMIT tag, or a thrower (lost response)
   onWork?: (sql: string, params?: unknown[]) => NodePostgresResult | Promise<NodePostgresResult>;
   release?: 'ok' | 'throw';
+  rollbackHangs?: boolean;                      // ROLLBACK never resolves (tests cleanup clamping)
 }
 class FakeClient implements NodePostgresClient {
   queries: string[] = [];
@@ -36,7 +37,7 @@ class FakeClient implements NodePostgresClient {
       if (typeof c === 'function') return c();
       return { rows: [], rowCount: null, command: c ?? 'COMMIT' };
     }
-    if (sql === 'ROLLBACK') return { rows: [], rowCount: null, command: 'ROLLBACK' };
+    if (sql === 'ROLLBACK') { if (this.script.rollbackHangs) return new Promise<never>(() => {}); return { rows: [], rowCount: null, command: 'ROLLBACK' }; }
     if (this.script.onWork) return this.script.onWork(sql, params);
     return { rows: [], rowCount: 1, command: 'SELECT' };
   }
@@ -218,6 +219,41 @@ describe('NodePostgresTransactor', () => {
     const err = await tx.transaction(async () => { throw new Error('callback boom'); }).catch((e) => e);
     expect(observed).toBe(true);
     expect(err).toBeInstanceOf(ConnectionDisposalError); // outcome unchanged by telemetry failure
+  });
+
+  it('(H1) capability-limits the callback executor: transaction/session control is blocked and rolls back', async () => {
+    const evils = ['COMMIT', 'ROLLBACK', 'BEGIN', 'END', 'SAVEPOINT s1', 'RELEASE s1', 'DISCARD ALL',
+      'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', '  /* sneaky */ commit', 'INSERT INTO t VALUES (1); COMMIT'];
+    for (const evil of evils) {
+      const client = new FakeClient();
+      const tx = new NodePostgresTransactor(poolOf(client));
+      const err = await tx.transaction(async (exec) => { await exec.query(evil); }).catch((e) => e);
+      expect(err, `must reject: ${evil}`).toBeInstanceOf(ContractValidationError);
+      expect(client.queries).not.toContain('COMMIT'); // the transactor never reached its own COMMIT
+      expect(client.destroyed).toBe(true);            // and the connection is discarded
+    }
+  });
+
+  it('(H1) allows ordinary data + read statements through the guarded executor', async () => {
+    const client = new FakeClient({ onWork: () => ({ rows: [{ ok: 1 }], rowCount: 1, command: 'SELECT' }) });
+    const tx = new NodePostgresTransactor(poolOf(client));
+    await tx.transaction(async (exec) => {
+      await exec.query('SELECT set_config($1, $2, true)', ['search_path', 'public']);
+      await exec.query('SHOW transaction_isolation');
+      await exec.query('INSERT INTO t VALUES (1)');
+      await exec.query('SELECT 1; '); // a trailing statement separator is fine
+    });
+    expect(client.queries.at(-1)).toBe('COMMIT'); // committed normally
+  });
+
+  it('(H2) clamps cleanup rollback to the transaction deadline, not the full rollback budget', async () => {
+    const client = new FakeClient({ rollbackHangs: true, onWork: () => { throw new Error('callback boom'); } });
+    const tx = new NodePostgresTransactor(poolOf(client), { transactionTimeoutMs: 150, rollbackTimeoutMs: 5_000 });
+    const t0 = Date.now();
+    await tx.transaction(async (exec) => exec.query('INSERT INTO t VALUES (1)')).catch(() => {});
+    const ms = Date.now() - t0;
+    expect(ms).toBeLessThan(1_500);   // bounded by the 150ms deadline, NOT the 5000ms rollback budget
+    expect(client.destroyed).toBe(true);
   });
 
   it('owns the checked-out client error event for the tx lifetime and swallows a mid-tx connection error', async () => {

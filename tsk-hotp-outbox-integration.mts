@@ -165,6 +165,19 @@ async function main() {
     assert.equal(Number((await pool.query('SELECT sequence FROM tsk_outbox_source_checkpoint WHERE stream_id=$1', [sid])).rows[0].sequence), 0);
   });
 
+  await check('(#10 transactor) a callback attempting transaction-control (COMMIT) is blocked; no durable partial write', async () => {
+    await pool.query('DROP TABLE IF EXISTS tsk_txctl_probe');
+    await pool.query('CREATE TABLE tsk_txctl_probe (id int primary key)');
+    // the H1 escape: INSERT then COMMIT from inside the callback, then throw. The
+    // capability-limited executor must REJECT the COMMIT so nothing durably persists.
+    await assert.rejects(() => serial.transaction(async (exec) => {
+      await exec.query('INSERT INTO tsk_txctl_probe(id) VALUES (1)');
+      await exec.query('COMMIT');
+    }), /transaction\/session-control/);
+    assert.equal(Number((await pool.query('SELECT count(*)::int AS n FROM tsk_txctl_probe')).rows[0].n), 0, 'the blocked-escape insert must roll back');
+    await pool.query('DROP TABLE tsk_txctl_probe');
+  });
+
   await check('lost-ACK idempotency: redelivery after a lost ack is duplicate-ok; HOTP consumed exactly once', async () => {
     const sid = 'tsk:lostack/v1'; await provision(sid);
     const receiver = new PgTskReceiverCheckpoint(serial, sid, sanitizer, headVerifier, applier, READY);

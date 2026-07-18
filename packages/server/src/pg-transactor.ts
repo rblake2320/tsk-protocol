@@ -150,14 +150,54 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-/** Best-effort ROLLBACK that can never block the failure path unbounded. */
-async function boundedRollback(client: NodePostgresClient, ms: number): Promise<void> {
+/** Best-effort ROLLBACK that can never block the failure path unbounded. It is
+ *  clamped by BOTH a fixed budget AND the transaction signal, so once the total
+ *  deadline (or a caller abort) fires, cleanup stops immediately and the caller
+ *  destroys the connection — cleanup can never extend the transaction past its
+ *  deadline. If the signal has already fired, it does not even issue the ROLLBACK. */
+async function boundedRollback(client: NodePostgresClient, ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return; // deadline/abort already reached — do not extend cleanup; destroy instead
   let timer!: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); });
+  let onAbort!: () => void;
+  const stop = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+    onAbort = () => resolve();
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
   try {
-    await Promise.race([client.query('ROLLBACK').then(() => undefined).catch(() => undefined), timeout]);
+    await Promise.race([client.query('ROLLBACK').then(() => undefined).catch(() => undefined), stop]);
   } finally {
     clearTimeout(timer);
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
+// (H1) A transaction callback receives a capability-limited executor: it may run
+// data statements but MUST NOT issue transaction/session control that would escape
+// or subvert the transactor's single-transaction guarantee (e.g. a callback that
+// COMMITs its own writes then throws would durably persist under an ordinary
+// pre-COMMIT error). We reject transaction-control leads and multi-statement text.
+const TX_CONTROL_LEAD = /^(begin|start|commit|end|rollback|abort|savepoint|release|discard)\b/i;
+const TX_CONTROL_SET = /^(set\s+(transaction\b|session\s+characteristics\b|constraints\b)|prepare\s+transaction\b|(commit|rollback)\s+prepared\b)/i;
+/** Strip comments and string/dollar-quoted literals so control-keyword and
+ *  statement-separator detection cannot be evaded by hiding them in noise. */
+function stripSqlNoise(sql: string): string {
+  return sql
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')                       // block comments
+    .replace(/--[^\n]*/g, ' ')                                // line comments
+    .replace(/\$([A-Za-z_]\w*)?\$[\s\S]*?\$\1\$/g, "''")      // dollar-quoted strings
+    .replace(/'(?:[^']|'')*'/g, "''");                        // single-quoted strings
+}
+function assertCallerQueryAllowed(sql: string): void {
+  if (typeof sql !== 'string') throw new ContractValidationError('query sql must be a string');
+  const stripped = stripSqlNoise(sql).trim();
+  const lead = stripped.replace(/^[(\s]+/, ''); // tolerate leading '(' / whitespace
+  if (TX_CONTROL_LEAD.test(lead) || TX_CONTROL_SET.test(lead)) {
+    throw new ContractValidationError('transaction/session-control statements are not allowed inside a transactor callback');
+  }
+  const semi = stripped.indexOf(';');
+  if (semi >= 0 && stripped.slice(semi + 1).trim().length > 0) {
+    throw new ContractValidationError('multiple statements are not allowed inside a transactor callback');
   }
 }
 
@@ -308,6 +348,7 @@ export class NodePostgresTransactor implements PgTransactor {
       }
       const exec: PgExecutor = {
         query: async (sql, params) => {
+          assertCallerQueryAllowed(sql); // (H1) capability limit: no transaction-control escape
           const result = await query(sql, params);
           return { rows: result.rows, rowCount: result.rowCount ?? 0 };
         },
@@ -327,7 +368,7 @@ export class NodePostgresTransactor implements PgTransactor {
       // Only ROLLBACK when COMMIT was never dispatched and the connection is still
       // open; otherwise go straight to destroy so we never unbounded-await.
       if (!committed && !commitDispatched && releaseState === 'open') {
-        await boundedRollback(client, this.rollbackTimeoutMs);
+        await boundedRollback(client, this.rollbackTimeoutMs, signal);
       }
       if (releaseState === 'open') destroy();
       // COMMIT dispatched, no confirmed tag, no explicit ROLLBACK tag → ambiguous.
