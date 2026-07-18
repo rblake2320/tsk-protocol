@@ -73,10 +73,12 @@ pinned canonical encoding (JCS / I-JSON) before hashing/signing.
   `manifestRoot`** and matches the manifest; verifies **both** source and guard signatures; verifies
   `epoch`/`streamId`/`sourceNodeId` and **B `system_identifier` distinct from A and control**
   (attested). B never reads the control DB in its tx (verifies the signed manifest bundle).
-- Only if all pass, B **seals** the generation, then **ONE SERIALIZABLE CAS tx** installs
-  checkpoint/head/state, **flips the singleton generation pointer**, and **durably stores the exact
-  immutable signed receipt body** — so post-flip crash recovery can never reconstruct an *unbound*
-  receipt. The generation is authoritative **receiver/candidate** state (NOT writable source — PR2c).
+- Only if all pass, B **seals** the generation and **CONSTRUCTS + SIGNS the `BFinalizedReceipt`
+  FIRST**; then **ONE SERIALIZABLE CAS tx VERIFIES that signed receipt and atomically installs
+  checkpoint/head/state + flips the singleton generation pointer + stores the complete signed receipt
+  — all together**. There is therefore **no post-flip / pre-receipt state**: recovery always returns
+  the already-stored receipt. The generation is authoritative **receiver/candidate** state (NOT
+  writable source — PR2c).
   **`BFinalizedReceipt`** binds `{commandId, epoch, N, generationId, frozenReceiptDigest,
   manifestDigest, manifestRoot, sourceSigId+digest, guardSigId+digest, signedHeadDigest@N,
   sourceStateDigest@N, B system_identifier, bSig}` — the `commandId` and all digests are **derived
@@ -95,8 +97,9 @@ individually durable + crash-resumable; no implied cross-DB atomicity.
 
 Freeze (revoke) is idempotent on `command_id`. Export + stage + replay are idempotent (re-stage /
 re-verify; exact chunk-digest duplicate-ok). Crash before the flip → candidate generation only
-(discardable); crash after the flip but before `BFinalizedReceipt` durable → resume emits the receipt;
-crash before control READY → resume verifies the receipt. No partial staged state is ever authority.
+(discardable). **The flip and the signed `BFinalizedReceipt` are ONE atomic SERIALIZABLE CAS**, so
+there is **no post-flip / pre-receipt state** — recovery returns the already-stored receipt. Crash
+before control READY → resume re-presents the stored receipt. No partial staged state is ever authority.
 
 ---
 
