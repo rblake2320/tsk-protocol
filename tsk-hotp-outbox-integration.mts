@@ -106,7 +106,7 @@ async function provision(sid: string, epoch = 'e1') {
   await pool.query('INSERT INTO tsk_outbox_receiver_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [sid, epoch]);
 }
 const unacked = async (sid: string) => Number((await pool.query('SELECT count(*)::int AS n FROM tsk_outbox_rows WHERE stream_id=$1 AND acked_at IS NULL AND quarantined_at IS NULL', [sid])).rows[0].n);
-const mkOutbox = (db: PgTransactor, sid: string, ready = READY) => new PgTskDurableOutbox(db, ready, { streamId: sid, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' });
+const mkOutbox = (db: PgTransactor, sid: string, ready = READY) => new PgTskDurableOutbox(db, ready, { streamId: sid, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation', sourceLeaseGate: { mode: 'unfenced-single-node' } });
 
 /** Receiver-backed transport: delivering runs the REAL receiver and returns a
  *  signed decision receipt. Records each decision. */
@@ -294,15 +294,15 @@ async function main() {
     await assert.rejects(() => serial.transaction((e) => attestSchema(e)), /attestation failed/);
     await resetSchema();
     const other = new NodePostgresTransactor(pool as unknown as ConstructorParameters<typeof NodePostgresTransactor>[0]); // a DISTINCT transactor instance
-    assert.throws(() => new PgTskDurableOutbox(other, READY, { streamId: 's/v1', sanitizer, signer, maxPendingRows: 1, backpressure: 'quarantine' }), /different PgTransactor/);
-    assert.throws(() => new PgTskDurableOutbox(serial, {} as SchemaReadyToken, { streamId: 's/v1', sanitizer, signer, maxPendingRows: 1, backpressure: 'quarantine' }), /forged or foreign/);
+    assert.throws(() => new PgTskDurableOutbox(other, READY, { streamId: 's/v1', sanitizer, signer, maxPendingRows: 1, backpressure: 'quarantine', sourceLeaseGate: { mode: 'unfenced-single-node' } }), /different PgTransactor/);
+    assert.throws(() => new PgTskDurableOutbox(serial, {} as SchemaReadyToken, { streamId: 's/v1', sanitizer, signer, maxPendingRows: 1, backpressure: 'quarantine', sourceLeaseGate: { mode: 'unfenced-single-node' } }), /forged or foreign/);
   });
 
   await check('(TOCTOU) append: mutating the raw mutation during signer.sign does not change stored/digested/signed bytes', async () => {
     const sid = 'tsk:toctou-append/v1'; await provision(sid);
     const raw = { tumblerId: 'T1', counter: 5 };
     const mutatingSigner: StreamHeadSigner = { keyId: KEY_ID, alg: 'ed25519', async sign(hd) { raw.tumblerId = 'EVIL'; raw.counter = 999; return edSign(null, Buffer.from(hd, 'utf8'), privateKey).toString('base64url'); } };
-    const ob = new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mutatingSigner, maxPendingRows: 100, backpressure: 'quarantine' });
+    const ob = new PgTskDurableOutbox(serial, READY, { streamId: sid, sanitizer, signer: mutatingSigner, maxPendingRows: 100, backpressure: 'quarantine', sourceLeaseGate: { mode: 'unfenced-single-node' } });
     const { head } = await ob.withOutboxTx((tx) => ob.appendInTx(tx, { streamId: sid, rawMutation: raw, fenceToken: 0n }));
     const row = (await pool.query('SELECT tumbler_id, hotp_counter, mutation, op_digest FROM tsk_outbox_rows WHERE stream_id=$1', [sid])).rows[0];
     assert.equal(row.tumbler_id, 'T1'); assert.equal(Number(row.hotp_counter), 5);
