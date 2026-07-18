@@ -159,13 +159,36 @@ async function main() {
     try {
       await c.query('CREATE TEMP TABLE tsk_ha_lease_head (x int)'); // attacker temp shadow of an authority table
       assert.ok((await nsp()).startsWith('pg_temp'), 'baseline: the default search_path (pg_temp implicit first) resolves the temp shadow');
-      // the FIX, exactly as pinSchema applies it: set_config LOCAL to pg_temp-last INSIDE a tx
+      // the FIX, exactly as pinSchema applies it: set_config LOCAL to 'schema, pg_temp' INSIDE a tx
       await c.query('BEGIN');
-      await c.query("SELECT set_config('search_path','public, pg_catalog, pg_temp', true)");
+      await c.query("SELECT pg_catalog.set_config('search_path','public, pg_temp', true)");
       const fixed = await nsp();
       await c.query('COMMIT');
       assert.equal(fixed, 'public', 'fixed: pg_temp-last search_path resolves the real public authority table');
     } finally { await c.end(); } // ends the session -> the temp shadow is gone, pool untouched
+  });
+  await check('R10-CRITICAL: pg_catalog-first search_path defeats malicious function/catalog shadows (clock spoof / current_schema / pg_class)', async () => {
+    const c = new pg.Client({ connectionString: PG_URL });
+    await c.connect();
+    try {
+      await c.query("CREATE OR REPLACE FUNCTION public.clock_timestamp() RETURNS timestamptz LANGUAGE sql IMMUTABLE AS $$ SELECT TIMESTAMPTZ '2000-01-01 00:00:00Z' $$"); // spoofs control time
+      await c.query("CREATE OR REPLACE FUNCTION public.current_schema() RETURNS name LANGUAGE sql IMMUTABLE AS $$ SELECT 'evil'::name $$");
+      await c.query('CREATE TABLE IF NOT EXISTS public.pg_class (x int)'); // decoy relation named pg_class in public
+      await c.query('BEGIN');
+      await c.query("SELECT pg_catalog.set_config('search_path','public, pg_temp', true)"); // exactly what pinSchema pins
+      const clk = (await c.query('SELECT clock_timestamp() AS t')).rows[0].t as Date;      // unqualified
+      const cs = (await c.query('SELECT current_schema() AS s')).rows[0].s as string;       // unqualified
+      const pc = Number((await c.query('SELECT count(*)::int AS n FROM pg_class')).rows[0].n); // unqualified
+      await c.query('COMMIT');
+      assert.ok(new Date(clk).getUTCFullYear() >= 2020, 'unqualified clock_timestamp resolves to pg_catalog (real time) — NO control-clock spoof');
+      assert.equal(cs, 'public', 'unqualified current_schema resolves to pg_catalog — not the public shadow');
+      assert.ok(pc > 50, 'unqualified pg_class resolves to the real pg_catalog.pg_class — not the public decoy');
+    } finally {
+      await c.query('DROP FUNCTION IF EXISTS public.clock_timestamp()').catch(() => {});
+      await c.query('DROP FUNCTION IF EXISTS public.current_schema()').catch(() => {});
+      await c.query('DROP TABLE IF EXISTS public.pg_class').catch(() => {});
+      await c.end();
+    }
   });
   await check('R9-MED: the REAL criticalTx holds ACCESS SHARE — a concurrent ALTER on a governed table is blocked by its backend (exact relation + pg_blocking_pids)', async () => {
     const S = 'tsk:r9lock/v1';
@@ -182,14 +205,15 @@ async function main() {
       if (!ctlBlocked) await new Promise((r) => setTimeout(r, 20));
     }
     assert.ok(ctlBlocked, 'the real criticalTx is blocked on the advisory lock (so ACCESS SHARE is already held)');
+    const ctlPid = Number((await pool.query("SELECT pid FROM pg_locks WHERE locktype='advisory' AND NOT granted ORDER BY pid LIMIT 1")).rows[0].pid); // the criticalTx backend (sole advisory-waiter)
     const altering = pool.query('ALTER TABLE tsk_ha_lease_head ADD COLUMN r9b int').catch(() => {}); // now must block on ctl ACCESS SHARE
     let proven = false;
     for (let i = 0; i < 200 && !proven; i++) {
       const rows = (await pool.query("SELECT pg_blocking_pids(w.pid) AS blockers FROM pg_locks w WHERE w.mode='AccessExclusiveLock' AND NOT w.granted AND w.relation='public.tsk_ha_lease_head'::regclass")).rows;
-      proven = rows.length > 0 && Array.isArray(rows[0].blockers) && rows[0].blockers.length > 0;
+      proven = rows.length > 0 && (rows[0].blockers as number[]).map(Number).includes(ctlPid); // the EXACT criticalTx backend blocks the EXACT-relation ALTER
       if (!proven) await new Promise((r) => setTimeout(r, 20));
     }
-    assert.ok(proven, 'the concurrent ALTER on tsk_ha_lease_head is blocked by the criticalTx backend holding ACCESS SHARE');
+    assert.ok(proven, `the ALTER on tsk_ha_lease_head is blocked by the exact criticalTx backend pid ${ctlPid} (ACCESS SHARE)`);
     await gate.query('COMMIT'); gate.release(); // release the advisory lock -> the real criticalTx proceeds + commits
     await op; // ctl.lease returns once its tx commits (ACCESS SHARE released)
     await altering;

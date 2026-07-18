@@ -313,11 +313,13 @@ async function assertSerializable(exec: PgExecutor): Promise<void> {
 }
 async function pinSchema(exec: PgExecutor, schema: string): Promise<void> {
   if (!SCHEMA_RE.test(schema)) throw new ContractValidationError(`invalid schema identifier: ${schema}`);
-  // (R9-HIGH1) list pg_temp EXPLICITLY LAST so a temp table cannot shadow the unqualified authority
-  // tables (PG otherwise searches pg_temp FIRST for relations). pg_catalog is pinned before the
-  // schema so catalog functions cannot be shadowed either.
-  await exec.query('SELECT set_config($1, $2, true)', ['search_path', `${schema}, pg_catalog, pg_temp`]);
-  const cur = (await exec.query('SELECT current_schema() AS s')).rows[0]?.s;
+  // (R10-CRITICAL) OMIT pg_catalog from search_path: when it is not listed, PG searches it FIRST for
+  // ALL objects, so a configured-schema function/operator (e.g. a malicious public.clock_timestamp
+  // that could spoof control time) can NEVER shadow a system builtin. pg_temp is LAST so a temp
+  // table cannot shadow the authority RELATIONS (which resolve to the configured schema first).
+  // Every system function/catalog below is ALSO pg_catalog-qualified as defense in depth.
+  await exec.query('SELECT pg_catalog.set_config($1, $2, true)', ['search_path', `${schema}, pg_temp`]);
+  const cur = (await exec.query('SELECT pg_catalog.current_schema() AS s')).rows[0]?.s;
   if (cur !== schema) throw new ContractValidationError(`schema context mismatch: current_schema=${String(cur)} pinned=${schema}`);
 }
 /** (R9-HIGH1) Assert every governed table resolves (UNQUALIFIED, as the authority SQL sees it) to
@@ -325,9 +327,9 @@ async function pinSchema(exec: PgExecutor, schema: string): Promise<void> {
 async function assertNoShadow(exec: PgExecutor, schema: string): Promise<void> {
   const rows = (await exec.query(
     `SELECT t.name, n.nspname
-     FROM unnest($1::text[]) AS t(name)
-     LEFT JOIN pg_class c ON c.oid = to_regclass(t.name)
-     LEFT JOIN pg_namespace n ON n.oid = c.relnamespace`, [[...HA_CONTROL_TABLES]])).rows;
+     FROM pg_catalog.unnest($1::text[]) AS t(name)
+     LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(t.name)
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace`, [[...HA_CONTROL_TABLES]])).rows;
   for (const r of rows) {
     if (r.nspname !== schema) {
       throw new ContractValidationError(`governed table ${String(r.name)} resolves to '${String(r.nspname)}' not '${schema}' — possible pg_temp shadow; quarantine`);
@@ -354,27 +356,27 @@ async function controlManifest(exec: PgExecutor): Promise<string> {
   const tables = [...MANIFEST_TABLES];
   const cols = (await exec.query(
     `SELECT table_name, ordinal_position, column_name, data_type, is_nullable, COALESCE(column_default,'') AS column_default
-     FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ANY($1)
+     FROM information_schema.columns WHERE table_schema = pg_catalog.current_schema() AND table_name = ANY($1)
      ORDER BY table_name, ordinal_position`, [tables])).rows;
   const cons = (await exec.query(
-    `SELECT rel.relname AS t, c.contype, pg_get_constraintdef(c.oid) AS def
-     FROM pg_constraint c JOIN pg_class rel ON rel.oid = c.conrelid JOIN pg_namespace n ON n.oid = rel.relnamespace
-     WHERE n.nspname = current_schema() AND rel.relname = ANY($1) AND c.contype IN ('p','c','u','f')
+    `SELECT rel.relname AS t, c.contype, pg_catalog.pg_get_constraintdef(c.oid) AS def
+     FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class rel ON rel.oid = c.conrelid JOIN pg_catalog.pg_namespace n ON n.oid = rel.relnamespace
+     WHERE n.nspname = pg_catalog.current_schema() AND rel.relname = ANY($1) AND c.contype IN ('p','c','u','f')
      ORDER BY rel.relname, c.contype, def`, [tables])).rows;
   const idx = (await exec.query(
-    `SELECT tablename AS t, indexname AS n, indexdef AS def FROM pg_indexes
-     WHERE schemaname = current_schema() AND tablename = ANY($1) ORDER BY tablename, indexname`, [tables])).rows;
+    `SELECT tablename AS t, indexname AS n, indexdef AS def FROM pg_catalog.pg_indexes
+     WHERE schemaname = pg_catalog.current_schema() AND tablename = ANY($1) ORDER BY tablename, indexname`, [tables])).rows;
   const trg = (await exec.query(
-    `SELECT rel.relname AS t, tg.tgname AS n, pg_get_triggerdef(tg.oid) AS def
-     FROM pg_trigger tg JOIN pg_class rel ON rel.oid = tg.tgrelid JOIN pg_namespace ns ON ns.oid = rel.relnamespace
-     WHERE ns.nspname = current_schema() AND rel.relname = ANY($1) AND NOT tg.tgisinternal ORDER BY rel.relname, tg.tgname`, [tables])).rows;
+    `SELECT rel.relname AS t, tg.tgname AS n, pg_catalog.pg_get_triggerdef(tg.oid) AS def
+     FROM pg_catalog.pg_trigger tg JOIN pg_catalog.pg_class rel ON rel.oid = tg.tgrelid JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace
+     WHERE ns.nspname = pg_catalog.current_schema() AND rel.relname = ANY($1) AND NOT tg.tgisinternal ORDER BY rel.relname, tg.tgname`, [tables])).rows;
   const rel = (await exec.query(
     `SELECT rel.relname AS t, rel.relkind, rel.relpersistence, rel.relrowsecurity, rel.relforcerowsecurity
-     FROM pg_class rel JOIN pg_namespace ns ON ns.oid = rel.relnamespace
-     WHERE ns.nspname = current_schema() AND rel.relname = ANY($1) ORDER BY rel.relname`, [tables])).rows;
+     FROM pg_catalog.pg_class rel JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace
+     WHERE ns.nspname = pg_catalog.current_schema() AND rel.relname = ANY($1) ORDER BY rel.relname`, [tables])).rows;
   const pol = (await exec.query(
     `SELECT tablename AS t, policyname AS n, permissive, roles::text AS roles, cmd, COALESCE(qual,'') AS qual, COALESCE(with_check,'') AS wc
-     FROM pg_policies WHERE schemaname = current_schema() AND tablename = ANY($1) ORDER BY tablename, policyname`, [tables])).rows;
+     FROM pg_catalog.pg_policies WHERE schemaname = pg_catalog.current_schema() AND tablename = ANY($1) ORDER BY tablename, policyname`, [tables])).rows;
   return [
     `V${CONTROL_SCHEMA_VERSION}`,
     ...cols.map((r) => `C|${r.table_name}|${r.ordinal_position}|${r.column_name}|${r.data_type}|${r.is_nullable}|${r.column_default}`),
@@ -570,13 +572,13 @@ export class HaControlFencing {
       // (R9-HIGH2) the singleton authority-stamp check runs on EVERY op — the attestEveryTx opt-out
       // only assumes no DDL, but a DML mutation of version/catalog_manifest must still fail closed.
       await revalidateAuthorityRow(exec);
-      await exec.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [sid]);
+      await exec.query('SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))', [sid]);
       return fn(exec);
     });
   }
 
   private async controlNowMs(exec: PgExecutor): Promise<number> {
-    return vInt((await exec.query('SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS ms')).rows[0]?.ms, 'control now', 0, MAX_MS);
+    return vInt((await exec.query('SELECT (extract(epoch from pg_catalog.clock_timestamp()) * 1000)::bigint AS ms')).rows[0]?.ms, 'control now', 0, MAX_MS);
   }
 
   // ── provisioning saga (H5: durable signed per-step tx; Redis epoch-0 genesis) ──
@@ -730,7 +732,7 @@ export class HaControlFencing {
         throw new FenceAuthorityQuarantineError('lease holder/leaseId is immutable within an epoch — advance the epoch to change the writer');
       }
       // monotonic max-expiry across ALL grants at this epoch (no holder pivot can shorten it)
-      const priorMax = vInt((await exec.query('SELECT COALESCE(max(granted_max_expiry_ms), 0) AS m FROM tsk_ha_lease_history WHERE stream_id=$1 AND epoch=$2', [s, epoch])).rows[0].m, 'prior max expiry', 0, MAX_MS);
+      const priorMax = vInt((await exec.query('SELECT COALESCE(pg_catalog.max(granted_max_expiry_ms), 0) AS m FROM tsk_ha_lease_history WHERE stream_id=$1 AND epoch=$2', [s, epoch])).rows[0].m, 'prior max expiry', 0, MAX_MS);
       if (reqMax < priorMax) throw new ContractValidationError(`grantedMaxExpiryMs ${reqMax} would shorten the monotonic fence horizon ${priorMax}`);
       const grantSeq = (cur?.grantSeq ?? 0) + 1;
       const prev = cur?.grantDigest ?? null;
@@ -899,7 +901,7 @@ export class HaControlFencing {
     if (lease.status !== 'revoked') throw new FenceAuthorityQuarantineError('lease is not revoked — A not proven fenced');
     // max-expiry over ALL grants at epoch target-1 (holder+leaseId is immutable per epoch, so this
     // covers every writer that could hold epoch target-1) — a revoke can never shorten it.
-    const maxExpiryMs = vInt((await exec.query('SELECT COALESCE(max(granted_max_expiry_ms), 0) AS m FROM tsk_ha_lease_history WHERE stream_id=$1 AND epoch=$2', [s, lease.epoch])).rows[0].m, 'max grant expiry', 0, MAX_MS);
+    const maxExpiryMs = vInt((await exec.query('SELECT COALESCE(pg_catalog.max(granted_max_expiry_ms), 0) AS m FROM tsk_ha_lease_history WHERE stream_id=$1 AND epoch=$2', [s, lease.epoch])).rows[0].m, 'max grant expiry', 0, MAX_MS);
     const now = await this.controlNowMs(exec);
     if (now < maxExpiryMs + margin) throw new FenceAuthorityQuarantineError('lease grant has not expired past the safety margin — A not proven fenced (wait or STONITH)');
     return { holderNodeId: lease.holderNodeId, grantSeq: lease.grantSeq, grantDigest: lease.grantDigest, maxExpiryMs, controlNowMs: now };
