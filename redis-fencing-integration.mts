@@ -7,7 +7,7 @@ import {
   handlePromotionCommand,
   signGuardCommand,
 } from './packages/server/src/promotion.ts';
-import { RedisFencingStore } from './packages/server/src/redis-fencing-store.ts';
+import { RedisFencingStore, FenceDurabilityUncertainError } from './packages/server/src/redis-fencing-store.ts';
 import { MemoryTumblerStore } from './packages/server/src/store.ts';
 import type { ReplicationCheckpoint } from './packages/server/src/replicating-tumbler-store.ts';
 
@@ -120,6 +120,22 @@ try {
     let rejected = false;
     try { await fenceA.current(); } catch { rejected = true; }
     assert(rejected, 'corrupt record was accepted as empty/current');
+  });
+
+  await test('enforced-WAIT: a CAS that WROTE but the replica quorum did not ACK throws typed Uncertain (not ordinary false)', async () => {
+    const durKey = `${key}:dur`;
+    await redisA.del(durKey);
+    const durStore = new RedisFencingStore(redisA, durKey, { waitReplicas: 1, waitTimeoutMs: 500 });
+    // single node, NO replicas → WAIT returns 0 < 1 → the CAS wrote but durability is UNKNOWN → typed throw.
+    let typed = false, stored = false;
+    try { await durStore.claim({ nodeId: 'B', fenceEpoch: 1, expiresAt: Date.now() + 3_600_000, commandId: 'c1' }); }
+    catch (e) { typed = e instanceof FenceDurabilityUncertainError; stored = (e as FenceDurabilityUncertainError).storedTuple?.fenceEpoch === 1; }
+    assert(typed, 'expected a typed FenceDurabilityUncertainError, not an ordinary false, when WAIT under-acks after a successful CAS');
+    assert(stored, 'the typed error must carry the exact stored tuple for reconciliation');
+    // a CAS that is REFUSED (epoch not strictly higher) is an ordinary durable no-op — false, NEVER a throw.
+    const refused = await durStore.claim({ nodeId: 'B', fenceEpoch: 1, expiresAt: Date.now() + 3_600_000, commandId: 'c1' });
+    assert(refused === false, 'a refused CAS must return ordinary false (no WAIT ambiguity)');
+    await redisA.del(durKey);
   });
 } finally {
   await redisA.del(key).catch(() => undefined);

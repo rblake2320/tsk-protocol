@@ -15,7 +15,9 @@
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { writeFileSync, rmSync } from 'node:fs';
+import { writeFileSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { generateKeyPairSync, sign as edSign } from 'node:crypto';
 import pg from 'pg';
 import { Redis } from 'ioredis';
@@ -132,9 +134,11 @@ async function main() {
     [HEAD_KEY]: headKp.publicKey.export({ type: 'spki', format: 'pem' }) as string,
     [B_KEY]: bKp.publicKey.export({ type: 'spki', format: 'pem' }) as string,
   };
-  const handoffPath = './tsk-sigkill-handoff.json';
+  // the handoff carries the control HMAC secret → create it in the OS temp dir with restrictive 0600
+  // perms (owner-only), and clean it up in an OUTER try/finally on EVERY exit path (not only success).
+  const handoffPath = join(tmpdir(), `tsk-sigkill-handoff-${process.pid}.json`);
   const claimExpiresAtMs = Date.now() + HOUR; // STABLE across workers so an advanceEpoch re-claim reads back byte-identical
-  writeFileSync(handoffPath, JSON.stringify({ SID, CMD, TARGET, ctrlKeyId: CTRL_KEY, ctrlSecretHex: ctrlSecret.toString('hex'), pubKeys, frozen, bReceipt, ctrlUrl: CTRL_URL, redisUrl: REDIS_URL, claimExpiresAtMs }));
+  writeFileSync(handoffPath, JSON.stringify({ SID, CMD, TARGET, ctrlKeyId: CTRL_KEY, ctrlSecretHex: ctrlSecret.toString('hex'), pubKeys, frozen, bReceipt, ctrlUrl: CTRL_URL, redisUrl: REDIS_URL, claimExpiresAtMs }), { mode: 0o600 });
 
   const phase = async () => (await ctl.cutover(SID))?.phase ?? null;
   const evidence = async () => (await ctl.cutover(SID))?.evidence ?? null;
@@ -150,6 +154,7 @@ async function main() {
     ['activate', 'READY', 'ACTIVE', 1],
   ];
 
+  try {
   for (const [transition, before, after, txIdx] of MATRIX) {
     // before advanceEpoch, the parent must have installed the REVOKED control lease (freeze proof).
     if (transition === 'advance') await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'a2' });
@@ -181,13 +186,18 @@ async function main() {
     assert.equal(ev.k, 'active/v1'); assert.equal(ev.bSystemId, bSysId); assert.equal(ev.sourceSystemId, aSysId); assert.equal(ev.controlSystemId, cSysId);
   });
 
+  } finally {
+    // the handoff carries the control HMAC secret — remove it on EVERY exit path (success OR failure).
+    rmSync(handoffPath, { force: true });
+  }
+  await check('the handoff (test key material) is cleaned up (secret hygiene)', async () => {
+    assert.equal(existsSync(handoffPath), false, 'handoff file must not remain on disk after the drill');
+  });
   console.log('\n# ── measured per-fault RPO / RTO (child-process SIGKILL) ──');
   console.log('  fault: SIGKILL of the cutover worker at EACH phase (before-commit ×5, after-commit ×5)');
   console.log('  RPO  : 0  (before-commit → PG rollback, no torn state; after-commit → durable, idempotent resume)');
   console.log(`  RTO  : ${Math.round(rtoTotal / MATRIX.length)} ms avg  (fresh child spawn → phase re-converged), ${rtoTotal} ms total over ${MATRIX.length} phases`);
   console.log(`\n# ${passed} PR2c SIGKILL-matrix checks passed`);
-
-  rmSync(handoffPath, { force: true }); // the handoff carries key material — never leave it on disk
   await aPool.end(); await bPool.end(); await cPool.end(); await redis.quit();
 }
 main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });

@@ -40,7 +40,7 @@ const B_KEY = 'b-1'; const bKp = generateKeyPairSync('ed25519');
 const resolver: SourceVerifyKeyResolver = { resolve: (k) => (k === GUARD_KEY ? guard.publicKey : k === SOURCE_KEY ? source.publicKey : k === HEAD_KEY ? headKp.publicKey : k === BHEAD_KEY ? bHeadKp.publicKey : k === B_KEY ? bKp.publicKey : null) };
 const CTRL_KEY = 'ctrl-1'; const ctrlSecret = Buffer.alloc(32, 0x2b);
 const ctrlResolver: GuardKeyResolver = { resolve: (kid) => (kid === CTRL_KEY ? ctrlSecret : null) };
-const POLICY: HaControlPolicy = { minClaimRemainingMs: 5_000 };
+const POLICY: HaControlPolicy = { minClaimRemainingMs: 5_000, sourceGuard: { keyId: GUARD_KEY, privateKey: guard.privateKey, activationTtlMs: 3_600_000 } };
 const mkSigner = (kid: string, priv: Parameters<typeof edSign>[2]): StreamHeadSigner => ({ keyId: kid, alg: 'ed25519', async sign(d) { return edSign(null, Buffer.from(d, 'utf8'), priv).toString('base64url'); } });
 const signer = mkSigner(HEAD_KEY, headKp.privateKey);
 const bSigner = mkSigner(BHEAD_KEY, bHeadKp.privateKey);
@@ -123,14 +123,16 @@ async function main() {
   await ctl.activate(SID, CMD, TARGET);
 
   let bGrant: Awaited<ReturnType<typeof ctl.activateSource>>;
-  await check('activateSource mints a GUARD-signed governed B lease at the PROMOTED epoch, bound to the ACTIVE head + BFinalizedReceipt', async () => {
-    bGrant = await ctl.activateSource(SID, CMD, TARGET, bReceipt, resolver, { guardKeyId: GUARD_KEY, guardPrivateKey: guard.privateKey, holderNodeId: 'B', leaseId: 'lb', leaseExpiresAtMs: (await ctlNow()) + HOUR });
+  await check('activateSource mints a GUARD-signed governed B lease at the PROMOTED epoch via the CONFIGURED authority, holder==ratified B, durable + rehydratable', async () => {
+    bGrant = await ctl.activateSource(SID, CMD, TARGET, bReceipt, resolver); // no per-call key; guard from config
     verifyLeaseGrant(resolver, bGrant); // B independently verifies with the guard PUBLIC key (unforgeable)
-    assert.equal(bGrant.leaseEpoch, TARGET); assert.equal(bGrant.holderNodeId, 'B'); assert.equal(bGrant.leaseStatus, 'active'); assert.equal(bGrant.commandId, CMD);
-    // a receipt that was NOT ratified into the ACTIVE head is refused
+    assert.equal(bGrant.leaseEpoch, TARGET); assert.equal(bGrant.holderNodeId, B_KEY, 'holder is the ratified B signing identity'); assert.equal(bGrant.leaseStatus, 'active'); assert.equal(bGrant.commandId, CMD);
+    // (recovery) a RETRY rehydrates the byte-identical grant — never a different or conflicting one.
+    const again = await ctl.activateSource(SID, CMD, TARGET, bReceipt, resolver);
+    assert.equal(again.grantDigest, bGrant.grantDigest); assert.deepEqual(again, bGrant);
+    // a receipt that was NOT ratified into the ACTIVE head is refused.
     const bogus = { ...bReceipt, n: 999 };
-    const exp = (await ctlNow()) + HOUR;
-    await assert.rejects(() => ctl.activateSource(SID, CMD, TARGET, bogus as typeof bReceipt, resolver, { guardKeyId: GUARD_KEY, guardPrivateKey: guard.privateKey, holderNodeId: 'B', leaseId: 'lb', leaseExpiresAtMs: exp }), /verif|not the one ratified|digest mismatch/i);
+    await assert.rejects(() => ctl.activateSource(SID, CMD, TARGET, bogus as typeof bReceipt, resolver), /verif|not the one ratified|digest mismatch/i);
   });
 
   await check('B installs the governed lease, seeds its checkpoint to (N, head@N), and ORIGINATES sequence N+1 through the fenced outbox', async () => {
@@ -138,7 +140,7 @@ async function main() {
     await bPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,$2)', [SID, TARGET]);
     await bPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence, head_digest) VALUES ($1,$2,$3,$4)', [SID, SRC_EPOCH, N, headAtN]);
     await bTx.transaction((exec) => installLeaseGrant(exec, resolver, bGrant));
-    const bReadySrc = await assertSourceFenceReady(bTx, SCHEMA, resolver, { streamId: SID, holderNodeId: 'B', leaseId: 'lb', grantDigest: bGrant.grantDigest });
+    const bReadySrc = await assertSourceFenceReady(bTx, SCHEMA, resolver, { streamId: SID, holderNodeId: bGrant.holderNodeId, leaseId: bGrant.leaseId, grantDigest: bGrant.grantDigest });
     const bREADY = await provisionSchemaVersion(bTx, SCHEMA);
     const bOb = new PgTskDurableOutbox(bTx, bREADY, { streamId: SID, sanitizer, signer: bSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready: bReadySrc });
     const res = await bOb.withOutboxTx((wtx) => bOb.appendInTx(wtx, { streamId: SID, rawMutation: { tumblerId: 'T9', counter: 1 }, fenceToken: BigInt(TARGET) }));

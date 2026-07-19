@@ -77,28 +77,30 @@ async function main() {
   });
 
   const oldMasterAddr = await masterAddr();
-  // a RECONNECTING process uses a fresh Sentinel-backed client (it does NOT inherit the dead connection);
-  // this measures data-plane RTO (Sentinel failover + connect), not one long-lived socket's slow follow.
-  const freshStore = () => new RedisFencingStore(new Redis({ sentinels: SENTINELS, name: MASTER_NAME, role: 'master', natMap: NATMAP, maxRetriesPerRequest: 5, sentinelRetryStrategy: () => 200 }), FENCE_KEY, { waitReplicas: 1, waitTimeoutMs: 3_000 });
+  // a RECONNECTING process uses a FRESH Sentinel-backed client created AFTER failover (it does NOT inherit
+  // the dead socket); this measures data-plane RTO (Sentinel failover + connect), not one long-lived
+  // socket's slow follow.
+  let survivor!: RedisFencingStore;
 
-  let rtoMs = 0; let survivor: ReturnType<typeof freshStore>;
-  await check('MASTER CRASH (SHUTDOWN NOSAVE) → Sentinel promotes a replica; the durably-claimed fence SURVIVES (RPO=0)', async () => {
-    const t0 = now();
-    execFileSync('docker', ['exec', MASTER_CONTAINER, 'redis-cli', 'SHUTDOWN', 'NOSAVE'], { stdio: 'ignore' }); // real crash
+  let t0 = 0, readableMs = 0, rtoMs = 0;
+  await check('MASTER CRASH (abrupt SIGKILL) → Sentinel promotes a replica; the durably-claimed fence SURVIVES (RPO=0)', async () => {
+    t0 = now();
+    try { execFileSync('docker', ['kill', '-s', 'KILL', MASTER_CONTAINER], { stdio: 'ignore' }); } catch { /* container already gone */ } // ABRUPT crash, deterministic exit
     const newMasterAddr = await waitFor('sentinel promotes a new master', async () => { const a = await masterAddr(); if (JSON.stringify(a) === JSON.stringify(oldMasterAddr)) throw new Error('same'); return a; }, 30_000, 250);
     assert.notDeepEqual(newMasterAddr, oldMasterAddr, 'Sentinel promoted a new master');
-    survivor = freshStore();
+    survivor = new RedisFencingStore(new Redis({ sentinels: SENTINELS, name: MASTER_NAME, role: 'master', natMap: NATMAP, maxRetriesPerRequest: 5, sentinelRetryStrategy: () => 200 }), FENCE_KEY, { waitReplicas: 1, waitTimeoutMs: 3_000 });
     const cur = await waitFor('fence readable on the promoted master', async () => { const c = await survivor.current(); if (!c) throw new Error('no fence yet'); return c; }, 30_000, 200);
-    rtoMs = now() - t0;
+    readableMs = now() - t0; // sub-time: fault → fence READABLE (read path recovered)
     assert.ok(cur.fenceEpoch === 1 && cur.nodeId === 'B' && cur.commandId === 'c1', 'the epoch-1 fence survived the failover unchanged (RPO=0)');
   });
 
-  await check('the promoted master is WRITABLE + MONOTONIC: epoch 2 durably claims, epoch 1 is refused (no rollback)', async () => {
+  await check('the promoted master is DURABLY WRITABLE + MONOTONIC: enforced-WAIT epoch 2 claims, epoch 1 refused (no rollback)', async () => {
     await waitFor('epoch 2 durable claim on the new master', async () => {
-      const ok2 = await survivor.claim({ nodeId: 'B2', fenceEpoch: 2, expiresAt: Date.now() + HOUR, commandId: 'c2' }); // enforced WAIT quorum
+      const ok2 = await survivor.claim({ nodeId: 'B2', fenceEpoch: 2, expiresAt: Date.now() + HOUR, commandId: 'c2' }); // enforced WAIT quorum (throws if uncertain)
       if (!ok2) throw new Error('not durably writable yet');
       return ok2;
-    }, 20_000, 250);
+    }, 25_000, 250);
+    rtoMs = now() - t0; // RTO: fault → NEW AUTHORITY DURABLY WRITABLE (successful enforced-WAIT epoch-2 claim)
     assert.equal((await survivor.current())!.fenceEpoch, 2);
     const rollback = await survivor.claim({ nodeId: 'Bx', fenceEpoch: 1, expiresAt: Date.now() + HOUR, commandId: 'cx' });
     assert.equal(rollback, false, 'an older epoch cannot reclaim after failover — no split-brain rollback');
@@ -106,9 +108,10 @@ async function main() {
   });
 
   console.log('\n# ── measured per-fault RPO / RTO ──');
-  console.log(`  fault: Redis MASTER CRASH (SHUTDOWN NOSAVE) → Sentinel quorum (2-of-3) failover, 3 data nodes`);
+  console.log(`  fault: Redis MASTER CRASH (abrupt SIGKILL) → Sentinel quorum (2-of-3) failover, 3 data nodes`);
   console.log(`  RPO  : 0  (claim() enforced a WAIT replica-quorum ACK before success; fence survived, epoch/node/command unchanged)`);
-  console.log(`  RTO  : ${rtoMs} ms  (master crash → fence readable on the promoted master; +re-sync window to durably writable)`);
+  console.log(`  RTO  : ${rtoMs} ms  (fault → NEW AUTHORITY DURABLY WRITABLE: successful enforced-WAIT epoch-2 claim + converged)`);
+  console.log(`         └ sub-time: fence READABLE at ${readableMs} ms (read path recovered before durable writability)`);
   console.log(`\n# ${passed} PR2c Sentinel-failover checks passed`);
 
   await sentinelClient.quit().catch(() => {});

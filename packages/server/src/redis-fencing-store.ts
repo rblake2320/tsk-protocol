@@ -61,6 +61,18 @@ function parseFenceRecord(raw: string): FenceRecord {
  *  durably receive fails closed, so a subsequent Sentinel failover cannot roll the fence epoch back. */
 export interface FenceDurabilityPolicy { waitReplicas: number; waitTimeoutMs: number }
 
+/** Thrown when the epoch CAS SET SUCCEEDED (the fence epoch was raised on the current master) but the
+ *  configured replica quorum did NOT ACK within the WAIT window — so the write's DURABILITY is UNKNOWN.
+ *  This is DISTINCT from an ordinary `claim() === false` (CAS refused because the epoch was not higher):
+ *  here the write happened, so the caller must RECONCILE against `storedTuple` and fail closed, never
+ *  treat it as a clean "not acquired". Carries the exact stored record for reconciliation. */
+export class FenceDurabilityUncertainError extends Error {
+  constructor(readonly acked: number, readonly required: number, readonly storedTuple: FenceRecord | null) {
+    super(`fence epoch CAS wrote but only ${acked}/${required} replicas ACK'd — durability UNCERTAIN; reconcile and fail closed`);
+    this.name = 'FenceDurabilityUncertainError';
+  }
+}
+
 export class RedisFencingStore implements FencingStore {
   constructor(
     private readonly redis: Redis,
@@ -88,11 +100,17 @@ export class RedisFencingStore implements FencingStore {
       String(record.fenceEpoch),
       JSON.stringify(next),
     );
-    if (result !== 1) return false;
+    if (result !== 1) return false; // CAS refused: the epoch was not strictly higher — an ordinary, durable no-op.
     if (this.durability) {
-      // ENFORCE durable replication to a replica quorum before declaring the claim successful (RPO=0).
+      // The CAS SET SUCCEEDED (epoch raised). ENFORCE durable replication to a replica quorum before
+      // declaring success; if the quorum did not ACK, the write's durability is UNKNOWN — this is NOT an
+      // ordinary false (which means "CAS refused"), so raise a typed reconcile-and-fail-closed signal.
       const acked = Number(await this.redis.call('WAIT', String(this.durability.waitReplicas), String(this.durability.waitTimeoutMs)));
-      if (!Number.isFinite(acked) || acked < this.durability.waitReplicas) return false; // not durable — fail closed
+      if (!Number.isFinite(acked) || acked < this.durability.waitReplicas) {
+        let stored: FenceRecord | null = null;
+        try { stored = await this.current(); } catch { stored = null; }
+        throw new FenceDurabilityUncertainError(Number.isFinite(acked) ? acked : 0, this.durability.waitReplicas, stored);
+      }
     }
     return true;
   }

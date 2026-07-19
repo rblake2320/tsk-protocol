@@ -69,9 +69,9 @@ async function main() {
     assert.equal((await store.current())!.fenceEpoch, 1);
   });
 
-  let rtoMs = 0;
+  let t0 = 0, refusalMs = 0, rtoMs = 0;
   await check('PARTITION the old master ALIVE → it REFUSES writes (min-replicas-to-write; no split-brain progress)', async () => {
-    const t0 = now();
+    t0 = now();
     docker('network', 'disconnect', NETWORK, MASTER_CONTAINER); // isolate the master from the cluster; it stays running
     // the isolated master loses its replica quorum (acks age past min-replicas-max-lag) → it refuses writes.
     await waitFor('isolated old master refuses writes', async () => {
@@ -79,13 +79,14 @@ async function main() {
       if (/NOREPLICAS|not enough|good replica/i.test(out)) return true;
       throw new Error('old master still accepted a write: ' + out);
     }, 25_000, 500);
-    rtoMs = now() - t0;
+    refusalMs = now() - t0; // sub-time: partition → old master refuses (split-brain prevented)
   });
 
-  const survivor = new RedisFencingStore(new Redis({ sentinels: SENTINELS, name: MASTER_NAME, role: 'master', natMap: NATMAP, maxRetriesPerRequest: 5, sentinelRetryStrategy: () => 200 }), FENCE_KEY, { waitReplicas: 1, waitTimeoutMs: 3_000 });
-  await check('the surviving quorum promotes a NEW master that is WRITABLE + MONOTONIC; the epoch-1 fence is intact (RPO=0)', async () => {
+  let survivor!: RedisFencingStore;
+  await check('the surviving quorum promotes a NEW master that is DURABLY WRITABLE + MONOTONIC; the epoch-1 fence is intact (RPO=0)', async () => {
     await waitFor('sentinel promoted a new master', async () => { const a = await masterAddr(); if (a === oldAddr) throw new Error('not yet'); return a; }, 30_000, 250);
-    // a reconnecting client reaches the promoted master; the fence survived (RPO=0).
+    // a RECONNECTING client created AFTER promotion reaches the promoted master; the fence survived (RPO=0).
+    survivor = new RedisFencingStore(new Redis({ sentinels: SENTINELS, name: MASTER_NAME, role: 'master', natMap: NATMAP, maxRetriesPerRequest: 5, sentinelRetryStrategy: () => 200 }), FENCE_KEY, { waitReplicas: 1, waitTimeoutMs: 3_000 });
     const cur = await waitFor('fence readable on the new master', async () => { const c = await survivor.current(); if (!c) throw new Error('no fence'); return c; }, 30_000, 200);
     assert.ok(cur.fenceEpoch === 1 && cur.nodeId === 'B', 'the durably-claimed epoch-1 fence survived the partition (RPO=0)');
     await waitFor('epoch 2 durable claim on the new master', async () => {
@@ -93,6 +94,7 @@ async function main() {
       if (!ok2) throw new Error('not durably writable yet');
       return ok2;
     }, 25_000, 250);
+    rtoMs = now() - t0; // RTO: partition → NEW AUTHORITY DURABLY WRITABLE (successful enforced-WAIT epoch-2 claim)
     assert.equal((await survivor.current())!.fenceEpoch, 2);
     assert.equal(await survivor.claim({ nodeId: 'Bx', fenceEpoch: 1, expiresAt: Date.now() + HOUR, commandId: 'cx' }), false, 'old epoch refused — no rollback');
   });
@@ -107,7 +109,8 @@ async function main() {
   console.log('\n# ── measured per-fault RPO / RTO ──');
   console.log(`  fault: LIVE NETWORK PARTITION isolating the master (still running) from the cluster`);
   console.log(`  RPO  : 0  (durably WAIT-quorum-claimed epoch-1 fence intact on the promoted master; old master made NO progress)`);
-  console.log(`  RTO  : ${rtoMs} ms  (partition → isolated master refuses writes; new master promoted + writable shortly after)`);
+  console.log(`  RTO  : ${rtoMs} ms  (partition → NEW AUTHORITY DURABLY WRITABLE: promotion + successful enforced-WAIT epoch-2 claim)`);
+  console.log(`         └ sub-time: isolated old master REFUSED writes at ${refusalMs} ms (split-brain prevented before promotion completed)`);
   console.log(`\n# ${passed} PR2c split-brain-partition checks passed`);
 
   await sentinelClient.quit().catch(() => {});
