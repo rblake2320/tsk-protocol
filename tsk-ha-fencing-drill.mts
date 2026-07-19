@@ -14,14 +14,23 @@
  * quorum, the child-process SIGKILL crash matrix, and measured RPO/RTO remain later PR2b/PR2c.
  */
 import assert from 'node:assert/strict';
+import { generateKeyPairSync } from 'node:crypto';
 import pg from 'pg';
 import { Redis } from 'ioredis';
 import {
   HA_CONTROL_PG_SCHEMA, HA_CONTROL_TABLES, HA_CONTROL_MANIFEST_DIGEST, HaControlFencing, GuardSigner,
   NodePostgresTransactor, RedisFencingStore, FenceAuthorityQuarantineError,
   provisionControlSchema, assertControlSchemaReady, assertRedisAuthority, reconcileFencedRedis,
+  TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, signLeaseGrant, installLeaseGrant, emitSourceFrozenReceipt,
   type GuardKeyResolver, type FenceProof, type ControlSchemaReadyToken, type FenceEvidence, type HaControlPolicy,
+  type SourceVerifyKeyResolver, type SourceFrozenReceipt,
 } from './packages/server/dist/index.js';
+
+// ed25519 SOURCE custody (independent of the HMAC control guard) — needed to mint a real, verifiable
+// SourceFrozenReceipt so the control can reach SOURCE_FENCED before advanceEpoch (the §4 ordering gate).
+const SRC_KEY = 'src-1'; const srcKp = generateKeyPairSync('ed25519'); const srcSecret = srcKp.privateKey;
+const SRC_GUARD_KEY = 'srcguard-1'; const srcGuardKp = generateKeyPairSync('ed25519'); const srcGuardSecret = srcGuardKp.privateKey;
+const srcResolver: SourceVerifyKeyResolver = { resolve: (k) => (k === SRC_KEY ? srcKp.publicKey : k === SRC_GUARD_KEY ? srcGuardKp.publicKey : null) };
 
 const PG_URL = process.env['TSK_TEST_CONTROL_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
 if (!PG_URL) throw new Error('TSK_TEST_CONTROL_PG_URL (control PG16) is required');
@@ -48,9 +57,24 @@ async function main() {
   await redis.flushdb();
   await pool.query(`DROP TABLE IF EXISTS ${HA_CONTROL_TABLES.join(', ')} CASCADE`);
   for (const s of HA_CONTROL_PG_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
+  // source lease + checkpoint tables (same control PG) — used ONLY to mint a real frozen receipt to bind.
+  await pool.query('DROP TABLE IF EXISTS tsk_outbox_rows, tsk_outbox_applied, tsk_outbox_fence, tsk_outbox_source_checkpoint, tsk_outbox_receiver_checkpoint, tsk_outbox_publisher_lease, tsk_outbox_quarantine, tsk_hotp_consumed, tsk_outbox_stream_halted, tsk_outbox_meta, tsk_source_lease, tsk_source_lease_history CASCADE');
+  for (const s of TSK_OUTBOX_PG_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
+  for (const s of TSK_SOURCE_LEASE_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
   const tx = new NodePostgresTransactor(pool as never);
   const storeFor = (sid: string) => new RedisFencingStore(redis, `tsk:fence:${sid}`);
   const nowMs = async () => Number((await pool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
+  // Mint a REAL ed25519 SourceFrozenReceipt for (sid, cmd) at N=0 (genesis freeze): a signed active→revoked
+  // source lease + a seq-0 checkpoint is all emitSourceFrozenReceipt needs. Bound via ctl.bindSourceFenced.
+  const freezeAt0 = async (sid: string, cmd: string): Promise<SourceFrozenReceipt> => {
+    await pool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0) ON CONFLICT (stream_id) DO NOTHING', [sid, 'e1']);
+    const now = await nowMs();
+    const g = signLeaseGrant(SRC_GUARD_KEY, srcGuardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'sl1', commandId: 'sgrant-' + cmd, leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 1, prevGrantDigest: null });
+    await tx.transaction((exec) => installLeaseGrant(exec, srcResolver, g));
+    const rev = signLeaseGrant(SRC_GUARD_KEY, srcGuardSecret, { streamId: sid, leaseEpoch: 0, leaseStatus: 'revoked', holderNodeId: 'A', leaseId: 'sl1', commandId: cmd, leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 2, prevGrantDigest: g.grantDigest });
+    await tx.transaction((exec) => installLeaseGrant(exec, srcResolver, rev));
+    return emitSourceFrozenReceipt(tx as never, 'public', { sourceKeyId: SRC_KEY, sourcePrivateKey: srcSecret, leaseResolver: srcResolver, headResolver: srcResolver }, { streamId: sid, commandId: cmd, epoch: 0, sourceNodeId: 'A' });
+  };
   const histCount = async (t: string, sid: string) => Number((await pool.query(`SELECT count(*)::int AS n FROM ${t} WHERE stream_id=$1`, [sid])).rows[0].n);
   // The EXACT criticalTx backend = the one waiting on an advisory lock that is blocked BY `gatePid`
   // (which holds this stream's advisory lock) — binds to the exact stream key + backend, no bit math.
@@ -253,9 +277,14 @@ async function main() {
     const SID2 = 'tsk:pair:advance/v1';
     await ctl.provision(SID2, 'g-adv');
     const store = storeFor(SID2);
+    const frozen2 = await freezeAt0(SID2, 'c1'); // real ed25519 frozen receipt for this (stream, command)
     const past = (await nowMs()) - 5_000;
     await ctl.writeLease({ streamId: SID2, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a1' });
     await ctl.beginPromotionIntent(SID2, 'c1', 1);
+    // advanceEpoch now REQUIRES a bound SOURCE_FENCED — a PREPARING cutover cannot be fenced.
+    const claimExp = (await nowMs()) + HOUR;
+    await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, { safetyMarginMs: 0, claimExpiresAtMs: claimExp }), /no matching SOURCE_FENCED intent/);
+    await ctl.bindSourceFenced(SID2, 'c1', 1, frozen2, srcResolver); // PREPARING → SOURCE_FENCED
     await assert.rejects(() => ctl.writeLease({ streamId: SID2, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a2' }), /frozen while a promotion is in-flight/);
     const proof: FenceProof = { safetyMarginMs: 0, claimExpiresAtMs: (await nowMs()) + HOUR };
     await assert.rejects(() => ctl.advanceEpoch(SID2, 'c1', 1, 'B', store, proof), FenceAuthorityQuarantineError); // not revoked
@@ -275,9 +304,11 @@ async function main() {
   await check('fence-advance min-TTL: a claim TTL below the configured worst-case budget quarantines', async () => {
     const SID3 = 'tsk:pair:ttl/v1';
     await ctl.provision(SID3, 'g-ttl');
+    const frozen3 = await freezeAt0(SID3, 'c1');
     const past = (await nowMs()) - 5_000;
     await ctl.writeLease({ streamId: SID3, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 't1' });
     await ctl.beginPromotionIntent(SID3, 'c1', 1);
+    await ctl.bindSourceFenced(SID3, 'c1', 1, frozen3, srcResolver);
     await ctl.writeLease({ streamId: SID3, leaseId: 'l', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: past, grantCommandId: 't2' });
     const tooSoon = (await nowMs()) + 2_000; // remaining 2s < 5s budget
     await assert.rejects(() => ctl.advanceEpoch(SID3, 'c1', 1, 'B', storeFor(SID3), { safetyMarginMs: 0, claimExpiresAtMs: tooSoon }), /below the configured min budget/);
