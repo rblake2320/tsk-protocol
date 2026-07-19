@@ -72,6 +72,16 @@ export function fenceTokenForEpoch(epoch: number): string {
  *  closed: Redis absent/rolled-back, A not proven fenced, or a frozen invariant violated. */
 export class FenceAuthorityQuarantineError extends ContractValidationError {}
 
+/** Synchronously DECOUPLE + deep-freeze an untrusted, caller-owned receipt BEFORE the first await, so a
+ *  concurrent caller mutation between the sync verify and the in-tx use cannot cause a TOCTOU (mirrors the
+ *  §3 receiver `verifiedExportSnapshot` discipline). The frozen snapshot is the ONLY value used thereafter. */
+function frozenSnapshot<T>(x: T): T {
+  const snap = JSON.parse(JSON.stringify(x)) as T;
+  const freeze = (o: unknown): void => { if (o && typeof o === 'object') { Object.freeze(o); for (const v of Object.values(o as Record<string, unknown>)) freeze(v); } };
+  freeze(snap);
+  return snap;
+}
+
 // ── guard signing (HMAC over length-prefixed, keyId-bound, canonical framing) ─
 
 /** Resolves a guard keyId to its secret, or null if unknown/revoked (rotation + revocation). */
@@ -830,8 +840,10 @@ export class HaControlFencing {
   }
 
   /**
-   * Advance the epoch (fence the old writer) for a PREPARING intent. NO cross-tx TOCTOU:
-   * grants are frozen once PREPARING, and the final witness/FENCED tx RE-READS and RE-ASSERTS
+   * Advance the epoch (fence the old writer) for a SOURCE_FENCED intent — the source freeze MUST already be
+   * bound (bindSourceFenced) before a control can FENCE. This makes the §4 ordering a single-chokepoint
+   * invariant: FENCED is unreachable without a durably-bound, source-signed frozen receipt. NO cross-tx
+   * TOCTOU: grants are frozen once a promotion is in-flight, and the final witness/FENCED tx RE-READS and RE-ASSERTS
    * the exact revoked lease (by digest), the control clock vs the MONOTONIC max grant-expiry,
    * and the full Redis claim tuple. The control clock is read IN-TX (never from the caller).
    * A completed advance is idempotent (H7). Returns the fence token + the signed evidence.
@@ -852,7 +864,7 @@ export class HaControlFencing {
         return { done: true as const, evidence: cut.evidence };
       }
       const w = await this.readWitness(exec, s);
-      if (!cut || (cut.phase !== 'PREPARING' && cut.phase !== 'SOURCE_FENCED') || cut.commandId !== cmd || cut.epoch !== target) throw new ContractValidationError('no matching PREPARING/SOURCE_FENCED intent for this promotion');
+      if (!cut || cut.phase !== 'SOURCE_FENCED' || cut.commandId !== cmd || cut.epoch !== target) throw new ContractValidationError('no matching SOURCE_FENCED intent for this promotion — bind the source freeze (bindSourceFenced) before fencing');
       if (!w || w.state !== 'provisioned') throw new FenceAuthorityQuarantineError('stream not provisioned');
       if (w.epoch !== target - 1) throw new ContractValidationError(`witness epoch ${w.epoch} is not targetEpoch-1 (${target - 1})`);
       const ev = await this.proveOldFenced(exec, s, target, margin);
@@ -881,7 +893,7 @@ export class HaControlFencing {
         reconcileFencedRedis(await fencingStore.current(), decodeEvidence(cut.evidence), cmd); // R5-H2/R7-HIGH2
         return { epoch: target, fenceToken: fenceTokenForEpoch(target), evidence: null, idempotent: true };
       }
-      if (!cut || (cut.phase !== 'PREPARING' && cut.phase !== 'SOURCE_FENCED') || cut.commandId !== cmd || cut.epoch !== target) throw new ContractValidationError('intent changed under promotion — abort');
+      if (!cut || cut.phase !== 'SOURCE_FENCED' || cut.commandId !== cmd || cut.epoch !== target) throw new ContractValidationError('intent changed under promotion — abort');
       const w = await this.readWitness(exec, s);
       if (!w || w.state !== 'provisioned' || w.epoch !== target - 1) throw new FenceAuthorityQuarantineError('witness changed under promotion — abort');
       const ev2 = await this.proveOldFenced(exec, s, target, margin); // re-read exact revoked lease + control clock
@@ -917,16 +929,26 @@ export class HaControlFencing {
     const s = vId(streamId, STREAM_ID_RE, 'streamId');
     const cmd = vId(commandId, ID_RE, 'commandId');
     const target = vInt(targetEpoch, 'targetEpoch', 1, MAX_EPOCH);
-    verifySourceFrozenReceipt(frozenResolver, frozenReceipt); // ed25519 over A's public key — throws on tamper
-    if (frozenReceipt.commandId !== cmd) throw new FenceAuthorityQuarantineError('frozen receipt commandId != cutover command — quarantine');
-    if (frozenReceipt.streamId !== s) throw new FenceAuthorityQuarantineError('frozen receipt streamId != cutover stream — quarantine');
+    // (H1) synchronously DECOUPLE + freeze the caller-owned receipt and capture the resolver BEFORE any await;
+    // everything below uses ONLY the immutable snapshot, so a concurrent caller mutation cannot TOCTOU us.
+    const fr = frozenSnapshot(frozenReceipt);
+    const resolver = frozenResolver;
+    verifySourceFrozenReceipt(resolver, fr); // ed25519 over A's public key — throws on tamper
+    if (fr.commandId !== cmd) throw new FenceAuthorityQuarantineError('frozen receipt commandId != cutover command — quarantine');
+    if (fr.streamId !== s) throw new FenceAuthorityQuarantineError('frozen receipt streamId != cutover stream — quarantine');
+    // canonical bound-field set — written as evidence AND re-asserted on an idempotent retry (H3).
+    const bound = { k: 'source_fenced/v1', frozenReceiptDigest: fr.receiptDigest, sourceEpoch: fr.epoch, n: fr.n,
+      headAtN: fr.signedHeadDigestAtN, stateAtN: fr.sourceStateDigestAtN, sourceNodeId: fr.sourceNodeId,
+      revokeCommandId: fr.revokeCommandId, leaseId: fr.leaseId, leaseGrantDigest: fr.leaseGrantDigest, sourceKeyId: fr.sourceKeyId };
+    const ev = JSON.stringify(bound);
     return this.criticalTx(s, async (exec) => {
       const cur = await this.readCutover(exec, s);
-      if (cur && cur.phase === 'SOURCE_FENCED' && cur.commandId === cmd && cur.epoch === target) return cur; // idempotent
+      if (cur && cur.phase === 'SOURCE_FENCED' && cur.commandId === cmd && cur.epoch === target) {
+        // (H3) idempotent ONLY if the incoming receipt equals the stored signed evidence, byte-for-byte.
+        if (cur.evidence !== ev) throw new FenceAuthorityQuarantineError('SOURCE_FENCED retry with a DIFFERENT frozen receipt than the bound one — quarantine');
+        return cur;
+      }
       if (!cur || cur.phase !== 'PREPARING' || cur.commandId !== cmd || cur.epoch !== target) throw new FenceAuthorityQuarantineError('no matching PREPARING intent to bind SOURCE_FENCED — quarantine');
-      const ev = JSON.stringify({ k: 'source_fenced/v1', frozenReceiptDigest: frozenReceipt.receiptDigest, sourceEpoch: frozenReceipt.epoch, n: frozenReceipt.n,
-        headAtN: frozenReceipt.signedHeadDigestAtN, stateAtN: frozenReceipt.sourceStateDigestAtN, sourceNodeId: frozenReceipt.sourceNodeId,
-        revokeCommandId: frozenReceipt.revokeCommandId, leaseId: frozenReceipt.leaseId, leaseGrantDigest: frozenReceipt.leaseGrantDigest, sourceKeyId: frozenReceipt.sourceKeyId });
       return this.cutTransition(exec, s, target, cmd, cur.seqno + 1, 'SOURCE_FENCED', ev, cur.stateDigest);
     });
   }
@@ -934,9 +956,9 @@ export class HaControlFencing {
   /**
    * (§4-c) FENCED → IMPORTING. Open the import window — but ONLY once (a) the Redis/witness FENCED is the
    * current head for this command/epoch AND (b) a SOURCE_FENCED freeze was durably bound in history for the
-   * SAME command/epoch. The second check enforces the §4 ordering even though advanceEpoch remained
-   * backward-compatible (it accepts PREPARING for the PR2a foundation drill); an import cannot proceed on a
-   * cutover that never bound A's frozen receipt. Idempotent resume.
+   * SAME command/epoch. Enforcement of the §4 ordering is PRIMARILY at advanceEpoch (which now requires the
+   * SOURCE_FENCED phase, so FENCED is unreachable without a bound freeze); this (b) check is DEFENSE-IN-DEPTH
+   * — an independent re-assertion at the import boundary, not the sole gate. Idempotent resume.
    */
   async markImporting(streamId: string, commandId: string, targetEpoch: number): Promise<CutoverState> {
     const s = vId(streamId, STREAM_ID_RE, 'streamId');
@@ -967,26 +989,35 @@ export class HaControlFencing {
     const s = vId(streamId, STREAM_ID_RE, 'streamId');
     const cmd = vId(commandId, ID_RE, 'commandId');
     const target = vInt(targetEpoch, 'targetEpoch', 1, MAX_EPOCH);
-    verifyBFinalizedReceipt(bResolver, bReceipt); // ed25519 over B + source + guard public keys — throws on tamper
-    if (bReceipt.commandId !== cmd) throw new FenceAuthorityQuarantineError('BFinalizedReceipt commandId != cutover command — quarantine');
-    if (bReceipt.streamId !== s) throw new FenceAuthorityQuarantineError('BFinalizedReceipt streamId != cutover stream — quarantine');
+    // (H1) synchronously DECOUPLE + freeze the caller-owned receipt and capture the resolver BEFORE any await.
+    const br = frozenSnapshot(bReceipt);
+    const resolver = bResolver;
+    verifyBFinalizedReceipt(resolver, br); // ed25519 over B + source + guard public keys — throws on tamper
+    if (br.commandId !== cmd) throw new FenceAuthorityQuarantineError('BFinalizedReceipt commandId != cutover command — quarantine');
+    if (br.streamId !== s) throw new FenceAuthorityQuarantineError('BFinalizedReceipt streamId != cutover stream — quarantine');
     return this.criticalTx(s, async (exec) => {
       const cur = await this.readCutover(exec, s);
-      if (cur && cur.phase === 'READY' && cur.commandId === cmd && cur.epoch === target) return cur; // idempotent
-      if (!cur || cur.phase !== 'IMPORTING' || cur.commandId !== cmd || cur.epoch !== target) throw new FenceAuthorityQuarantineError('no matching IMPORTING cutover to mark READY — quarantine');
+      // Accept ONLY an IMPORTING cutover (fresh) or an already-READY one (idempotent retry) for this cmd/epoch.
+      const isReadyRetry = !!cur && cur.phase === 'READY' && cur.commandId === cmd && cur.epoch === target;
+      if (!cur || (!isReadyRetry && (cur.phase !== 'IMPORTING' || cur.commandId !== cmd || cur.epoch !== target))) throw new FenceAuthorityQuarantineError('no matching IMPORTING cutover to mark READY — quarantine');
       const sfRow = (await exec.query("SELECT evidence FROM tsk_ha_cutover_history WHERE stream_id=$1 AND command_id=$2 AND epoch=$3 AND phase='SOURCE_FENCED'", [s, cmd, target])).rows[0];
       if (!sfRow || sfRow.evidence === null) throw new FenceAuthorityQuarantineError('no bound SOURCE_FENCED evidence to bind READY against — quarantine');
       const sf = JSON.parse(String(sfRow.evidence)) as { frozenReceiptDigest: string; n: number; headAtN: string; stateAtN: string };
       // B's finalize MUST bind the EXACT frozen N control bound at SOURCE_FENCED (no cross-freeze splice).
-      if (bReceipt.frozenReceiptDigest !== sf.frozenReceiptDigest) throw new FenceAuthorityQuarantineError('BFinalizedReceipt frozenReceiptDigest != the bound SOURCE_FENCED freeze — quarantine');
-      if (bReceipt.n !== sf.n || bReceipt.signedHeadDigestAtN !== sf.headAtN || bReceipt.sourceStateDigestAtN !== sf.stateAtN) throw new FenceAuthorityQuarantineError('BFinalizedReceipt N/head@N/state@N != the bound freeze — quarantine');
+      if (br.frozenReceiptDigest !== sf.frozenReceiptDigest) throw new FenceAuthorityQuarantineError('BFinalizedReceipt frozenReceiptDigest != the bound SOURCE_FENCED freeze — quarantine');
+      if (br.n !== sf.n || br.signedHeadDigestAtN !== sf.headAtN || br.sourceStateDigestAtN !== sf.stateAtN) throw new FenceAuthorityQuarantineError('BFinalizedReceipt N/head@N/state@N != the bound freeze — quarantine');
       // Distinctness: B != source (signed in the receipt) AND B != control (control's OWN in-tx sysid).
       const controlSystemId = await this.controlSystemId(exec);
-      if (bReceipt.bSystemId === bReceipt.sourceSystemId) throw new FenceAuthorityQuarantineError('B system_identifier == source — not a distinct node; quarantine');
-      if (bReceipt.bSystemId === controlSystemId) throw new FenceAuthorityQuarantineError('B system_identifier == control — not a distinct node; quarantine');
-      const ev = JSON.stringify({ k: 'ready/v1', bReceiptDigest: bReceipt.receiptDigest, generationId: bReceipt.generationId, manifestDigest: bReceipt.manifestDigest, manifestRoot: bReceipt.manifestRoot,
-        frozenReceiptDigest: bReceipt.frozenReceiptDigest, n: bReceipt.n, bSystemId: bReceipt.bSystemId, sourceSystemId: bReceipt.sourceSystemId, controlSystemId, bKeyId: bReceipt.bKeyId });
-      return this.cutTransition(exec, s, target, cmd, cur.seqno + 1, 'READY', ev, cur.stateDigest);
+      if (br.bSystemId === br.sourceSystemId) throw new FenceAuthorityQuarantineError('B system_identifier == source — not a distinct node; quarantine');
+      if (br.bSystemId === controlSystemId) throw new FenceAuthorityQuarantineError('B system_identifier == control — not a distinct node; quarantine');
+      const ev = JSON.stringify({ k: 'ready/v1', bReceiptDigest: br.receiptDigest, generationId: br.generationId, manifestDigest: br.manifestDigest, manifestRoot: br.manifestRoot,
+        frozenReceiptDigest: br.frozenReceiptDigest, n: br.n, bSystemId: br.bSystemId, sourceSystemId: br.sourceSystemId, controlSystemId, bKeyId: br.bKeyId });
+      if (isReadyRetry) {
+        // (H3) idempotent ONLY if the incoming receipt equals the stored signed READY evidence, byte-for-byte.
+        if (cur!.evidence !== ev) throw new FenceAuthorityQuarantineError('READY retry with a DIFFERENT B receipt than the ratified one — quarantine');
+        return cur!;
+      }
+      return this.cutTransition(exec, s, target, cmd, cur!.seqno + 1, 'READY', ev, cur!.stateDigest);
     });
   }
 

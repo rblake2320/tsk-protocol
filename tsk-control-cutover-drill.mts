@@ -11,9 +11,11 @@
  *                          B.system_identifier is DISTINCT from BOTH the signed source id (B != source) AND
  *                          control's OWN pg_control_system id (B != control — the capability §4 was deferred
  *                          to hold). A READY head EXISTS only if control proved B != control against itself.
- * Negatives: foreign freeze; the ORDERING gate (no IMPORT without a bound SOURCE_FENCED); B == control
- * (a valid receipt finalized ON the control instance — passes §3's B!=source but is refused here); a
- * tampered receipt; wrong-command receipt. #10 stays OPEN (no HA/production claim; single Redis/instance).
+ * Negatives + hardening: foreign freeze; the ORDERING gate is a SINGLE CHOKEPOINT at advanceEpoch (a
+ * PREPARING cutover that never bound SOURCE_FENCED cannot be FENCED); B == control (a valid receipt
+ * finalized ON the control instance — passes §3's B!=source but is refused here); tampered + wrong-command
+ * receipts; (H1) caller-mutation-after-bind is decoupled from the stored signed evidence; (H3) an idempotent
+ * retry with a different receipt is refused. #10 stays OPEN (no HA/production claim; single Redis/instance).
  *
  * Env: TSK_TEST_SOURCE_PG_URL_A (A) + TSK_TEST_RECEIVER_PG_URL_B (B) + TSK_TEST_CONTROL_PG_URL (control) +
  *      TSK_TEST_REDIS_URL (real Redis). All three PG URLs MUST be independent instances.
@@ -32,7 +34,7 @@ import {
   FenceAuthorityQuarantineError, provisionControlSchema,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation,
   type TskHotpMutation, type SourceVerifyKeyResolver, type SourceExportBundle, type GuardCountersignedExport,
-  type GuardKeyResolver, type FenceProof, type HaControlPolicy, type BFinalizedReceipt,
+  type GuardKeyResolver, type HaControlPolicy, type BFinalizedReceipt,
 } from './packages/server/dist/index.js';
 
 const A_URL = process.env['TSK_TEST_SOURCE_PG_URL_A'] ?? process.env['TSK_TEST_SOURCE_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -124,25 +126,15 @@ async function main() {
   const ctrlNowMs = async () => Number((await cPool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
   const storeFor = (sid: string) => new RedisFencingStore(redis, 'tsk:fence:' + sid);
 
-  // Drive control PREPARING → SOURCE_FENCED(no) → FENCED for `sid`/`cmd`. Returns the fence store.
-  const driveToFenced = async (sid: string, cmd: string, bindFrozen: null | Parameters<typeof ctl.bindSourceFenced>[3]) => {
-    await ctl.provision(sid, 'g-' + cmd);
-    const past = (await ctrlNowMs()) - 5_000;
-    await ctl.writeLease({ streamId: sid, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a-' + cmd });
-    await ctl.beginPromotionIntent(sid, cmd, 1);
-    if (bindFrozen) await ctl.bindSourceFenced(sid, cmd, 1, bindFrozen, resolver);
-    await ctl.writeLease({ streamId: sid, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: past, grantCommandId: 'r-' + cmd });
-    const store = storeFor(sid);
-    const proof: FenceProof = { safetyMarginMs: 0, claimExpiresAtMs: (await ctrlNowMs()) + HOUR };
-    const res = await ctl.advanceEpoch(sid, cmd, 1, 'Bnode', store, proof);
-    assert.equal(res.epoch, 1); assert.equal(res.idempotent, false);
-    return store;
-  };
-
   // ── happy path: full signed ordering with both receipts bound ────────────────
   const SID = 'tsk:pair:cutover/v1'; const CMD = 'promote-1';
   const s1 = await buildStream(aTx, aPool, bTx, SID, CMD, [['T1', 1], ['T2', 5], ['T1', 2], ['T3', 9], ['T2', 6], ['T1', 3]]);
   assert.equal(s1.receipt.n, 6); assert.equal(s1.receipt.bSystemId, bSysId); assert.equal(s1.receipt.sourceSystemId, aSysId);
+  // A VALID B-signed receipt finalized ON the control instance: same freeze/manifest, but bSystemId == control.
+  // §3's receiver finalize only enforces B != source, so control != source lets this through; §4 must catch it.
+  const ctrlReceipt = await stageAndFinalizeReceiverGeneration(cTx, SCHEMA, await assertReceiverReady(cTx, SCHEMA), 'gen-onctrl', s1.bundle, s1.dual, s1.ropts);
+  verifyBFinalizedReceipt(resolver, ctrlReceipt);
+  assert.equal(ctrlReceipt.bSystemId, cSysId); assert.equal(ctrlReceipt.frozenReceiptDigest, s1.frozen.receiptDigest);
 
   await check('PREPARING → SOURCE_FENCED binds the ed25519 frozen receipt (digest/N/head@N/state@N) into the signed cutover head', async () => {
     await ctl.provision(SID, 'g-' + CMD);
@@ -154,8 +146,12 @@ async function main() {
     const ev = JSON.parse(sf.evidence!);
     assert.equal(ev.frozenReceiptDigest, s1.frozen.receiptDigest); assert.equal(ev.n, s1.frozen.n);
     assert.equal(ev.headAtN, s1.frozen.signedHeadDigestAtN); assert.equal(ev.stateAtN, s1.frozen.sourceStateDigestAtN);
-    // idempotent
+    // idempotent for the EXACT bound receipt
     assert.equal((await ctl.bindSourceFenced(SID, CMD, 1, s1.frozen, resolver)).phase, 'SOURCE_FENCED');
+    // (H1) mutate the caller receipt AFTER binding — the stored signed evidence is decoupled (snapshot), unchanged
+    const mut = s1.frozen as unknown as Record<string, unknown>; const savedN = mut.n; mut.n = 4242;
+    assert.equal(JSON.parse((await ctl.cutover(SID))!.evidence!).n, savedN, 'stored SOURCE_FENCED evidence is decoupled from caller mutation');
+    mut.n = savedN;
   });
 
   await check('SOURCE_FENCED → FENCED via the PR2a Redis+witness fence (revoked control lease + elapsed grant + Redis claim)', async () => {
@@ -173,12 +169,6 @@ async function main() {
   });
 
   await check('IMPORTING refuses a B==control receipt (finalized ON control: passes §3 B!=source, refused here) — the §4 capability', async () => {
-    // finalize the SAME export on the CONTROL instance → a VALID B-signed receipt whose bSystemId == control.
-    // §3's receiver finalize only enforces B != source, so control != source lets this through; §4 catches it.
-    const ctrlReceipt = await stageAndFinalizeReceiverGeneration(cTx, SCHEMA, await assertReceiverReady(cTx, SCHEMA), 'gen-onctrl', s1.bundle, s1.dual, s1.ropts);
-    verifyBFinalizedReceipt(resolver, ctrlReceipt);
-    assert.equal(ctrlReceipt.bSystemId, cSysId, 'receipt finalized on control carries control system_identifier');
-    assert.equal(ctrlReceipt.frozenReceiptDigest, s1.frozen.receiptDigest, 'same freeze — isolates the B!=control branch');
     await assert.rejects(() => ctl.markReady(SID, CMD, 1, ctrlReceipt, resolver), /B system_identifier == control/);
     assert.equal((await ctl.cutover(SID))?.phase, 'IMPORTING', 'refusal did not advance the head');
   });
@@ -197,7 +187,13 @@ async function main() {
     assert.equal(ev.frozenReceiptDigest, s1.frozen.receiptDigest, 'READY binds the EXACT SOURCE_FENCED freeze');
     assert.equal(ev.bSystemId, bSysId); assert.equal(ev.sourceSystemId, aSysId); assert.equal(ev.controlSystemId, cSysId);
     assert.notEqual(ev.bSystemId, ev.sourceSystemId); assert.notEqual(ev.bSystemId, ev.controlSystemId);
-    assert.equal((await ctl.markReady(SID, CMD, 1, s1.receipt, resolver)).phase, 'READY'); // idempotent
+    assert.equal((await ctl.markReady(SID, CMD, 1, s1.receipt, resolver)).phase, 'READY'); // idempotent for the ratified receipt
+    // (H3) a READY retry with a DIFFERENT receipt (the B==control one, same freeze) is refused — never silently OK
+    await assert.rejects(() => ctl.markReady(SID, CMD, 1, ctrlReceipt, resolver), /B system_identifier == control/);
+    // (H1) mutate the caller receipt AFTER READY — the stored signed evidence is decoupled (snapshot), unchanged
+    const mut = s1.receipt as unknown as Record<string, unknown>; const savedB = mut.bSystemId; mut.bSystemId = 'zzz';
+    assert.equal(JSON.parse((await ctl.cutover(SID))!.evidence!).bSystemId, savedB, 'stored READY evidence is decoupled from caller mutation');
+    mut.bSystemId = savedB;
   });
 
   // ── negative: foreign freeze cannot be bound to a cutover ─────────────────────
@@ -211,12 +207,17 @@ async function main() {
     await assert.rejects(() => ctl.bindSourceFenced(SIDX, 'promote-foreign', 1, other.frozen, resolver), /frozen receipt (streamId|commandId) != cutover/);
   });
 
-  // ── negative: the ORDERING gate — no IMPORT without a bound SOURCE_FENCED ──────
-  await check('markImporting REJECTS a FENCED cutover that never bound a SOURCE_FENCED freeze (backward-compat PREPARING→FENCED path)', async () => {
+  // ── negative: the ORDERING gate is enforced AT advanceEpoch (single chokepoint) ─
+  await check('advanceEpoch REFUSES to FENCE a PREPARING cutover that never bound SOURCE_FENCED (FENCED unreachable without a freeze)', async () => {
     const SIDN = 'tsk:pair:nofreeze/v1'; const CMDN = 'promote-nofreeze';
-    await driveToFenced(SIDN, CMDN, null); // reaches FENCED straight from PREPARING (no bindSourceFenced)
-    assert.equal((await ctl.cutover(SIDN))?.phase, 'FENCED');
-    await assert.rejects(() => ctl.markImporting(SIDN, CMDN, 1), /no bound SOURCE_FENCED freeze/);
+    await ctl.provision(SIDN, 'g-' + CMDN);
+    const past = (await ctrlNowMs()) - 5_000;
+    await ctl.writeLease({ streamId: SIDN, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a-' + CMDN });
+    await ctl.beginPromotionIntent(SIDN, CMDN, 1);
+    await ctl.writeLease({ streamId: SIDN, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: past, grantCommandId: 'r-' + CMDN });
+    const claimExp = (await ctrlNowMs()) + HOUR;
+    await assert.rejects(() => ctl.advanceEpoch(SIDN, CMDN, 1, 'Bnode', storeFor(SIDN), { safetyMarginMs: 0, claimExpiresAtMs: claimExp }), /no matching SOURCE_FENCED intent/);
+    assert.equal((await ctl.cutover(SIDN))?.phase, 'PREPARING', 'still PREPARING — the fence never fired without a bound freeze');
   });
 
   console.log(`\n# ${passed} PR2b-3 control-cutover ordering checks passed`);
