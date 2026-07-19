@@ -3,8 +3,9 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { ContractValidationError } from './ha-outbox-contract.js';
 import type { PgExecutor, PgTransactor } from './tsk-hotp-outbox-pg.js';
 import type { FencingStore, FenceRecord } from './promotion.js';
-import { verifySourceFrozenReceipt, verifyBFinalizedReceipt } from './tsk-source-fence.js';
-import type { SourceFrozenReceipt, BFinalizedReceipt, SourceVerifyKeyResolver } from './tsk-source-fence.js';
+import { verifySourceFrozenReceipt, verifyBFinalizedReceipt, signLeaseGrant } from './tsk-source-fence.js';
+import type { SourceFrozenReceipt, BFinalizedReceipt, SourceVerifyKeyResolver, LeaseGrant } from './tsk-source-fence.js';
+import type { KeyObject } from 'node:crypto';
 
 /**
  * PR2a — HA fencing FOUNDATION (control DB). Implements the reviewed design
@@ -1058,6 +1059,38 @@ export class HaControlFencing {
         return cur!;
       }
       return this.cutTransition(exec, s, target, cmd, cur!.seqno + 1, 'ACTIVE', ev, cur!.stateDigest);
+    });
+  }
+
+  /**
+   * (§5 / PR2c) GOVERNED B source-authority activation. After the cutover is ACTIVE, mint B's unforgeable
+   * SOURCE capability: a GUARD-signed (ed25519) lease grant that lets B become the writable source AT THE
+   * PROMOTED EPOCH. This binds the grant to the ratified promotion — it requires the ACTIVE head for this
+   * exact command/epoch, re-verifies B's BFinalizedReceipt, and asserts the ACTIVE evidence pins the SAME B
+   * (bReceiptDigest + n + bSystemId). The grant is at leaseEpoch == targetEpoch (the exact new epoch), holder
+   * == B, commandId == the cutover command — so B installs a GENESIS lease at epoch N's successor while the old
+   * A, still at the prior epoch with a revoked lease, is denied. B verifies the grant with the guard PUBLIC
+   * key (unforgeable); control never sees B's private material. Returns the signed grant for B to install.
+   */
+  async activateSource(streamId: string, commandId: string, targetEpoch: number, bReceipt: BFinalizedReceipt, bResolver: SourceVerifyKeyResolver, grant: { guardKeyId: string; guardPrivateKey: KeyObject | string; holderNodeId: string; leaseId: string; leaseExpiresAtMs: number }): Promise<LeaseGrant> {
+    const s = vId(streamId, STREAM_ID_RE, 'streamId');
+    const cmd = vId(commandId, ID_RE, 'commandId');
+    const target = vInt(targetEpoch, 'targetEpoch', 1, MAX_EPOCH);
+    const br = frozenSnapshot(bReceipt);
+    verifyBFinalizedReceipt(bResolver, br);
+    if (br.commandId !== cmd) throw new FenceAuthorityQuarantineError('BFinalizedReceipt commandId != cutover command — quarantine');
+    if (br.streamId !== s) throw new FenceAuthorityQuarantineError('BFinalizedReceipt streamId != cutover stream — quarantine');
+    if (br.epoch !== target - 1) throw new FenceAuthorityQuarantineError(`BFinalizedReceipt epoch ${br.epoch} != targetEpoch-1 (${target - 1}) — quarantine`);
+    await this.criticalTx(s, async (exec) => {
+      const cur = await this.readCutover(exec, s);
+      if (!cur || cur.phase !== 'ACTIVE' || cur.commandId !== cmd || cur.epoch !== target) throw new FenceAuthorityQuarantineError('no ACTIVE cutover to activate the source authority against — quarantine');
+      const rd = JSON.parse(cur.evidence ?? '{}') as { bReceiptDigest?: string; n?: number; bSystemId?: string };
+      if (rd.bReceiptDigest !== br.receiptDigest || rd.n !== br.n || rd.bSystemId !== br.bSystemId) throw new FenceAuthorityQuarantineError('BFinalizedReceipt is not the one ratified into the ACTIVE head — quarantine');
+    });
+    // GUARD-sign B's genesis source lease AT THE PROMOTED EPOCH (bound to the cutover command).
+    return signLeaseGrant(grant.guardKeyId, grant.guardPrivateKey, {
+      streamId: s, leaseEpoch: target, leaseStatus: 'active', holderNodeId: vId(grant.holderNodeId, ID_RE, 'holderNodeId'),
+      leaseId: vId(grant.leaseId, ID_RE, 'leaseId'), commandId: cmd, leaseExpiresAtMs: grant.leaseExpiresAtMs, leaseGrantSeq: 1, prevGrantDigest: null,
     });
   }
 

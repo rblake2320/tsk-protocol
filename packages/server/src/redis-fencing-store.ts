@@ -55,12 +55,22 @@ function parseFenceRecord(raw: string): FenceRecord {
  * Redis persistence, replication, ACLs, TLS, and availability remain deployment
  * responsibilities and must be tested for the selected topology.
  */
+/** Durable-claim policy: after the epoch CAS SET, require `waitReplicas` replicas to ACK the write
+ *  (Redis WAIT) within `waitTimeoutMs` before the claim is reported successful. This makes RPO=0 an
+ *  ENFORCED property of the claim path (not a caller-side WAIT): a claim that a replica quorum did not
+ *  durably receive fails closed, so a subsequent Sentinel failover cannot roll the fence epoch back. */
+export interface FenceDurabilityPolicy { waitReplicas: number; waitTimeoutMs: number }
+
 export class RedisFencingStore implements FencingStore {
   constructor(
     private readonly redis: Redis,
     private readonly key = 'tsk:fencing:writer',
+    private readonly durability?: FenceDurabilityPolicy,
   ) {
     if (!key || key.length > 512) throw new Error('Redis fencing key must be 1..512 characters');
+    if (durability && (!Number.isInteger(durability.waitReplicas) || durability.waitReplicas < 1 || !Number.isInteger(durability.waitTimeoutMs) || durability.waitTimeoutMs < 1)) {
+      throw new Error('FenceDurabilityPolicy requires waitReplicas>=1 and waitTimeoutMs>=1');
+    }
   }
 
   async current(): Promise<FenceRecord | null> {
@@ -78,7 +88,13 @@ export class RedisFencingStore implements FencingStore {
       String(record.fenceEpoch),
       JSON.stringify(next),
     );
-    return result === 1;
+    if (result !== 1) return false;
+    if (this.durability) {
+      // ENFORCE durable replication to a replica quorum before declaring the claim successful (RPO=0).
+      const acked = Number(await this.redis.call('WAIT', String(this.durability.waitReplicas), String(this.durability.waitTimeoutMs)));
+      if (!Number.isFinite(acked) || acked < this.durability.waitReplicas) return false; // not durable — fail closed
+    }
+    return true;
   }
 
   async release(nodeId: string, fenceEpoch: number, commandId: string): Promise<boolean> {
