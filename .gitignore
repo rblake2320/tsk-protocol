@@ -16,3 +16,6 @@ debug-e2e.mts
 
 # FileTumblerStore persistent data — lives in ~/.tsk, never in repo
 demo/tsk-maps.json
+
+# PR2c SIGKILL drill handoff (test key material — never commit)
+tsk-sigkill-handoff.json

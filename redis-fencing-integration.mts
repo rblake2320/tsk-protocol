@@ -7,7 +7,7 @@ import {
   handlePromotionCommand,
   signGuardCommand,
 } from './packages/server/src/promotion.ts';
-import { RedisFencingStore } from './packages/server/src/redis-fencing-store.ts';
+import { RedisFencingStore, FenceDurabilityUncertainError } from './packages/server/src/redis-fencing-store.ts';
 import { MemoryTumblerStore } from './packages/server/src/store.ts';
 import type { ReplicationCheckpoint } from './packages/server/src/replicating-tumbler-store.ts';
 
@@ -120,6 +120,56 @@ try {
     let rejected = false;
     try { await fenceA.current(); } catch { rejected = true; }
     assert(rejected, 'corrupt record was accepted as empty/current');
+  });
+
+  await test('enforced-WAIT: a CAS that WROTE but the replica quorum did not ACK throws typed Uncertain (not ordinary false)', async () => {
+    const durKey = `${key}:dur`;
+    await redisA.del(durKey);
+    const durStore = new RedisFencingStore(redisA, durKey, { waitReplicas: 1, waitTimeoutMs: 500 });
+    // single node, NO replicas → WAIT returns 0 < 1 → the CAS wrote but durability is UNKNOWN → typed throw.
+    let typed = false, stored = false;
+    try { await durStore.claim({ nodeId: 'B', fenceEpoch: 1, expiresAt: Date.now() + 3_600_000, commandId: 'c1' }); }
+    catch (e) { typed = e instanceof FenceDurabilityUncertainError; stored = (e as FenceDurabilityUncertainError).storedTuple?.fenceEpoch === 1; }
+    assert(typed, 'expected a typed FenceDurabilityUncertainError, not an ordinary false, when WAIT under-acks after a successful CAS');
+    assert(stored, 'the typed error must carry the exact stored tuple for reconciliation');
+    // a CAS that is REFUSED (epoch not strictly higher) is an ordinary durable no-op — false, NEVER a throw.
+    const refused = await durStore.claim({ nodeId: 'B', fenceEpoch: 1, expiresAt: Date.now() + 3_600_000, commandId: 'c1' });
+    assert(refused === false, 'a refused CAS must return ordinary false (no WAIT ambiguity)');
+    await redisA.del(durKey);
+  });
+
+  await test('enforced-WAIT dedicated-connection continuity: disconnect/rejection AFTER dispatch is typed Uncertain, never silent/false; no reconnect/replay', async () => {
+    // Deterministic hermetic stub of the DEDICATED physical connection (redis.duplicate). Each case programs
+    // the EVAL/WAIT outcome so a disconnect/rejection AFTER the CAS is dispatched is exercised WITHOUT a live
+    // cluster — proving claim() reports typed uncertainty on that exact path, and that the connection is
+    // created with reconnect/retry/RESEND fully disabled (so a whole-pipeline replay on a new master, which
+    // would return matching ids + CAS0, cannot occur → CAS0 is an honest refusal, not a silent success).
+    const dur = { waitReplicas: 1, waitTimeoutMs: 500 };
+    const storedJson = JSON.stringify({ nodeId: 'B', fenceEpoch: 1, expiresAt: Date.now() + 3_600_000, commandId: 'c1', active: true });
+    let lastOpts: Record<string, unknown> = {};
+    const conn = (evalOut: () => Promise<unknown>, callOut: () => Promise<unknown>, connectOut: () => Promise<unknown> = async () => undefined) =>
+      ({ connect: connectOut, disconnect: () => {}, eval: evalOut, call: callOut });
+    const mk = (c: ReturnType<typeof conn>) => new RedisFencingStore({ duplicate: (o: Record<string, unknown>) => { lastOpts = o; return c; }, get: async () => storedJson } as unknown as Redis, 'k:ded', dur);
+    const rec = { nodeId: 'B', fenceEpoch: 1, expiresAt: Date.now() + 3_600_000, commandId: 'c1' };
+    const reject = () => { throw new Error('Connection is closed'); };
+    const isUncertain = async (c: ReturnType<typeof conn>) => { try { await mk(c).claim(rec); return false; } catch (e) { return e instanceof FenceDurabilityUncertainError; } };
+    // EVAL rejects AFTER dispatch (socket dropped mid-CAS) → the CAS may have applied → Uncertain.
+    assert(await isUncertain(conn(async () => reject(), async () => 1)), 'an EVAL rejection after dispatch must be typed Uncertain');
+    // CAS wrote (1), then WAIT rejects (socket dropped) → Uncertain.
+    assert(await isUncertain(conn(async () => 1, async () => reject())), 'a WAIT rejection after a successful CAS must be typed Uncertain');
+    // CAS wrote (1), WAIT under-acked → Uncertain.
+    assert(await isUncertain(conn(async () => 1, async () => 0)), 'an under-ack must be typed Uncertain');
+    // CAS wrote (1), WAIT acked on the SAME dedicated socket → durable success.
+    assert((await mk(conn(async () => 1, async () => 1)).claim(rec)) === true, 'a quorum-acked same-connection claim succeeds');
+    // CAS REFUSED (epoch not higher) → ordinary false; replay is IMPOSSIBLE on this connection so CAS0 is honest.
+    assert((await mk(conn(async () => 0, async () => 0)).claim(rec)) === false, 'a genuinely refused CAS is ordinary false');
+    // a PRE-dispatch connect failure propagates (the claim never started) — not a silent false.
+    let connectFailPropagated = false;
+    try { await mk(conn(async () => 1, async () => 1, async () => reject())).claim(rec); }
+    catch (e) { connectFailPropagated = !(e instanceof FenceDurabilityUncertainError); }
+    assert(connectFailPropagated, 'a pre-dispatch connect failure must propagate, not become a silent false/uncertain');
+    // STRUCTURAL: the dedicated connection disables reconnect/retry/offline-queue/RESEND → no path-switch/replay.
+    assert(lastOpts.autoResendUnfulfilledCommands === false && lastOpts.enableOfflineQueue === false && lastOpts.maxRetriesPerRequest === 0 && typeof lastOpts.retryStrategy === 'function' && (lastOpts.retryStrategy as () => unknown)() === null, 'claim must pin a non-retrying, non-replaying dedicated connection');
   });
 } finally {
   await redisA.del(key).catch(() => undefined);

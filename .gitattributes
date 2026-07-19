@@ -1,0 +1,2 @@
+*.sh text eol=lf
+ci/redis-sentinel/docker-compose.yml text eol=lf

@@ -3,8 +3,9 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { ContractValidationError } from './ha-outbox-contract.js';
 import type { PgExecutor, PgTransactor } from './tsk-hotp-outbox-pg.js';
 import type { FencingStore, FenceRecord } from './promotion.js';
-import { verifySourceFrozenReceipt, verifyBFinalizedReceipt } from './tsk-source-fence.js';
-import type { SourceFrozenReceipt, BFinalizedReceipt, SourceVerifyKeyResolver } from './tsk-source-fence.js';
+import { verifySourceFrozenReceipt, verifyBFinalizedReceipt, signLeaseGrant } from './tsk-source-fence.js';
+import type { SourceFrozenReceipt, BFinalizedReceipt, SourceVerifyKeyResolver, LeaseGrant } from './tsk-source-fence.js';
+import type { KeyObject } from 'node:crypto';
 
 /**
  * PR2a — HA fencing FOUNDATION (control DB). Implements the reviewed design
@@ -304,6 +305,17 @@ CREATE TABLE IF NOT EXISTS tsk_ha_cutover_history (
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (stream_id, seqno),
   UNIQUE (stream_id, state_digest)
+);
+CREATE TABLE IF NOT EXISTS tsk_ha_source_activation (
+  stream_id text PRIMARY KEY,
+  command_id text NOT NULL,
+  epoch bigint NOT NULL CHECK (epoch >= 1),
+  b_key_id text NOT NULL,
+  b_receipt_digest text NOT NULL CHECK (b_receipt_digest ~ '^[0-9a-f]{64}$'),
+  grant_digest text NOT NULL CHECK (grant_digest ~ '^[0-9a-f]{64}$'),
+  grant_json text NOT NULL,
+  guard_key_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
 )
 `.trim();
 
@@ -311,6 +323,7 @@ export const HA_CONTROL_TABLES = [
   'tsk_ha_schema', 'tsk_ha_provisioning', 'tsk_ha_provisioning_history',
   'tsk_ha_epoch_witness', 'tsk_ha_epoch_witness_history', 'tsk_ha_lease_head',
   'tsk_ha_lease_history', 'tsk_ha_cutover_head', 'tsk_ha_cutover_history',
+  'tsk_ha_source_activation',
 ] as const;
 const MANIFEST_TABLES = [...HA_CONTROL_TABLES]; // attest the FULL set incl tsk_ha_schema (R4-H3)
 // (R8-HIGH) governed tables locked ACCESS SHARE per critical tx to freeze the catalog against a
@@ -407,7 +420,7 @@ async function controlManifest(exec: PgExecutor): Promise<string> {
  *  defeat the pin). To RE-PIN after an intentional DDL change, run provisionControlSchema against
  *  the new schema in an OFFLINE, code-reviewed step and copy the digest reported in the attestation
  *  error ("live catalog digest <D>") into this constant. */
-export const HA_CONTROL_MANIFEST_DIGEST = '68d4710a6bc72db1cfa4734f03f052fc963daa74c7e27787f595b0b29f45f6c3';
+export const HA_CONTROL_MANIFEST_DIGEST = 'a80069c514d7450a5a2f4482d99952f9b2920ee876d14f51ba5d516ff79eefab';
 
 /** Attest the live catalog hashes to the pinned expected manifest (fail-closed, NOT TOFU). */
 async function attestControlSchema(exec: PgExecutor): Promise<string> {
@@ -514,6 +527,11 @@ export interface HaControlPolicy {
    *  (CREATE/ALTER/DROP) on this schema — then drift is impossible under the operating identity and
    *  the per-op re-attestation is redundant. */
   attestEveryTx?: boolean;
+  /** (PR2c) The CONFIGURED source-guard signing authority used by activateSource() to mint B's promoted
+   *  source lease. Held by the control as deployment configuration — NOT accepted per call — so no caller
+   *  can supply an arbitrary (evil) key. `activationTtlMs` is the (deterministic, config-fixed) lease
+   *  horizon of the genesis promotion grant. Absent → activateSource() is disabled (throws). */
+  sourceGuard?: { keyId: string; privateKey: import('node:crypto').KeyObject | string; activationTtlMs: number };
 }
 export interface FenceEvidence {
   holderNodeId: string; grantSeq: number; grantDigest: string; maxExpiryMs: number;
@@ -558,6 +576,7 @@ export class HaControlFencing {
   private readonly schema: string;
   private readonly minClaimRemainingMs: number;
   private readonly attestEveryTx: boolean;
+  private readonly sourceGuard?: HaControlPolicy['sourceGuard'];
   constructor(
     private readonly db: PgTransactor,
     private readonly signer: GuardSigner,
@@ -568,6 +587,11 @@ export class HaControlFencing {
     this.schema = requireReady(ready, db).schema;
     this.minClaimRemainingMs = vInt(policy?.minClaimRemainingMs, 'policy.minClaimRemainingMs', 1, MAX_CLAIM_REMAINING_MS); // strictly positive
     this.attestEveryTx = policy?.attestEveryTx !== false; // default true (R7-HIGH1)
+    if (policy?.sourceGuard) {
+      if (!policy.sourceGuard.keyId || !policy.sourceGuard.privateKey) throw new ContractValidationError('policy.sourceGuard requires keyId + privateKey');
+      vInt(policy.sourceGuard.activationTtlMs, 'policy.sourceGuard.activationTtlMs', 1, MAX_MS);
+      this.sourceGuard = policy.sourceGuard;
+    }
   }
 
   /** Exact-session SERIALIZABLE + pinned schema + (R7-HIGH1) LIVE per-tx catalog re-attestation +
@@ -1028,6 +1052,91 @@ export class HaControlFencing {
         return cur!;
       }
       return this.cutTransition(exec, s, target, cmd, cur!.seqno + 1, 'READY', ev, cur!.stateDigest);
+    });
+  }
+
+  /**
+   * (§5 / PR2c) READY → ACTIVE. The FINAL, TERMINAL cutover transition: B is now the live write authority
+   * for the stream at the new epoch. Requires a READY head for this command/epoch (control already verified
+   * B's BFinalizedReceipt, the exact frozen N/epoch, and B != source/control). The ACTIVE head carries the
+   * ratified B binding forward as the durable go-live proof and is TERMINAL (a new promotion needs a new
+   * command + epoch). Idempotent resume: a re-activation is accepted ONLY if it reproduces the byte-identical
+   * signed ACTIVE evidence. Crash-safe: a single signed forward-CAS on the cutover head.
+   */
+  async activate(streamId: string, commandId: string, targetEpoch: number): Promise<CutoverState> {
+    const s = vId(streamId, STREAM_ID_RE, 'streamId');
+    const cmd = vId(commandId, ID_RE, 'commandId');
+    const target = vInt(targetEpoch, 'targetEpoch', 1, MAX_EPOCH);
+    return this.criticalTx(s, async (exec) => {
+      const cur = await this.readCutover(exec, s);
+      const isActiveRetry = !!cur && cur.phase === 'ACTIVE' && cur.commandId === cmd && cur.epoch === target;
+      if (!cur || (!isActiveRetry && (cur.phase !== 'READY' || cur.commandId !== cmd || cur.epoch !== target))) throw new FenceAuthorityQuarantineError('no matching READY cutover to ACTIVATE — quarantine');
+      // carry the ratified READY binding forward as the terminal go-live proof.
+      const rdRow = (await exec.query("SELECT evidence FROM tsk_ha_cutover_history WHERE stream_id=$1 AND command_id=$2 AND epoch=$3 AND phase='READY'", [s, cmd, target])).rows[0];
+      if (!rdRow || rdRow.evidence === null) throw new FenceAuthorityQuarantineError('no bound READY evidence to activate against — quarantine');
+      const rd = JSON.parse(String(rdRow.evidence)) as { bReceiptDigest: string; generationId: string; bSystemId: string; sourceSystemId: string; controlSystemId: string; n: number; frozenReceiptDigest: string; bKeyId: string };
+      const ev = JSON.stringify({ k: 'active/v1', bReceiptDigest: rd.bReceiptDigest, generationId: rd.generationId, bSystemId: rd.bSystemId,
+        sourceSystemId: rd.sourceSystemId, controlSystemId: rd.controlSystemId, n: rd.n, frozenReceiptDigest: rd.frozenReceiptDigest, bKeyId: rd.bKeyId });
+      if (isActiveRetry) {
+        if (cur!.evidence !== ev) throw new FenceAuthorityQuarantineError('ACTIVE retry does not reproduce the ratified go-live evidence — quarantine');
+        return cur!;
+      }
+      return this.cutTransition(exec, s, target, cmd, cur!.seqno + 1, 'ACTIVE', ev, cur!.stateDigest);
+    });
+  }
+
+  /**
+   * (§5 / PR2c) GOVERNED B source-authority activation. After the cutover is ACTIVE, mint B's unforgeable
+   * SOURCE capability: a GUARD-signed (ed25519) lease grant that lets B become the writable source AT THE
+   * PROMOTED EPOCH. This binds the grant to the ratified promotion — it requires the ACTIVE head for this
+   * exact command/epoch, re-verifies B's BFinalizedReceipt, and asserts the ACTIVE evidence pins the SAME B
+   * (bReceiptDigest + n + bSystemId). The grant is at leaseEpoch == targetEpoch (the exact new epoch), holder
+   * == B, commandId == the cutover command — so B installs a GENESIS lease at epoch N's successor while the old
+   * A, still at the prior epoch with a revoked lease, is denied. B verifies the grant with the guard PUBLIC
+   * key (unforgeable); control never sees B's private material. Returns the signed grant for B to install.
+   */
+  async activateSource(streamId: string, commandId: string, targetEpoch: number, bReceipt: BFinalizedReceipt, bResolver: SourceVerifyKeyResolver): Promise<LeaseGrant> {
+    const s = vId(streamId, STREAM_ID_RE, 'streamId');
+    const cmd = vId(commandId, ID_RE, 'commandId');
+    const target = vInt(targetEpoch, 'targetEpoch', 1, MAX_EPOCH);
+    const guard = this.sourceGuard;
+    if (!guard) throw new ContractValidationError('activateSource requires a configured policy.sourceGuard signing authority');
+    const br = frozenSnapshot(bReceipt);
+    verifyBFinalizedReceipt(bResolver, br);
+    if (br.commandId !== cmd) throw new FenceAuthorityQuarantineError('BFinalizedReceipt commandId != cutover command — quarantine');
+    if (br.streamId !== s) throw new FenceAuthorityQuarantineError('BFinalizedReceipt streamId != cutover stream — quarantine');
+    if (br.epoch !== target - 1) throw new FenceAuthorityQuarantineError(`BFinalizedReceipt epoch ${br.epoch} != targetEpoch-1 (${target - 1}) — quarantine`);
+    // the holder identity is DERIVED from the ratified B (its signing key id), never accepted from the caller.
+    const holder = vId(br.bKeyId, ID_RE, 'ratified B key id (holder)');
+    const leaseId = vId(`bsrc-${cmd}`, ID_RE, 'derived leaseId');
+    return this.criticalTx(s, async (exec) => {
+      const cur = await this.readCutover(exec, s);
+      if (!cur || cur.phase !== 'ACTIVE' || cur.commandId !== cmd || cur.epoch !== target) throw new FenceAuthorityQuarantineError('no ACTIVE cutover to activate the source authority against — quarantine');
+      const rd = JSON.parse(cur.evidence ?? '{}') as { bReceiptDigest?: string; n?: number; bSystemId?: string; bKeyId?: string };
+      // the receipt must be EXACTLY the one ratified into the ACTIVE head, and the holder == that ratified B.
+      if (rd.bReceiptDigest !== br.receiptDigest || rd.n !== br.n || rd.bSystemId !== br.bSystemId || rd.bKeyId !== br.bKeyId) throw new FenceAuthorityQuarantineError('BFinalizedReceipt is not the one ratified into the ACTIVE head — quarantine');
+      if (rd.bKeyId !== holder) throw new FenceAuthorityQuarantineError('holder != the ratified B identity — quarantine');
+      // (recovery / idempotency) if this stream was already activated, REHYDRATE the byte-identical signed
+      // grant — a retry can NEVER mint a different or conflicting grant.
+      const existing = (await exec.query('SELECT command_id, epoch, b_key_id, b_receipt_digest, grant_json FROM tsk_ha_source_activation WHERE stream_id=$1 FOR UPDATE', [s])).rows[0];
+      if (existing) {
+        if (String(existing.command_id) !== cmd || vInt(existing.epoch, 'epoch', 1, MAX_EPOCH) !== target || String(existing.b_key_id) !== holder || String(existing.b_receipt_digest) !== br.receiptDigest) {
+          throw new FenceAuthorityQuarantineError('a DIFFERENT source activation already exists for this stream — quarantine (no conflicting re-grant)');
+        }
+        return JSON.parse(String(existing.grant_json)) as LeaseGrant; // rehydrated, byte-identical
+      }
+      // FIRST activation: GUARD-sign B's genesis source lease at the promoted epoch using the CONFIGURED
+      // authority (deterministic tuple; holder == ratified B; expiry = configured horizon read in-tx).
+      const nowMs = await this.controlNowMs(exec);
+      const grantObj = signLeaseGrant(guard.keyId, guard.privateKey, {
+        streamId: s, leaseEpoch: target, leaseStatus: 'active', holderNodeId: holder,
+        leaseId, commandId: cmd, leaseExpiresAtMs: Math.min(nowMs + guard.activationTtlMs, MAX_MS), leaseGrantSeq: 1, prevGrantDigest: null,
+      });
+      // bind the exact genesis grant tuple/digest into durable signed activation evidence.
+      affectedOne(await exec.query(
+        'INSERT INTO tsk_ha_source_activation (stream_id, command_id, epoch, b_key_id, b_receipt_digest, grant_digest, grant_json, guard_key_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+        [s, cmd, target, holder, br.receiptDigest, grantObj.grantDigest, JSON.stringify(grantObj), guard.keyId]), 'source activation insert');
+      return grantObj;
     });
   }
 

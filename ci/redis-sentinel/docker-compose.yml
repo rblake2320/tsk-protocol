@@ -1,0 +1,78 @@
+# Real Redis Sentinel/quorum topology for the PR2c acceptance drills (#10):
+#   1 master + 2 REPLICAS (3 data nodes) + 3 SENTINELS (quorum 2), AOF everysec.
+#   min-replicas-to-write 1 + min-replicas-max-lag → a master that loses its replica quorum REFUSES
+#   writes (the split-brain guard). STATIC IPs so sentinels monitor by fixed IP (survives a crashed
+#   master container exiting) AND PUBLISHED ports so the host drills reach every node directly; the
+#   sentinel-backed client uses ioredis natMap (internal IP:6379 → 127.0.0.1:published) to auto-follow
+#   failover from the host. Mechanism-only on one host (processes, not physical failure domains).
+networks:
+  tsknet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.7.0/24
+x-redis-data: &redis-data
+  image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 1s
+    timeout: 2s
+    retries: 40
+services:
+  redis-master:
+    <<: *redis-data
+    command: >-
+      redis-server --appendonly yes --appendfsync everysec --save ""
+      --repl-diskless-sync yes --min-replicas-to-write 1 --min-replicas-max-lag 10
+    restart: "no"
+    ports: ["6390:6379"]
+    networks:
+      tsknet: { ipv4_address: 172.28.7.10 }
+  redis-replica-1:
+    <<: *redis-data
+    command: >-
+      redis-server --appendonly yes --appendfsync everysec --save ""
+      --replicaof 172.28.7.10 6379 --replica-read-only yes --min-replicas-to-write 1 --min-replicas-max-lag 10
+    depends_on:
+      redis-master: { condition: service_healthy }
+    ports: ["6391:6379"]
+    networks:
+      tsknet: { ipv4_address: 172.28.7.11 }
+  redis-replica-2:
+    <<: *redis-data
+    command: >-
+      redis-server --appendonly yes --appendfsync everysec --save ""
+      --replicaof 172.28.7.10 6379 --replica-read-only yes --min-replicas-to-write 1 --min-replicas-max-lag 10
+    depends_on:
+      redis-master: { condition: service_healthy }
+    ports: ["6392:6379"]
+    networks:
+      tsknet: { ipv4_address: 172.28.7.12 }
+  sentinel-1: &sentinel
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    depends_on:
+      redis-master: { condition: service_healthy }
+      redis-replica-1: { condition: service_healthy }
+      redis-replica-2: { condition: service_healthy }
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cat > /tmp/sentinel.conf <<EOF
+        port 26379
+        sentinel monitor tskmaster 172.28.7.10 6379 2
+        sentinel down-after-milliseconds tskmaster 3000
+        sentinel failover-timeout tskmaster 8000
+        sentinel parallel-syncs tskmaster 1
+        EOF
+        exec redis-sentinel /tmp/sentinel.conf
+    ports: ["26379:26379"]
+    networks: [tsknet]
+  sentinel-2:
+    <<: *sentinel
+    ports: ["26380:26379"]
+    networks: [tsknet]
+  sentinel-3:
+    <<: *sentinel
+    ports: ["26381:26379"]
+    networks: [tsknet]
