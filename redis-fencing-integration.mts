@@ -137,6 +137,32 @@ try {
     assert(refused === false, 'a refused CAS must return ordinary false (no WAIT ambiguity)');
     await redisA.del(durKey);
   });
+
+  await test('enforced-WAIT connection continuity: a CUT or PATH-CHANGE between EVAL and WAIT is typed Uncertain (never silent)', async () => {
+    // Deterministic hermetic stub of the pinned [CLIENT ID, EVAL, WAIT, CLIENT ID] pipeline. Each case
+    // programs the exec() result vector so a connection cut / identity change between the CAS and the WAIT
+    // is exercised WITHOUT a live cluster — proving claim() reports typed uncertainty on that exact path.
+    const dur = { waitReplicas: 1, waitTimeoutMs: 500 };
+    const storedJson = JSON.stringify({ nodeId: 'B', fenceEpoch: 1, expiresAt: Date.now() + 3_600_000, commandId: 'c1', active: true });
+    const mk = (entries: [Error | null, unknown][]) => {
+      const chain: Record<string, unknown> = { call: () => chain, eval: () => chain, exec: async () => entries };
+      return new RedisFencingStore({ pipeline: () => chain, get: async () => storedJson } as unknown as Redis, 'k:cut', dur);
+    };
+    const rec = { nodeId: 'B', fenceEpoch: 1, expiresAt: Date.now() + 3_600_000, commandId: 'c1' };
+    const isUncertain = async (entries: [Error | null, unknown][]) => { try { await mk(entries).claim(rec); return false; } catch (e) { return e instanceof FenceDurabilityUncertainError; } };
+    // CAS wrote (1), then the WAIT command ERRORED = a cut between EVAL and WAIT → Uncertain.
+    assert(await isUncertain([[null, 10], [null, 1], [new Error('Connection is closed'), null], [null, 10]]), 'a WAIT-side connection cut after a successful CAS must be typed Uncertain');
+    // CAS wrote (1), WAIT acked, but the connection IDENTITY changed across the sequence → Uncertain (path switch).
+    assert(await isUncertain([[null, 10], [null, 1], [null, 1], [null, 999]]), 'a changed connection identity across EVAL→WAIT must be typed Uncertain');
+    // CAS wrote, WAIT under-acked on the SAME connection → Uncertain.
+    assert(await isUncertain([[null, 10], [null, 1], [null, 0], [null, 10]]), 'an under-ack on the same connection must be typed Uncertain');
+    // the aborted-pipeline (null exec) path → Uncertain.
+    assert(await isUncertain(null as unknown as [Error | null, unknown][]), 'an aborted pipeline (connection lost) must be typed Uncertain');
+    // CAS wrote, WAIT acked on the SAME connection → durable success.
+    assert((await mk([[null, 10], [null, 1], [null, 1], [null, 10]]).claim(rec)) === true, 'quorum-acked same-connection claim succeeds');
+    // CAS REFUSED (epoch not higher) → ordinary false, no throw (WAIT semantics irrelevant).
+    assert((await mk([[null, 10], [null, 0], [null, 0], [null, 10]]).claim(rec)) === false, 'a refused CAS is ordinary false');
+  });
 } finally {
   await redisA.del(key).catch(() => undefined);
   await Promise.all([redisA.quit().catch(() => undefined), redisB.quit().catch(() => undefined)]);

@@ -93,25 +93,37 @@ export class RedisFencingStore implements FencingStore {
   async claim(record: Omit<FenceRecord, 'active'>): Promise<boolean> {
     const next: FenceRecord = { ...record, active: true };
     parseFenceRecord(JSON.stringify(next));
-    const result = await this.redis.eval(
-      CLAIM_SCRIPT,
-      1,
-      this.key,
-      String(record.fenceEpoch),
-      JSON.stringify(next),
-    );
-    if (result !== 1) return false; // CAS refused: the epoch was not strictly higher — an ordinary, durable no-op.
-    if (this.durability) {
-      // The CAS SET SUCCEEDED (epoch raised). ENFORCE durable replication to a replica quorum before
-      // declaring success; if the quorum did not ACK, the write's durability is UNKNOWN — this is NOT an
-      // ordinary false (which means "CAS refused"), so raise a typed reconcile-and-fail-closed signal.
-      const acked = Number(await this.redis.call('WAIT', String(this.durability.waitReplicas), String(this.durability.waitTimeoutMs)));
-      if (!Number.isFinite(acked) || acked < this.durability.waitReplicas) {
-        let stored: FenceRecord | null = null;
-        try { stored = await this.current(); } catch { stored = null; }
-        throw new FenceDurabilityUncertainError(Number.isFinite(acked) ? acked : 0, this.durability.waitReplicas, stored);
-      }
+    if (!this.durability) {
+      const result = await this.redis.eval(CLAIM_SCRIPT, 1, this.key, String(record.fenceEpoch), JSON.stringify(next));
+      return result === 1; // CAS refused (0) or acquired (1); no durability enforcement configured.
     }
+    // DURABLE path. PIN the CAS EVAL and the WAIT to ONE physical connection via a single pipeline (written
+    // to one socket, never split across a reconnect) and BRACKET them with CLIENT ID. So WAIT's replication
+    // offset binds the SAME connection that ran the CAS — never a fresh Sentinel-reconnected server whose
+    // offset does not cover the prior write. Any anomaly after the CAS wrote (WAIT error, a dropped pipeline,
+    // or a changed connection identity) is DURABILITY-UNKNOWN → typed uncertainty, never a silent success or
+    // an ordinary false.
+    const { waitReplicas, waitTimeoutMs } = this.durability;
+    const res = await this.redis.pipeline()
+      .call('CLIENT', 'ID')
+      .eval(CLAIM_SCRIPT, 1, this.key, String(record.fenceEpoch), JSON.stringify(next))
+      .call('WAIT', String(waitReplicas), String(waitTimeoutMs))
+      .call('CLIENT', 'ID')
+      .exec();
+    const uncertain = async (acked: number): Promise<never> => {
+      let stored: FenceRecord | null = null;
+      try { stored = await this.current(); } catch { stored = null; }
+      throw new FenceDurabilityUncertainError(acked, waitReplicas, stored);
+    };
+    if (!res || res.length !== 4) return uncertain(0); // pipeline aborted (connection lost) — CAS state unknown
+    const [idBeforeErr, idBefore] = res[0], [casErr, casRes] = res[1], [waitErr, waitAck] = res[2], [idAfterErr, idAfter] = res[3];
+    if (casErr) throw casErr;           // the CAS itself errored — not a durability question
+    if (casRes !== 1) return false;     // CAS refused: epoch not strictly higher — ordinary durable no-op
+    // the CAS WROTE. From here, ANY anomaly means the write's durability is UNKNOWN.
+    if (waitErr || idBeforeErr || idAfterErr) return uncertain(0);                                   // cut between EVAL and WAIT
+    if (idBefore == null || idAfter == null || String(idBefore) !== String(idAfter)) return uncertain(0); // connection/path changed across the sequence
+    const acked = Number(waitAck);
+    if (!Number.isFinite(acked) || acked < waitReplicas) return uncertain(Number.isFinite(acked) ? acked : 0);
     return true;
   }
 
