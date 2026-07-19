@@ -97,12 +97,15 @@ export class RedisFencingStore implements FencingStore {
       const result = await this.redis.eval(CLAIM_SCRIPT, 1, this.key, String(record.fenceEpoch), JSON.stringify(next));
       return result === 1; // CAS refused (0) or acquired (1); no durability enforcement configured.
     }
-    // DURABLE path. PIN the CAS EVAL and the WAIT to ONE physical connection via a single pipeline (written
-    // to one socket, never split across a reconnect) and BRACKET them with CLIENT ID. So WAIT's replication
-    // offset binds the SAME connection that ran the CAS — never a fresh Sentinel-reconnected server whose
-    // offset does not cover the prior write. Any anomaly after the CAS wrote (WAIT error, a dropped pipeline,
-    // or a changed connection identity) is DURABILITY-UNKNOWN → typed uncertainty, never a silent success or
-    // an ordinary false.
+    // DURABLE path. Redis WAIT tracks the writes of the CURRENT CONNECTION (per-client replication offset),
+    // so WAIT is only meaningful on the SAME physical connection that ran the CAS. We issue a single pipeline
+    // [CLIENT ID, EVAL(CAS), WAIT, CLIENT ID] and BRACKET it with CLIENT ID. The bracket is LOAD-BEARING, not
+    // decorative: ioredis `autoResendUnfulfilledCommands` (default true) RESENDS un-replied commands on the
+    // reconnected socket — so a drop after EVAL could resend WAIT on a fresh Sentinel-promoted master whose
+    // offset does not cover the prior CAS. When that happens the resent trailing CLIENT ID returns a DIFFERENT
+    // id than the pre-EVAL one (a new connection = a new client id), so idBefore != idAfter and we fail closed.
+    // Any anomaly once the CAS wrote (WAIT error, aborted pipeline, or a changed connection identity) is
+    // DURABILITY-UNKNOWN → typed uncertainty, never a silent success or an ordinary false.
     const { waitReplicas, waitTimeoutMs } = this.durability;
     const res = await this.redis.pipeline()
       .call('CLIENT', 'ID')
