@@ -1031,6 +1031,36 @@ export class HaControlFencing {
     });
   }
 
+  /**
+   * (§5 / PR2c) READY → ACTIVE. The FINAL, TERMINAL cutover transition: B is now the live write authority
+   * for the stream at the new epoch. Requires a READY head for this command/epoch (control already verified
+   * B's BFinalizedReceipt, the exact frozen N/epoch, and B != source/control). The ACTIVE head carries the
+   * ratified B binding forward as the durable go-live proof and is TERMINAL (a new promotion needs a new
+   * command + epoch). Idempotent resume: a re-activation is accepted ONLY if it reproduces the byte-identical
+   * signed ACTIVE evidence. Crash-safe: a single signed forward-CAS on the cutover head.
+   */
+  async activate(streamId: string, commandId: string, targetEpoch: number): Promise<CutoverState> {
+    const s = vId(streamId, STREAM_ID_RE, 'streamId');
+    const cmd = vId(commandId, ID_RE, 'commandId');
+    const target = vInt(targetEpoch, 'targetEpoch', 1, MAX_EPOCH);
+    return this.criticalTx(s, async (exec) => {
+      const cur = await this.readCutover(exec, s);
+      const isActiveRetry = !!cur && cur.phase === 'ACTIVE' && cur.commandId === cmd && cur.epoch === target;
+      if (!cur || (!isActiveRetry && (cur.phase !== 'READY' || cur.commandId !== cmd || cur.epoch !== target))) throw new FenceAuthorityQuarantineError('no matching READY cutover to ACTIVATE — quarantine');
+      // carry the ratified READY binding forward as the terminal go-live proof.
+      const rdRow = (await exec.query("SELECT evidence FROM tsk_ha_cutover_history WHERE stream_id=$1 AND command_id=$2 AND epoch=$3 AND phase='READY'", [s, cmd, target])).rows[0];
+      if (!rdRow || rdRow.evidence === null) throw new FenceAuthorityQuarantineError('no bound READY evidence to activate against — quarantine');
+      const rd = JSON.parse(String(rdRow.evidence)) as { bReceiptDigest: string; generationId: string; bSystemId: string; sourceSystemId: string; controlSystemId: string; n: number; frozenReceiptDigest: string };
+      const ev = JSON.stringify({ k: 'active/v1', bReceiptDigest: rd.bReceiptDigest, generationId: rd.generationId, bSystemId: rd.bSystemId,
+        sourceSystemId: rd.sourceSystemId, controlSystemId: rd.controlSystemId, n: rd.n, frozenReceiptDigest: rd.frozenReceiptDigest });
+      if (isActiveRetry) {
+        if (cur!.evidence !== ev) throw new FenceAuthorityQuarantineError('ACTIVE retry does not reproduce the ratified go-live evidence — quarantine');
+        return cur!;
+      }
+      return this.cutTransition(exec, s, target, cmd, cur!.seqno + 1, 'ACTIVE', ev, cur!.stateDigest);
+    });
+  }
+
   /** Prove the OLD holder is fenced WITHOUT touching A's PG: an exact current revoked lease at
    *  epoch target-1 whose MONOTONIC max grant-expiry (+ bounded margin) has elapsed on the control
    *  clock read in THIS tx. A missing lease is NOT acceptable. */

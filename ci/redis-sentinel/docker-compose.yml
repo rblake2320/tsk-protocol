@@ -1,0 +1,69 @@
+# Real Redis Sentinel/quorum topology for the PR2c acceptance drill (#10): a master, one
+# replica, and THREE sentinels (quorum 2). STATIC IPs on a dedicated network so that when the
+# master CRASHES (its container exits, dropping Docker DNS), the sentinels — which monitor the
+# master by its fixed IP, not a hostname — still mark it down and fail over to the replica.
+# The drill runs as an in-network service (no host-NAT). `run.sh` docker-waits on the drill and
+# propagates its exit code (we can't --abort-on-container-exit: the drill intentionally exits the
+# master mid-run). Mechanism-only on a single host (processes, not physical failure domains).
+networks:
+  tsknet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.7.0/24
+services:
+  redis-master:
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    command: >-
+      redis-server --appendonly yes --appendfsync everysec --save ""
+      --repl-diskless-sync yes
+    restart: "no"   # a crashed master STAYS down so Sentinel must promote the replica
+    networks:
+      tsknet: { ipv4_address: 172.28.7.10 }
+  redis-replica:
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    command: >-
+      redis-server --appendonly yes --appendfsync everysec --save ""
+      --replicaof 172.28.7.10 6379 --replica-read-only yes
+    depends_on: [redis-master]
+    networks:
+      tsknet: { ipv4_address: 172.28.7.11 }
+  sentinel-1: &sentinel
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cat > /tmp/sentinel.conf <<EOF
+        port 26379
+        sentinel monitor tskmaster 172.28.7.10 6379 2
+        sentinel down-after-milliseconds tskmaster 3000
+        sentinel failover-timeout tskmaster 8000
+        sentinel parallel-syncs tskmaster 1
+        EOF
+        exec redis-sentinel /tmp/sentinel.conf
+    depends_on: [redis-master, redis-replica]
+    networks: [tsknet]
+  sentinel-2:
+    <<: *sentinel
+    networks: [tsknet]
+  sentinel-3:
+    <<: *sentinel
+    networks: [tsknet]
+  drill:
+    image: node:24-bookworm
+    working_dir: /work
+    volumes:
+      - "${TSK_REPO:-../..}:/work"
+      - "/work/node_modules"                    # anonymous volume: in-container npm ci never touches the host's
+    environment:
+      TSK_TEST_SENTINELS: "sentinel-1:26379,sentinel-2:26379,sentinel-3:26379"
+      TSK_TEST_SENTINEL_MASTER: tskmaster
+      TSK_TEST_MASTER_HOST: "172.28.7.10"
+      TSK_TEST_REPLICA_HOST: "172.28.7.11"
+    command:
+      - bash
+      - -lc
+      - "npm ci --no-audit --no-fund && npm run build -w packages/server && npx tsx tsk-ha-sentinel-drill.mts"
+    depends_on: [sentinel-1, sentinel-2, sentinel-3]
+    networks: [tsknet]

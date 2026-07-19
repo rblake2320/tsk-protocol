@@ -161,6 +161,22 @@ jobs:
           TSK_TEST_RECEIVER_PG_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5433/tsk_test
           TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
           TSK_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # (PR2c acceptance) child-process SIGKILL/restart matrix over the FULL control cutover
+      # (bind->advance->import->ready->activate): before-commit SIGKILL rolls back (no torn state),
+      # after-commit SIGKILL resumes idempotently to ACTIVE. Three INDEPENDENT PG16 + real Redis.
+      # Real OS-level process kills. THROWS if any URL is unset. Contributes to closing #10.
+      - run: npm run test:sigkill
+        env:
+          TSK_TEST_SOURCE_PG_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+          TSK_TEST_RECEIVER_PG_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5433/tsk_test
+          TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
+          TSK_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # (PR2c acceptance) REAL Redis Sentinel/quorum failover of the fencing authority: 1 master +
+      # 1 replica + 3 sentinels (quorum 2), a real master crash (SHUTDOWN NOSAVE), automatic Sentinel
+      # promotion; the committed+replica-ack'd fence SURVIVES (RPO=0), stays monotonic, RTO measured.
+      # Runs the whole topology + drill via docker compose (run.sh docker-waits on the drill). Closes
+      # the Redis-HA gate for #10. Mechanism-only on one host (processes, not physical failure domains).
+      - run: npm run test:sentinel
       - run: npm run test:pack
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:

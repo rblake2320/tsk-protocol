@@ -213,6 +213,17 @@ async function main() {
     mut.bSystemId = savedB;
   });
 
+  await check('READY → ACTIVE: terminal go-live; B is the live authority; idempotent; ACTIVE carries the ratified binding', async () => {
+    const ac = await ctl.activate(SID, CMD, 1);
+    assert.equal(ac.phase, 'ACTIVE'); assert.equal(ac.commandId, CMD); assert.equal(ac.epoch, 1);
+    const ev = JSON.parse(ac.evidence!);
+    assert.equal(ev.k, 'active/v1'); assert.equal(ev.bReceiptDigest, s1.receipt.receiptDigest);
+    assert.equal(ev.bSystemId, bSysId); assert.equal(ev.sourceSystemId, aSysId); assert.equal(ev.controlSystemId, cSysId); assert.equal(ev.n, 6);
+    assert.equal((await ctl.activate(SID, CMD, 1)).phase, 'ACTIVE'); // idempotent terminal
+    // ACTIVE is terminal — a stale READY re-mark on the completed promotion is refused.
+    await assert.rejects(() => ctl.markReady(SID, CMD, 1, s1.receipt, resolver), /no matching IMPORTING/);
+  });
+
   // ── negative: foreign freeze cannot be bound to a cutover ─────────────────────
   await check('bindSourceFenced REJECTS a frozen receipt for a different stream/command (no cross-stream splice)', async () => {
     const SIDX = 'tsk:pair:foreign/v1';
