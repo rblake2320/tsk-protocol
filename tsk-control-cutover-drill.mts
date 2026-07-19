@@ -34,7 +34,7 @@ import {
   FenceAuthorityQuarantineError, provisionControlSchema,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation,
   type TskHotpMutation, type SourceVerifyKeyResolver, type SourceExportBundle, type GuardCountersignedExport,
-  type GuardKeyResolver, type HaControlPolicy, type BFinalizedReceipt,
+  type GuardKeyResolver, type HaControlPolicy, type BFinalizedReceipt, type SourceFrozenReceipt,
 } from './packages/server/dist/index.js';
 
 const A_URL = process.env['TSK_TEST_SOURCE_PG_URL_A'] ?? process.env['TSK_TEST_SOURCE_PG_URL'] ?? process.env['TSK_TEST_POSTGRES_URL'];
@@ -126,6 +126,19 @@ async function main() {
   const ctrlNowMs = async () => Number((await cPool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
   const storeFor = (sid: string) => new RedisFencingStore(redis, 'tsk:fence:' + sid);
 
+  // Mint a REAL ed25519 SourceFrozenReceipt at a GIVEN source lease epoch (genesis N=0) — used to build a
+  // cross-epoch (foreign-epoch) freeze that must NOT bind to a target whose target-1 differs.
+  const genesisFreezeAtEpoch = async (sid: string, cmd: string, leaseEpoch: number): Promise<SourceFrozenReceipt> => {
+    await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0) ON CONFLICT (stream_id) DO NOTHING', [sid]);
+    await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0) ON CONFLICT (stream_id) DO NOTHING', [sid, 'e1']);
+    const now = Number((await aPool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
+    const g = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'g-' + cmd, leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 1, prevGrantDigest: null });
+    await aTx.transaction((exec) => installLeaseGrant(exec, resolver, g));
+    const rev = signLeaseGrant(GUARD_KEY, guardSecret, { streamId: sid, leaseEpoch, leaseStatus: 'revoked', holderNodeId: 'A', leaseId: 'l1', commandId: cmd, leaseExpiresAtMs: now + HOUR, leaseGrantSeq: 2, prevGrantDigest: g.grantDigest });
+    await aTx.transaction((exec) => installLeaseGrant(exec, resolver, rev));
+    return emitSourceFrozenReceipt(aTx, SCHEMA, { sourceKeyId: SOURCE_KEY, sourcePrivateKey: sourceSecret, leaseResolver: resolver, headResolver: resolver }, { streamId: sid, commandId: cmd, epoch: leaseEpoch, sourceNodeId: 'A' });
+  };
+
   // ── happy path: full signed ordering with both receipts bound ────────────────
   const SID = 'tsk:pair:cutover/v1'; const CMD = 'promote-1';
   const s1 = await buildStream(aTx, aPool, bTx, SID, CMD, [['T1', 1], ['T2', 5], ['T1', 2], ['T3', 9], ['T2', 6], ['T1', 3]]);
@@ -176,6 +189,9 @@ async function main() {
   await check('IMPORTING refuses a tampered receipt (ed25519 gate) and a wrong-command receipt', async () => {
     const tampered = clone(s1.receipt); tampered.bSystemId = '999';
     await assert.rejects(() => ctl.markReady(SID, CMD, 1, tampered as BFinalizedReceipt, resolver), /digest mismatch|signature|verif/i);
+    // epoch is a SIGNED-bound field: a forged cross-epoch B receipt can't pass verification (B-receipt epoch vector)
+    const tamperedEp = clone(s1.receipt); tamperedEp.epoch = 99;
+    await assert.rejects(() => ctl.markReady(SID, CMD, 1, tamperedEp as BFinalizedReceipt, resolver), /digest mismatch|signature|verif/i);
     await assert.rejects(() => ctl.markReady(SID, 'other-cmd', 1, s1.receipt, resolver), /no matching IMPORTING|commandId/);
   });
 
@@ -187,6 +203,7 @@ async function main() {
     assert.equal(ev.frozenReceiptDigest, s1.frozen.receiptDigest, 'READY binds the EXACT SOURCE_FENCED freeze');
     assert.equal(ev.bSystemId, bSysId); assert.equal(ev.sourceSystemId, aSysId); assert.equal(ev.controlSystemId, cSysId);
     assert.notEqual(ev.bSystemId, ev.sourceSystemId); assert.notEqual(ev.bSystemId, ev.controlSystemId);
+    assert.equal(s1.receipt.epoch, 0); assert.equal(s1.frozen.epoch, 0); // freeze + B receipt at source epoch target-1 (=0)
     assert.equal((await ctl.markReady(SID, CMD, 1, s1.receipt, resolver)).phase, 'READY'); // idempotent for the ratified receipt
     // (H3) a READY retry with a DIFFERENT receipt (the B==control one, same freeze) is refused — never silently OK
     await assert.rejects(() => ctl.markReady(SID, CMD, 1, ctrlReceipt, resolver), /B system_identifier == control/);
@@ -205,6 +222,17 @@ async function main() {
     await ctl.writeLease({ streamId: SIDX, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a-foreign' });
     await ctl.beginPromotionIntent(SIDX, 'promote-foreign', 1);
     await assert.rejects(() => ctl.bindSourceFenced(SIDX, 'promote-foreign', 1, other.frozen, resolver), /frozen receipt (streamId|commandId) != cutover/);
+  });
+
+  // ── negative: a freeze at the WRONG source epoch cannot bind (cross-epoch splice) ─
+  await check('bindSourceFenced REJECTS a freeze whose epoch != targetEpoch-1 (foreign-epoch freeze)', async () => {
+    const SIDE = 'tsk:pair:epoch/v1';
+    const frE1 = await genesisFreezeAtEpoch(SIDE, 'promote-epoch', 1); // frozen at source epoch 1
+    await ctl.provision(SIDE, 'g-epoch');
+    const past = (await ctrlNowMs()) - 5_000;
+    await ctl.writeLease({ streamId: SIDE, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a-epoch' });
+    await ctl.beginPromotionIntent(SIDE, 'promote-epoch', 1); // target 1 → target-1 = 0, but the freeze is epoch 1
+    await assert.rejects(() => ctl.bindSourceFenced(SIDE, 'promote-epoch', 1, frE1, resolver), /epoch 1 != targetEpoch-1|cross-epoch/);
   });
 
   // ── negative: the ORDERING gate is enforced AT advanceEpoch (single chokepoint) ─

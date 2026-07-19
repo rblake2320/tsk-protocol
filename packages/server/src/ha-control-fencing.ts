@@ -933,9 +933,11 @@ export class HaControlFencing {
     // everything below uses ONLY the immutable snapshot, so a concurrent caller mutation cannot TOCTOU us.
     const fr = frozenSnapshot(frozenReceipt);
     const resolver = frozenResolver;
-    verifySourceFrozenReceipt(resolver, fr); // ed25519 over A's public key — throws on tamper
+    verifySourceFrozenReceipt(resolver, fr); // verifies A's ed25519 signature over the frozen receipt — throws on tamper
     if (fr.commandId !== cmd) throw new FenceAuthorityQuarantineError('frozen receipt commandId != cutover command — quarantine');
     if (fr.streamId !== s) throw new FenceAuthorityQuarantineError('frozen receipt streamId != cutover stream — quarantine');
+    // the freeze at source epoch E promotes to control target epoch E+1 — reject a cross-epoch splice.
+    if (fr.epoch !== target - 1) throw new FenceAuthorityQuarantineError(`frozen receipt epoch ${fr.epoch} != targetEpoch-1 (${target - 1}) — cross-epoch freeze; quarantine`);
     // canonical bound-field set — written as evidence AND re-asserted on an idempotent retry (H3).
     const bound = { k: 'source_fenced/v1', frozenReceiptDigest: fr.receiptDigest, sourceEpoch: fr.epoch, n: fr.n,
       headAtN: fr.signedHeadDigestAtN, stateAtN: fr.sourceStateDigestAtN, sourceNodeId: fr.sourceNodeId,
@@ -975,10 +977,12 @@ export class HaControlFencing {
   }
 
   /**
-   * (§4-d) IMPORTING → READY. Control VERIFIES B's BFinalizedReceipt (ed25519 over B's + source's + guard's
-   * PUBLIC keys), then binds it to THIS cutover:
+   * (§4-d) IMPORTING → READY. Control VERIFIES B's ed25519 signature over the BFinalizedReceipt (whose bound
+   * fields embed the source+guard signatures, transitively binding them — this does NOT independently re-verify
+   * the source/guard public-key signatures, which were checked at export/finalize), then binds it to THIS cutover:
    *   • commandId + streamId match the active cutover command;
    *   • frozenReceiptDigest / n / head@N / state@N match the SOURCE_FENCED-bound freeze byte-for-byte;
+   *   • the freeze epoch is targetEpoch-1 and B's receipt epoch equals it (no cross-epoch splice);
    *   • B's system_identifier is DISTINCT from BOTH the signed source system_identifier (B != source) AND
    *     control's OWN durable PG system_identifier (B != control — the capability §4 was deferred to hold).
    * The READY head (control-signed) records B's finalize digest + both distinct system_identifiers, so a
@@ -992,7 +996,10 @@ export class HaControlFencing {
     // (H1) synchronously DECOUPLE + freeze the caller-owned receipt and capture the resolver BEFORE any await.
     const br = frozenSnapshot(bReceipt);
     const resolver = bResolver;
-    verifyBFinalizedReceipt(resolver, br); // ed25519 over B + source + guard public keys — throws on tamper
+    // verifies B's ed25519 signature over the receipt (whose bound fields INCLUDE the source+guard signature
+    // strings, so any of them tampering breaks B's signature); it does NOT independently re-verify the source
+    // or guard public-key signatures — that was done at export/finalize time and is transitively bound here.
+    verifyBFinalizedReceipt(resolver, br);
     if (br.commandId !== cmd) throw new FenceAuthorityQuarantineError('BFinalizedReceipt commandId != cutover command — quarantine');
     if (br.streamId !== s) throw new FenceAuthorityQuarantineError('BFinalizedReceipt streamId != cutover stream — quarantine');
     return this.criticalTx(s, async (exec) => {
@@ -1002,10 +1009,13 @@ export class HaControlFencing {
       if (!cur || (!isReadyRetry && (cur.phase !== 'IMPORTING' || cur.commandId !== cmd || cur.epoch !== target))) throw new FenceAuthorityQuarantineError('no matching IMPORTING cutover to mark READY — quarantine');
       const sfRow = (await exec.query("SELECT evidence FROM tsk_ha_cutover_history WHERE stream_id=$1 AND command_id=$2 AND epoch=$3 AND phase='SOURCE_FENCED'", [s, cmd, target])).rows[0];
       if (!sfRow || sfRow.evidence === null) throw new FenceAuthorityQuarantineError('no bound SOURCE_FENCED evidence to bind READY against — quarantine');
-      const sf = JSON.parse(String(sfRow.evidence)) as { frozenReceiptDigest: string; n: number; headAtN: string; stateAtN: string };
+      const sf = JSON.parse(String(sfRow.evidence)) as { frozenReceiptDigest: string; n: number; headAtN: string; stateAtN: string; sourceEpoch: number };
       // B's finalize MUST bind the EXACT frozen N control bound at SOURCE_FENCED (no cross-freeze splice).
       if (br.frozenReceiptDigest !== sf.frozenReceiptDigest) throw new FenceAuthorityQuarantineError('BFinalizedReceipt frozenReceiptDigest != the bound SOURCE_FENCED freeze — quarantine');
       if (br.n !== sf.n || br.signedHeadDigestAtN !== sf.headAtN || br.sourceStateDigestAtN !== sf.stateAtN) throw new FenceAuthorityQuarantineError('BFinalizedReceipt N/head@N/state@N != the bound freeze — quarantine');
+      // epoch binding: the bound freeze is at source epoch target-1, and B's receipt must be at that SAME epoch.
+      if (sf.sourceEpoch !== target - 1) throw new FenceAuthorityQuarantineError(`bound SOURCE_FENCED sourceEpoch ${sf.sourceEpoch} != targetEpoch-1 (${target - 1}) — quarantine`);
+      if (br.epoch !== sf.sourceEpoch) throw new FenceAuthorityQuarantineError(`BFinalizedReceipt epoch ${br.epoch} != the bound freeze sourceEpoch ${sf.sourceEpoch} — cross-epoch splice; quarantine`);
       // Distinctness: B != source (signed in the receipt) AND B != control (control's OWN in-tx sysid).
       const controlSystemId = await this.controlSystemId(exec);
       if (br.bSystemId === br.sourceSystemId) throw new FenceAuthorityQuarantineError('B system_identifier == source — not a distinct node; quarantine');
