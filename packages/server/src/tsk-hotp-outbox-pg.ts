@@ -479,13 +479,14 @@ function mintReadyToken(state: ReadyState): SchemaReadyToken {
   READY_STATE.set(token, state);
   return token as SchemaReadyToken;
 }
-function requireReady(token: SchemaReadyToken, db?: PgTransactor): string {
+export function requireSchemaReady(token: SchemaReadyToken, db?: PgTransactor): string {
   const st = READY_STATE.get(token as unknown as object);
   if (!st) throw new ContractValidationError('invalid schema-readiness capability (forged or foreign token)');
   if (db !== undefined && st.db !== db) throw new ContractValidationError('schema-readiness token is bound to a different PgTransactor');
   if (st.manifest !== TSK_OUTBOX_SCHEMA_MANIFEST || st.version !== TSK_OUTBOX_SCHEMA_VERSION) throw new ContractValidationError('schema-readiness token attests a different manifest/version');
   return st.schema;
 }
+const requireReady = requireSchemaReady;
 // (R2/HIGH) There is NO test-only mint helper: it would ship in dist and permit
 // unattested construction via a deep import. Tests obtain a token the same way
 // production does — via `assertSchemaReady`/`provisionSchemaVersion` — using a fake
@@ -513,6 +514,13 @@ async function assertVersionInTx(exec: PgExecutor): Promise<void> {
 export async function assertSchemaReady(db: PgTransactor, schema: string): Promise<SchemaReadyToken> {
   await db.transaction(async (exec) => { await enterCriticalTx(exec, schema); await attestSchema(exec); await assertVersionInTx(exec); });
   return mintReadyToken({ db, schema, manifest: TSK_OUTBOX_SCHEMA_MANIFEST, version: TSK_OUTBOX_SCHEMA_VERSION });
+}
+
+/** Re-attest the complete outbox catalog inside an already-owned operation. */
+export async function attestOutboxSchemaInTx(exec: PgExecutor, schema: string): Promise<void> {
+  await enterCriticalTx(exec, schema);
+  await attestSchema(exec);
+  await assertVersionInTx(exec);
 }
 
 /** FRESH provisioning: attest, then stamp with a plain asserted insert; an exact-
@@ -689,10 +697,7 @@ abstract class AbstractTskDurableOutbox {
     if (!Number.isSafeInteger(counter) || counter < 1 || counter > TSK_HOTP_MAX_COUNTER) throw new ContractValidationError('HOTP counter out of range [1, 2^31-1]');
     const tumblerId = (sanitized as unknown as TskHotpMutation).tumblerId;
     if (typeof tumblerId !== 'string' || tumblerId.length < 1 || tumblerId.length > 512) throw new ContractValidationError('tumblerId invalid');
-    // Preserve the complete sanitizer-produced value. The built-in HOTP
-    // sanitizer emits exactly {tumblerId,counter}; typed HA extensions may
-    // bind additional secret-free lifecycle fields to the same signed head.
-    const mutation = deepFreeze(sanitized) as SanitizedMutation<TskHotpMutation>;
+    const mutation = deepFreeze({ tumblerId, counter }) as SanitizedMutation<TskHotpMutation>;
 
     const opDigest = canonicalOpDigest<TskHotpMutation>({ streamId, sourceEpoch, sequence: nextSeq, fenceToken: fenceDecimal, mutation });
     const mutationJson = JSON.stringify(mutation); // serialize BEFORE any await

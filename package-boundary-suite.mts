@@ -88,7 +88,8 @@ for (const workspace of workspaces) {
       assert(typeof (exports as Record<string, unknown>)[sym] === 'function', `@tsk/server must export ${sym}`);
     }
     for (const sym of ['PgHaTumblerMapStore', 'PgTskCredentialReceiverCheckpoint',
-      'assertCredentialAuthorityReady']) {
+      'assertCredentialAuthorityReady', 'provisionCredentialRuntimeMutationBoundary',
+      'assertCredentialRuntimeMutationBoundary', 'HmacCredentialMutationTicketSigner']) {
       assert(typeof (exports as Record<string, unknown>)[sym] === 'function', `@tsk/server must export ${sym}`);
     }
     assert(typeof (exports as Record<string, unknown>).TSK_CREDENTIAL_AUTHORITY_SCHEMA === 'string',
