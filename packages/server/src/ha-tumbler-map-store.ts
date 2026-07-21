@@ -736,7 +736,8 @@ export async function provisionCredentialRuntimeMutationBoundary(
       )).rows[0];
       if (owner) throw new ContractValidationError('credential runtime role inherits authority ownership');
       await exec.query(`REVOKE CREATE ON SCHEMA ${schema} FROM PUBLIC,${runtimeRole}`);
-      await exec.query(`REVOKE INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER ON ALL TABLES IN SCHEMA ${schema} FROM PUBLIC,${runtimeRole}`);
+      const governedTableSql = GOVERNED_TABLES.map((table) => `${schema}.${table}`).join(',');
+      await exec.query(`REVOKE INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER ON TABLE ${governedTableSql} FROM PUBLIC,${runtimeRole}`);
       await exec.query(`REVOKE ALL ON TABLE ${schema}.tsk_credential_mutation_key,
         ${schema}.tsk_credential_mutation_nonce FROM PUBLIC,${runtimeRole}`);
       await exec.query(`REVOKE ALL ON FUNCTION ${schema}.tsk_apply_credential_mutation(jsonb,text,text,bigint,numeric,text,jsonb,text,text,text,text,text,jsonb),
