@@ -689,7 +689,10 @@ abstract class AbstractTskDurableOutbox {
     if (!Number.isSafeInteger(counter) || counter < 1 || counter > TSK_HOTP_MAX_COUNTER) throw new ContractValidationError('HOTP counter out of range [1, 2^31-1]');
     const tumblerId = (sanitized as unknown as TskHotpMutation).tumblerId;
     if (typeof tumblerId !== 'string' || tumblerId.length < 1 || tumblerId.length > 512) throw new ContractValidationError('tumblerId invalid');
-    const mutation = deepFreeze({ tumblerId, counter }) as SanitizedMutation<TskHotpMutation>;
+    // Preserve the complete sanitizer-produced value. The built-in HOTP
+    // sanitizer emits exactly {tumblerId,counter}; typed HA extensions may
+    // bind additional secret-free lifecycle fields to the same signed head.
+    const mutation = deepFreeze(sanitized) as SanitizedMutation<TskHotpMutation>;
 
     const opDigest = canonicalOpDigest<TskHotpMutation>({ streamId, sourceEpoch, sequence: nextSeq, fenceToken: fenceDecimal, mutation });
     const mutationJson = JSON.stringify(mutation); // serialize BEFORE any await
