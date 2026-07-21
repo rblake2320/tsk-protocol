@@ -20,6 +20,7 @@ import {
   signLeaseGrant, installLeaseGrant, assertSourceFenceReady, emitSourceFrozenReceipt,
   buildSourceExportManifest, guardCountersignSourceExport,
   assertReceiverReady, stageAndFinalizeReceiverGeneration, verifyBFinalizedReceipt,
+  activateFinalizedReceiverAsSource,
   HA_CONTROL_PG_SCHEMA, HA_CONTROL_TABLES, HaControlFencing, GuardSigner, RedisFencingStore, provisionControlSchema, verifyLeaseGrant,
   type PgTransactor, type StreamHeadSigner, type HotpMutationSanitizer, type SanitizedMutation,
   type TskHotpMutation, type SourceVerifyKeyResolver, type SourceExportBundle, type GuardCountersignedExport,
@@ -53,24 +54,6 @@ const sanitizer: HotpMutationSanitizer = {
 };
 let passed = 0;
 async function check(name: string, fn: () => Promise<void>) { await fn(); passed++; console.log(`  ok - ${name}`); }
-
-async function installVerifiedHistory(pool: pg.Pool, streamId: string,
-  bundle: SourceExportBundle, fromSequence = 1): Promise<void> {
-  for (const record of bundle.historyChunks.flatMap((chunk) => chunk.records)) {
-    if (record.sequence < fromSequence) continue;
-    const mutation = JSON.parse(record.payload) as { tumblerId: string; counter: number };
-    await pool.query(
-      `INSERT INTO tsk_outbox_rows
-       (stream_id,source_epoch,sequence,fence_token,op_digest,tumbler_id,hotp_counter,
-        mutation,head_prev,head_digest,head_key_id,head_alg,head_sig,acked_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now())`,
-      [streamId, record.sourceEpoch, record.sequence, record.fenceToken,
-        record.opDigest, mutation.tumblerId, mutation.counter, mutation,
-        record.prevHeadDigest, record.headDigest, record.keyId, record.alg,
-        record.signature],
-    );
-  }
-}
 
 async function main() {
   console.log('# TSK PR2c governed B source-authority activation (B originates N+1; old A denied)');
@@ -111,36 +94,34 @@ async function main() {
   const nowA = async () => Number((await aPool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
   await aPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,0)', [SID]);
   await aPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence) VALUES ($1,$2,0)', [SID, SRC_EPOCH]);
-  const g = signLeaseGrant(GUARD_KEY, guard.privateKey, { streamId: SID, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: 'A', leaseId: 'l1', commandId: 'grant-1', leaseExpiresAtMs: (await nowA()) + HOUR, leaseGrantSeq: 1, prevGrantDigest: null });
+  const g = signLeaseGrant(GUARD_KEY, guard.privateKey, { streamId: SID, leaseEpoch: 0, leaseStatus: 'active', holderNodeId: A_KEY, leaseId: 'l1', commandId: 'grant-1', leaseExpiresAtMs: (await nowA()) + HOUR, leaseGrantSeq: 1, prevGrantDigest: null });
   await aTx.transaction((exec) => installLeaseGrant(exec, resolver, g));
-  const aReady = await assertSourceFenceReady(aTx, SCHEMA, resolver, { streamId: SID, holderNodeId: 'A', leaseId: 'l1', grantDigest: g.grantDigest });
+  const aReady = await assertSourceFenceReady(aTx, SCHEMA, resolver, { streamId: SID, holderNodeId: A_KEY, leaseId: 'l1', grantDigest: g.grantDigest });
   const aOb = new PgTskDurableOutbox(aTx, READY, { streamId: SID, sanitizer, signer, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready: aReady });
   for (const [t, c] of [['T1', 1], ['T2', 5], ['T1', 2], ['T3', 9]] as [string, number][]) await aOb.withOutboxTx((wtx) => aOb.appendInTx(wtx, { streamId: SID, rawMutation: { tumblerId: t, counter: c }, fenceToken: 0n }));
   const N = 4;
-  const rev = signLeaseGrant(GUARD_KEY, guard.privateKey, { streamId: SID, leaseEpoch: 0, leaseStatus: 'revoked', holderNodeId: 'A', leaseId: 'l1', commandId: CMD, leaseExpiresAtMs: (await nowA()) + HOUR, leaseGrantSeq: 2, prevGrantDigest: g.grantDigest });
+  const rev = signLeaseGrant(GUARD_KEY, guard.privateKey, { streamId: SID, leaseEpoch: 0, leaseStatus: 'revoked', holderNodeId: A_KEY, leaseId: 'l1', commandId: CMD, leaseExpiresAtMs: (await nowA()) + HOUR, leaseGrantSeq: 2, prevGrantDigest: g.grantDigest });
   await aTx.transaction((exec) => installLeaseGrant(exec, resolver, rev));
-  const frozen = await emitSourceFrozenReceipt(aTx, SCHEMA, { sourceKeyId: SOURCE_KEY, sourcePrivateKey: source.privateKey, leaseResolver: resolver, headResolver: resolver }, { streamId: SID, commandId: CMD, epoch: 0, sourceNodeId: 'A' });
+  const frozen = await emitSourceFrozenReceipt(aTx, SCHEMA, { sourceKeyId: SOURCE_KEY, sourcePrivateKey: source.privateKey, leaseResolver: resolver, headResolver: resolver }, { streamId: SID, commandId: CMD, epoch: 0, sourceNodeId: A_KEY });
   assert.equal(frozen.n, N);
-  const built = await buildSourceExportManifest(aTx, SCHEMA, { streamId: SID, epoch: 0, commandId: CMD, sourceNodeId: 'A' }, { sourceKeyId: SOURCE_KEY, sourcePrivateKey: source.privateKey, sanitizer, leaseResolver: resolver, headResolver: resolver, frozenReceipt: frozen, maxChunkItems: 4 });
+  const built = await buildSourceExportManifest(aTx, SCHEMA, { streamId: SID, epoch: 0, commandId: CMD, sourceNodeId: A_KEY }, { sourceKeyId: SOURCE_KEY, sourcePrivateKey: source.privateKey, sanitizer, leaseResolver: resolver, headResolver: resolver, frozenReceipt: frozen, maxChunkItems: 4 });
   const bundle: SourceExportBundle = built.bundle;
   const dual: GuardCountersignedExport = guardCountersignSourceExport(bundle, built.manifest, { guardKeyId: GUARD_KEY, guardPrivateKey: guard.privateKey, sanitizer, sourceManifestResolver: resolver, headResolver: resolver, frozenResolver: resolver, frozenReceipt: frozen, expectedCommandId: CMD });
   const ropts = { sanitizer, sourceResolver: resolver, guardResolver: resolver, headResolver: resolver, frozenResolver: resolver, bVerifyResolver: resolver, frozenReceipt: frozen, expectedCommandId: CMD, bKeyId: B_KEY, bPrivateKey: bKp.privateKey };
-  const bReceipt = await stageAndFinalizeReceiverGeneration(bTx, SCHEMA, await assertReceiverReady(bTx, SCHEMA), 'gen-1', bundle, dual, ropts);
+  const bReceiverReady = await assertReceiverReady(bTx, SCHEMA);
+  const bReceipt = await stageAndFinalizeReceiverGeneration(bTx, SCHEMA, bReceiverReady, 'gen-1', bundle, dual, ropts);
   verifyBFinalizedReceipt(resolver, bReceipt);
   const headAtN = bReceipt.signedHeadDigestAtN;
-  // The independently replayed receiver generation is now materialized as B's source ledger.
-  // These exact signed rows are what the next freeze/export replays; no history is synthesized.
-  await installVerifiedHistory(bPool, SID, bundle);
 
   // ── control drives the cutover to ACTIVE ──
   const ctlReady = await provisionControlSchema(cTx as never, SCHEMA);
   const ctl = new HaControlFencing(cTx as never, new GuardSigner(CTRL_KEY, ctrlSecret), ctrlResolver, ctlReady, POLICY);
   const ctlNow = async () => Number((await cPool.query('SELECT (extract(epoch from clock_timestamp())*1000)::bigint AS ms')).rows[0].ms);
   await ctl.provision(SID, 'g-bact');
-  await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'a1' });
+  await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: A_KEY, epoch: 0, status: 'active', grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'a1' });
   await ctl.beginPromotionIntent(SID, CMD, TARGET);
   await ctl.bindSourceFenced(SID, CMD, TARGET, frozen, resolver);
-  await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'a2' });
+  await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: A_KEY, epoch: 0, status: 'revoked', grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'a2' });
   const store = redis ? new RedisFencingStore(redis, 'tsk:fence:' + SID) : new MemoryFencingStore();
   const proof: FenceProof = { safetyMarginMs: 0, claimExpiresAtMs: (await ctlNow()) + HOUR };
   await ctl.advanceEpoch(SID, CMD, TARGET, 'Bnode', store, proof);
@@ -151,22 +132,79 @@ async function main() {
   let bGrant: Awaited<ReturnType<typeof ctl.activateSource>>;
   let bOb: InstanceType<typeof PgTskDurableOutbox>;
   await check('activateSource mints a GUARD-signed governed B lease at the PROMOTED epoch via the CONFIGURED authority, holder==ratified B, durable + rehydratable', async () => {
-    bGrant = await ctl.activateSource(SID, CMD, TARGET, bReceipt, resolver); // no per-call key; guard from config
+    bGrant = await ctl.activateSource(SID, CMD, TARGET, bReceipt, resolver, resolver); // no per-call key; guard from config
     verifyLeaseGrant(resolver, bGrant); // B independently verifies with the guard PUBLIC key (unforgeable)
     assert.equal(bGrant.leaseEpoch, TARGET); assert.equal(bGrant.holderNodeId, B_KEY, 'holder is the ratified B signing identity'); assert.equal(bGrant.leaseStatus, 'active'); assert.equal(bGrant.commandId, CMD);
     // (recovery) a RETRY rehydrates the byte-identical grant — never a different or conflicting one.
-    const again = await ctl.activateSource(SID, CMD, TARGET, bReceipt, resolver);
+    const again = await ctl.activateSource(SID, CMD, TARGET, bReceipt, resolver, resolver);
     assert.equal(again.grantDigest, bGrant.grantDigest); assert.deepEqual(again, bGrant);
     // a receipt that was NOT ratified into the ACTIVE head is refused.
     const bogus = { ...bReceipt, n: 999 };
-    await assert.rejects(() => ctl.activateSource(SID, CMD, TARGET, bogus as typeof bReceipt, resolver), /verif|not the one ratified|digest mismatch/i);
+    await assert.rejects(() => ctl.activateSource(SID, CMD, TARGET, bogus as typeof bReceipt, resolver, resolver), /verif|not the one ratified|digest mismatch/i);
   });
 
   await check('B installs the governed lease, seeds its checkpoint to (N, head@N), and ORIGINATES sequence N+1 through the fenced outbox', async () => {
-    // B becomes the source: fence epoch = the promoted epoch; checkpoint continues from the verified (N, head@N).
-    await bPool.query('INSERT INTO tsk_outbox_fence (stream_id, fence_token) VALUES ($1,$2)', [SID, TARGET]);
-    await bPool.query('INSERT INTO tsk_outbox_source_checkpoint (stream_id, source_epoch, sequence, head_digest) VALUES ($1,$2,$3,$4)', [SID, SRC_EPOCH, N, headAtN]);
-    await bTx.transaction((exec) => installLeaseGrant(exec, resolver, bGrant));
+    let failBeforeCommit = false;
+    const crashTx: PgTransactor = {
+      transaction: (fn, opts) => bTx.transaction(fn, {
+        ...opts,
+        onBeforeCommit: async () => { if (failBeforeCommit) throw new Error('simulated crash before commit'); },
+      }),
+    };
+    const crashOutboxReady = await provisionSchemaVersion(crashTx, SCHEMA);
+    const crashReceiverReady = await assertReceiverReady(crashTx, SCHEMA);
+    failBeforeCommit = true;
+    await assert.rejects(() => activateFinalizedReceiverAsSource(
+      crashTx, crashOutboxReady, crashReceiverReady, SID, 'gen-1', {
+        sanitizer, sourceResolver: resolver, guardResolver: resolver,
+        headResolver: resolver, frozenResolver: resolver,
+        bReceiptResolver: resolver, leaseResolver: resolver,
+        frozenReceipt: frozen, finalizedReceipt: bReceipt,
+        activationLease: bGrant, targetEpoch: TARGET,
+      },
+    ), /simulated crash before commit/);
+    const partial = await Promise.all([
+      bPool.query('SELECT count(*)::int AS n FROM tsk_outbox_rows WHERE stream_id=$1', [SID]),
+      bPool.query('SELECT count(*)::int AS n FROM tsk_outbox_fence WHERE stream_id=$1', [SID]),
+      bPool.query('SELECT count(*)::int AS n FROM tsk_outbox_source_checkpoint WHERE stream_id=$1', [SID]),
+      bPool.query('SELECT count(*)::int AS n FROM tsk_source_lease WHERE stream_id=$1', [SID]),
+    ]);
+    assert.deepEqual(partial.map((r) => Number(r.rows[0].n)), [0, 0, 0, 0], 'failed activation exposed no partial source authority');
+    const bOutboxReady = await provisionSchemaVersion(bTx, SCHEMA);
+    // ONE owned SERIALIZABLE authority imports the persisted, independently-verified generation,
+    // advances fence/checkpoint, and installs the lease. A crash exposes all or none.
+    const imported = await activateFinalizedReceiverAsSource(
+      bTx, bOutboxReady, bReceiverReady, SID, 'gen-1', {
+        sanitizer, sourceResolver: resolver, guardResolver: resolver,
+        headResolver: resolver, frozenResolver: resolver,
+        bReceiptResolver: resolver, leaseResolver: resolver,
+        frozenReceipt: frozen, finalizedReceipt: bReceipt,
+        activationLease: bGrant, targetEpoch: TARGET,
+      },
+    );
+    assert.equal(imported.n, N); assert.equal(imported.headDigest, headAtN);
+    // Lost reply/restart is byte-identically idempotent and cannot duplicate the lease or ledger.
+    const importedAgain = await activateFinalizedReceiverAsSource(
+      bTx, bOutboxReady, bReceiverReady, SID, 'gen-1', {
+        sanitizer, sourceResolver: resolver, guardResolver: resolver,
+        headResolver: resolver, frozenResolver: resolver,
+        bReceiptResolver: resolver, leaseResolver: resolver,
+        frozenReceipt: frozen, finalizedReceipt: bReceipt,
+        activationLease: bGrant, targetEpoch: TARGET,
+      },
+    );
+    assert.deepEqual(importedAgain, imported);
+    const accessorReceipt = { ...bReceipt };
+    Object.defineProperty(accessorReceipt, 'commandId', { enumerable: true, get: () => CMD });
+    await assert.rejects(() => activateFinalizedReceiverAsSource(
+      bTx, bOutboxReady, bReceiverReady, SID, 'gen-1', {
+        sanitizer, sourceResolver: resolver, guardResolver: resolver,
+        headResolver: resolver, frozenResolver: resolver,
+        bReceiptResolver: resolver, leaseResolver: resolver,
+        frozenReceipt: frozen, finalizedReceipt: accessorReceipt,
+        activationLease: bGrant, targetEpoch: TARGET,
+      },
+    ), /contains an accessor/);
     const bReadySrc = await assertSourceFenceReady(bTx, SCHEMA, resolver, { streamId: SID, holderNodeId: bGrant.holderNodeId, leaseId: bGrant.leaseId, grantDigest: bGrant.grantDigest });
     const bREADY = await provisionSchemaVersion(bTx, SCHEMA);
     bOb = new PgTskDurableOutbox(bTx, bREADY, { streamId: SID, sanitizer, signer: bSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready: bReadySrc });
@@ -185,11 +223,12 @@ async function main() {
   });
 
   // ── governed B -> A return failback on the SAME stream ──
-  const RETURN_CMD = 'return-2'; const RETURN_TARGET = 2;
+  const ABORT_CMD = 'aborted-handoff-2';
+  const RETURN_CMD = 'return-3'; const RETURN_TARGET = 3;
   let bRev: ReturnType<typeof signLeaseGrant>;
   let returnedGrant: Awaited<ReturnType<typeof ctl.activateSource>>;
   let returnReceipt: Awaited<ReturnType<typeof stageAndFinalizeReceiverGeneration>>;
-  await check('B freezes N+1 and A independently replays the complete signed ledger for return failback', async () => {
+  await check('after a signed terminal ABORTED epoch, B freezes N+1 and A independently replays the complete signed ledger for return failback', async () => {
     bRev = signLeaseGrant(GUARD_KEY, guard.privateKey, {
       streamId: SID, leaseEpoch: TARGET, leaseStatus: 'revoked',
       holderNodeId: bGrant.holderNodeId, leaseId: bGrant.leaseId,
@@ -216,8 +255,9 @@ async function main() {
       expectedCommandId: RETURN_CMD,
     });
     for (const s of TSK_RECEIVER_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await aPool.query(s);
+    const aReceiverReady = await assertReceiverReady(aTx, SCHEMA);
     returnReceipt = await stageAndFinalizeReceiverGeneration(
-      aTx, SCHEMA, await assertReceiverReady(aTx, SCHEMA), 'gen-return-2',
+      aTx, SCHEMA, aReceiverReady, 'gen-return-2',
       builtB.bundle, dualB, {
         sanitizer, sourceResolver: resolver, guardResolver: resolver,
         headResolver: resolver, frozenResolver: resolver, bVerifyResolver: resolver,
@@ -228,21 +268,39 @@ async function main() {
     verifyBFinalizedReceipt(resolver, returnReceipt);
     assert.equal(returnReceipt.n, N + 1);
 
+    const frozenAbort = await emitSourceFrozenReceipt(bTx, SCHEMA, {
+      sourceKeyId: B_SOURCE_KEY, sourcePrivateKey: bSource.privateKey,
+      leaseResolver: resolver, headResolver: resolver,
+    }, { streamId: SID, commandId: ABORT_CMD, epoch: TARGET, sourceNodeId: B_KEY });
     await ctl.writeLease({ streamId: SID, leaseId: bGrant.leaseId,
       holderNodeId: bGrant.holderNodeId, epoch: TARGET, status: 'active',
       grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'b-active-2' });
-    await ctl.beginPromotionIntent(SID, RETURN_CMD, RETURN_TARGET);
-    await ctl.bindSourceFenced(SID, RETURN_CMD, RETURN_TARGET, frozenB, resolver);
+    await ctl.beginPromotionIntent(SID, ABORT_CMD, 2);
+    await ctl.bindSourceFenced(SID, ABORT_CMD, 2, frozenAbort, resolver);
     await ctl.writeLease({ streamId: SID, leaseId: bGrant.leaseId,
       holderNodeId: bGrant.holderNodeId, epoch: TARGET, status: 'revoked',
       grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'b-revoke-2' });
+    await ctl.advanceEpoch(SID, ABORT_CMD, 2, 'unused-node', store,
+      { safetyMarginMs: 0, claimExpiresAtMs: (await ctlNow()) + HOUR });
+    await ctl.abortFencedPromotion(SID, ABORT_CMD, 2, 'target-unavailable');
+
+    // Epoch 2 is consumed but never receives source authority. Control records a terminal
+    // no-writer lease state, then the later promotion proves the signed ABORTED gap.
+    await ctl.writeLease({ streamId: SID, leaseId: bGrant.leaseId,
+      holderNodeId: bGrant.holderNodeId, epoch: 2, status: 'active',
+      grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'b-empty-active-3' });
+    await ctl.writeLease({ streamId: SID, leaseId: bGrant.leaseId,
+      holderNodeId: bGrant.holderNodeId, epoch: 2, status: 'revoked',
+      grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'b-empty-revoke-3' });
+    await ctl.beginPromotionIntent(SID, RETURN_CMD, RETURN_TARGET);
+    await ctl.bindSourceFenced(SID, RETURN_CMD, RETURN_TARGET, frozenB, resolver);
     await ctl.advanceEpoch(SID, RETURN_CMD, RETURN_TARGET, 'Anode', store,
       { safetyMarginMs: 0, claimExpiresAtMs: (await ctlNow()) + HOUR });
     await ctl.markImporting(SID, RETURN_CMD, RETURN_TARGET);
     await ctl.markReady(SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver);
     await ctl.activate(SID, RETURN_CMD, RETURN_TARGET);
     returnedGrant = await ctl.activateSource(
-      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, rev,
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, resolver, [g, rev],
     );
     verifyLeaseGrant(resolver, returnedGrant);
     assert.equal(returnedGrant.holderNodeId, A_KEY);
@@ -250,14 +308,17 @@ async function main() {
     assert.equal(returnedGrant.leaseGrantSeq, 3);
     assert.equal(returnedGrant.prevGrantDigest, rev.grantDigest);
 
-    // A already owns 1..N. Import only B's independently verified signed N+1 row.
-    await installVerifiedHistory(aPool, SID, builtB.bundle, N + 1);
-    await aPool.query('UPDATE tsk_outbox_fence SET fence_token=$2 WHERE stream_id=$1', [SID, RETURN_TARGET]);
-    await aPool.query(
-      'UPDATE tsk_outbox_source_checkpoint SET sequence=$2,head_digest=$3 WHERE stream_id=$1',
-      [SID, N + 1, returnReceipt.signedHeadDigestAtN],
+    const returned = await activateFinalizedReceiverAsSource(
+      aTx, await provisionSchemaVersion(aTx, SCHEMA), aReceiverReady, SID, 'gen-return-2', {
+        sanitizer, sourceResolver: resolver, guardResolver: resolver,
+        headResolver: resolver, frozenResolver: resolver,
+        bReceiptResolver: resolver, leaseResolver: resolver,
+        frozenReceipt: frozenB, finalizedReceipt: returnReceipt,
+        activationLease: returnedGrant, targetEpoch: RETURN_TARGET,
+      },
     );
-    await aTx.transaction((exec) => installLeaseGrant(exec, resolver, returnedGrant));
+    assert.equal(returned.n, N + 1);
+    assert.equal(returned.headDigest, returnReceipt.signedHeadDigestAtN);
   });
 
   await check('returned A originates N+2 while old B and replayed activation inputs fail closed', async () => {
@@ -279,13 +340,23 @@ async function main() {
       streamId: SID, rawMutation: { tumblerId: 'T9', counter: 2 }, fenceToken: 1n,
     })), /revoked|not writable|lease|fence/i);
     await assert.rejects(() => ctl.activateSource(
-      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, g,
-    ), /prior target lease must be terminally revoked|does not byte-bind/i);
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, resolver, [g],
+    ), /high-water must be revoked|does not byte-bind/i);
+    const extraChain = [g, rev] as (typeof g)[] & { extra?: string };
+    extraChain.extra = 'not-authority';
     await assert.rejects(() => ctl.activateSource(
-      SID, CMD, TARGET, bReceipt, resolver,
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, resolver, extraChain,
+    ), /dense exact array|data elements/i);
+    const accessorChain = [g, rev];
+    Object.defineProperty(accessorChain, '0', { enumerable: true, configurable: true, get: () => g });
+    await assert.rejects(() => ctl.activateSource(
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, resolver, accessorChain,
+    ), /dense exact array|data elements/i);
+    await assert.rejects(() => ctl.activateSource(
+      SID, CMD, TARGET, bReceipt, resolver, resolver,
     ), /epoch|activation|quarantine/i);
     const retry = await ctl.activateSource(
-      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, rev,
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, resolver, [g, rev],
     );
     assert.deepEqual(retry, returnedGrant);
     const activationCols = 'command_id,epoch,b_key_id,b_receipt_digest,activation_seq,' +
@@ -297,12 +368,27 @@ async function main() {
          WHERE stream_id=$1 AND activation_seq=1) WHERE h.stream_id=$1`, [SID],
     );
     await assert.rejects(() => ctl.activateSource(
-      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, rev,
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, resolver, [g, rev],
     ), /head is not the latest|replay|rollback/i);
     await cPool.query(
       `UPDATE tsk_ha_source_activation h SET (${activationCols}) =
        (SELECT ${activationCols} FROM tsk_ha_source_activation_history
          WHERE stream_id=$1 AND activation_seq=2) WHERE h.stream_id=$1`, [SID],
+    );
+    const savedGrantJson = String((await cPool.query(
+      'SELECT grant_json FROM tsk_ha_source_activation_history WHERE stream_id=$1 AND activation_seq=1',
+      [SID],
+    )).rows[0].grant_json);
+    await cPool.query(
+      "UPDATE tsk_ha_source_activation_history SET grant_json='{}' WHERE stream_id=$1 AND activation_seq=1",
+      [SID],
+    );
+    await assert.rejects(() => ctl.activateSource(
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, resolver, [g, rev],
+    ), /activation grant_json|lease grant/i);
+    await cPool.query(
+      'UPDATE tsk_ha_source_activation_history SET grant_json=$2 WHERE stream_id=$1 AND activation_seq=1',
+      [SID, savedGrantJson],
     );
     const activationRows = Number((await cPool.query(
       'SELECT count(*) AS n FROM tsk_ha_source_activation_history WHERE stream_id=$1', [SID],

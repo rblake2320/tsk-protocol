@@ -181,6 +181,13 @@ jobs:
           TSK_TEST_RECEIVER_PG_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5433/tsk_test
           TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
           TSK_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # Governed OFFLINE control-schema v1->v2 migration: exact v1 catalog+stamp
+      # attestation, signed legacy activation preservation, atomic conversion, and
+      # fail-closed rollback on corrupt legacy authority. Real control PG16; no skip.
+      - run: npm run test:ha-control-migration
+        env:
+          TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
+      - run: npm run test:ha-control-continuity -w packages/server
       # Enterprise credential authority: every TumblerMapStore mutation commits its
       # authoritative map change and a secret-free signed TSK record in one
       # SERIALIZABLE source-A transaction. Independent B verifies the head chain,

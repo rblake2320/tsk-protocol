@@ -82,6 +82,42 @@ function frozenSnapshot<T>(x: T): T {
   freeze(snap);
   return snap;
 }
+const LEASE_GRANT_KEYS = ['commandId', 'grantDigest', 'guardKeyId', 'guardSignature',
+  'holderNodeId', 'leaseEpoch', 'leaseExpiresAtMs', 'leaseGrantSeq', 'leaseId',
+  'leaseStatus', 'prevGrantDigest', 'streamId'] as const;
+const MAX_PRIOR_TARGET_LEASE_CHAIN = 10_000;
+function snapshotLeaseChain(value: unknown): LeaseGrant[] {
+  if (!Array.isArray(value) || Object.getOwnPropertySymbols(value).length !== 0 ||
+      value.length > MAX_PRIOR_TARGET_LEASE_CHAIN) {
+    throw new ContractValidationError(`priorTargetLeaseChain must be an array of at most ${MAX_PRIOR_TARGET_LEASE_CHAIN} grants`);
+  }
+  const arrayDescriptors = Object.getOwnPropertyDescriptors(value);
+  const expectedArrayKeys = ['length', ...Array.from({ length: value.length }, (_, i) => String(i))].sort();
+  const arrayKeys = Object.keys(arrayDescriptors).sort();
+  if (arrayKeys.length !== expectedArrayKeys.length || arrayKeys.some((key, index) => key !== expectedArrayKeys[index]) ||
+      Object.entries(arrayDescriptors).some(([key, descriptor]) => key !== 'length' && !('value' in descriptor))) {
+    throw new ContractValidationError('priorTargetLeaseChain must be a dense exact array with data elements only');
+  }
+  const result: LeaseGrant[] = [];
+  for (let i = 0; i < value.length; i++) {
+    const grant = arrayDescriptors[String(i)].value as unknown;
+    if (!grant || typeof grant !== 'object' || Array.isArray(grant) ||
+        Object.getPrototypeOf(grant) !== Object.prototype ||
+        Object.getOwnPropertySymbols(grant).length !== 0) {
+      throw new ContractValidationError('priorTargetLeaseChain grants must be exact plain data objects');
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(grant);
+    const keys = Object.keys(descriptors).sort();
+    const expected = [...LEASE_GRANT_KEYS].sort();
+    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index]) ||
+        Object.values(descriptors).some((descriptor) => !('value' in descriptor))) {
+      throw new ContractValidationError('priorTargetLeaseChain grant shape is invalid');
+    }
+    const row = Object.fromEntries(LEASE_GRANT_KEYS.map((key) => [key, descriptors[key].value])) as unknown as LeaseGrant;
+    result.push(Object.freeze(row));
+  }
+  return Object.freeze(result.slice()) as LeaseGrant[];
+}
 
 // ── guard signing (HMAC over length-prefixed, keyId-bound, canonical framing) ─
 
@@ -194,7 +230,83 @@ export function reconcileFencedRedis(r: FenceRecord | null, evidence: FenceEvide
 const CUTOVER_TERMINAL = new Set(['ACTIVE', 'ABORTED']);
 const CUTOVER_FROZEN = new Set(['PREPARING', 'SOURCE_FENCED', 'FENCED', 'IMPORTING', 'READY']); // lease grants frozen while a promotion is in-flight
 
+/** @internal Pure continuity rule shared with hermetic rejection vectors. */
+export function assertConsumedActivationEpochs(
+  currentActivationEpoch: number,
+  targetEpoch: number,
+  cutoverRows: ReadonlyArray<{ epoch: number; phase: string }>,
+  activatedEpochs: ReadonlyArray<number>,
+): void {
+  if (targetEpoch <= currentActivationEpoch) throw new FenceAuthorityQuarantineError('source activation epoch does not advance current authority — quarantine');
+  const activated = new Set(activatedEpochs);
+  const phases = new Map<number, string[]>();
+  for (const row of cutoverRows) {
+    const list = phases.get(row.epoch) ?? [];
+    list.push(row.phase); phases.set(row.epoch, list);
+  }
+  for (let epoch = currentActivationEpoch + 1; epoch < targetEpoch; epoch++) {
+    if (activated.has(epoch)) throw new FenceAuthorityQuarantineError(`skipped activation epoch ${epoch} already has source authority evidence — quarantine`);
+    const terminal = (phases.get(epoch) ?? []).filter((phase) => CUTOVER_TERMINAL.has(phase));
+    if (terminal.length !== 1 || terminal[0] !== 'ABORTED') {
+      throw new FenceAuthorityQuarantineError(`source activation skipped epoch ${epoch} without one verified terminal ABORTED cutover — quarantine`);
+    }
+  }
+}
+
 // ── control-DB schema (executable; hardened with range/grammar CHECKs, H9) ────
+
+const SOURCE_ACTIVATION_V2_SCHEMA = `
+CREATE TABLE IF NOT EXISTS tsk_ha_source_activation (
+  stream_id text PRIMARY KEY,
+  command_id text NOT NULL,
+  epoch bigint NOT NULL CHECK (epoch >= 1),
+  b_key_id text NOT NULL,
+  b_receipt_digest text NOT NULL CHECK (b_receipt_digest ~ '^[0-9a-f]{64}$'),
+  activation_seq bigint NOT NULL CHECK (activation_seq >= 1),
+  prior_target_grant_digest text CHECK (prior_target_grant_digest IS NULL OR prior_target_grant_digest ~ '^[0-9a-f]{64}$'),
+  prev_activation_digest text CHECK (prev_activation_digest IS NULL OR prev_activation_digest ~ '^[0-9a-f]{64}$'),
+  activation_digest text NOT NULL CHECK (activation_digest ~ '^[0-9a-f]{64}$'),
+  grant_digest text NOT NULL CHECK (grant_digest ~ '^[0-9a-f]{64}$'),
+  grant_json text NOT NULL,
+  guard_key_id text NOT NULL,
+  guard_signature text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS tsk_ha_source_activation_history (
+  stream_id text NOT NULL,
+  command_id text NOT NULL,
+  epoch bigint NOT NULL CHECK (epoch >= 1),
+  b_key_id text NOT NULL,
+  b_receipt_digest text NOT NULL CHECK (b_receipt_digest ~ '^[0-9a-f]{64}$'),
+  activation_seq bigint NOT NULL CHECK (activation_seq >= 1),
+  prior_target_grant_digest text CHECK (prior_target_grant_digest IS NULL OR prior_target_grant_digest ~ '^[0-9a-f]{64}$'),
+  prev_activation_digest text CHECK (prev_activation_digest IS NULL OR prev_activation_digest ~ '^[0-9a-f]{64}$'),
+  activation_digest text NOT NULL CHECK (activation_digest ~ '^[0-9a-f]{64}$'),
+  grant_digest text NOT NULL CHECK (grant_digest ~ '^[0-9a-f]{64}$'),
+  grant_json text NOT NULL,
+  guard_key_id text NOT NULL,
+  guard_signature text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (stream_id, activation_seq),
+  UNIQUE (stream_id, command_id),
+  UNIQUE (stream_id, activation_digest)
+)
+`.trim();
+
+/** Exact legacy v1 activation table used only by the governed offline v1->v2 migration. */
+export const HA_CONTROL_V1_SOURCE_ACTIVATION_SCHEMA = `
+CREATE TABLE IF NOT EXISTS tsk_ha_source_activation (
+  stream_id text PRIMARY KEY,
+  command_id text NOT NULL,
+  epoch bigint NOT NULL CHECK (epoch >= 1),
+  b_key_id text NOT NULL,
+  b_receipt_digest text NOT NULL CHECK (b_receipt_digest ~ '^[0-9a-f]{64}$'),
+  grant_digest text NOT NULL CHECK (grant_digest ~ '^[0-9a-f]{64}$'),
+  grant_json text NOT NULL,
+  guard_key_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+)
+`.trim();
 
 export const HA_CONTROL_PG_SCHEMA = `
 CREATE TABLE IF NOT EXISTS tsk_ha_schema (
@@ -312,41 +424,7 @@ CREATE TABLE IF NOT EXISTS tsk_ha_cutover_history (
   PRIMARY KEY (stream_id, seqno),
   UNIQUE (stream_id, state_digest)
 );
-CREATE TABLE IF NOT EXISTS tsk_ha_source_activation (
-  stream_id text PRIMARY KEY,
-  command_id text NOT NULL,
-  epoch bigint NOT NULL CHECK (epoch >= 1),
-  b_key_id text NOT NULL,
-  b_receipt_digest text NOT NULL CHECK (b_receipt_digest ~ '^[0-9a-f]{64}$'),
-  activation_seq bigint NOT NULL CHECK (activation_seq >= 1),
-  prior_target_grant_digest text CHECK (prior_target_grant_digest IS NULL OR prior_target_grant_digest ~ '^[0-9a-f]{64}$'),
-  prev_activation_digest text CHECK (prev_activation_digest IS NULL OR prev_activation_digest ~ '^[0-9a-f]{64}$'),
-  activation_digest text NOT NULL CHECK (activation_digest ~ '^[0-9a-f]{64}$'),
-  grant_digest text NOT NULL CHECK (grant_digest ~ '^[0-9a-f]{64}$'),
-  grant_json text NOT NULL,
-  guard_key_id text NOT NULL,
-  guard_signature text NOT NULL,
-  updated_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS tsk_ha_source_activation_history (
-  stream_id text NOT NULL,
-  command_id text NOT NULL,
-  epoch bigint NOT NULL CHECK (epoch >= 1),
-  b_key_id text NOT NULL,
-  b_receipt_digest text NOT NULL CHECK (b_receipt_digest ~ '^[0-9a-f]{64}$'),
-  activation_seq bigint NOT NULL CHECK (activation_seq >= 1),
-  prior_target_grant_digest text CHECK (prior_target_grant_digest IS NULL OR prior_target_grant_digest ~ '^[0-9a-f]{64}$'),
-  prev_activation_digest text CHECK (prev_activation_digest IS NULL OR prev_activation_digest ~ '^[0-9a-f]{64}$'),
-  activation_digest text NOT NULL CHECK (activation_digest ~ '^[0-9a-f]{64}$'),
-  grant_digest text NOT NULL CHECK (grant_digest ~ '^[0-9a-f]{64}$'),
-  grant_json text NOT NULL,
-  guard_key_id text NOT NULL,
-  guard_signature text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (stream_id, activation_seq),
-  UNIQUE (stream_id, command_id),
-  UNIQUE (stream_id, activation_digest)
-)
+${SOURCE_ACTIVATION_V2_SCHEMA}
 `.trim();
 
 export const HA_CONTROL_TABLES = [
@@ -356,6 +434,7 @@ export const HA_CONTROL_TABLES = [
   'tsk_ha_source_activation', 'tsk_ha_source_activation_history',
 ] as const;
 const MANIFEST_TABLES = [...HA_CONTROL_TABLES]; // attest the FULL set incl tsk_ha_schema (R4-H3)
+const HA_CONTROL_V1_TABLES = HA_CONTROL_TABLES.filter((t) => t !== 'tsk_ha_source_activation_history');
 // (R8-HIGH) governed tables locked ACCESS SHARE per critical tx to freeze the catalog against a
 // concurrent ALTER/DROP between attest and mutation. Names are compile-time constants (not input).
 const GOVERNED_LOCK_LIST = HA_CONTROL_TABLES.join(', ');
@@ -407,8 +486,7 @@ async function enterCriticalTx(exec: PgExecutor, schema: string): Promise<void> 
  * boundary — the runtime role MUST NOT hold DDL rights (no CREATE/ALTER/DROP) on this schema;
  * provisioning/migration run under a separate privileged role, offline from serving.
  */
-async function controlManifest(exec: PgExecutor): Promise<string> {
-  const tables = [...MANIFEST_TABLES];
+async function controlManifestFor(exec: PgExecutor, tables: readonly string[], version: number): Promise<string> {
   const cols = (await exec.query(
     `SELECT table_name, ordinal_position, column_name, data_type, is_nullable, COALESCE(column_default,'') AS column_default
      FROM information_schema.columns WHERE table_schema = pg_catalog.current_schema() AND table_name = ANY($1)
@@ -433,7 +511,7 @@ async function controlManifest(exec: PgExecutor): Promise<string> {
     `SELECT tablename AS t, policyname AS n, permissive, roles::text AS roles, cmd, COALESCE(qual,'') AS qual, COALESCE(with_check,'') AS wc
      FROM pg_catalog.pg_policies WHERE schemaname = pg_catalog.current_schema() AND tablename = ANY($1) ORDER BY tablename, policyname`, [tables])).rows;
   return [
-    `V${CONTROL_SCHEMA_VERSION}`,
+    `V${version}`,
     ...cols.map((r) => `C|${r.table_name}|${r.ordinal_position}|${r.column_name}|${r.data_type}|${r.is_nullable}|${r.column_default}`),
     ...cons.map((r) => `K|${r.t}|${r.contype}|${r.def}`),
     ...idx.map((r) => `I|${r.t}|${r.n}|${r.def}`),
@@ -443,6 +521,10 @@ async function controlManifest(exec: PgExecutor): Promise<string> {
   ].join('\n');
 }
 
+async function controlManifest(exec: PgExecutor): Promise<string> {
+  return controlManifestFor(exec, MANIFEST_TABLES, CONTROL_SCHEMA_VERSION);
+}
+
 /** COMPILED expected full-catalog manifest digest — pinned in source, computed from
  *  HA_CONTROL_PG_SCHEMA on PostgreSQL 16. Attestation compares the LIVE catalog to THIS; a
  *  dropped/added CHECK, column, index, trigger, or policy fails closed. There is deliberately NO
@@ -450,7 +532,8 @@ async function controlManifest(exec: PgExecutor): Promise<string> {
  *  defeat the pin). To RE-PIN after an intentional DDL change, run provisionControlSchema against
  *  the new schema in an OFFLINE, code-reviewed step and copy the digest reported in the attestation
  *  error ("live catalog digest <D>") into this constant. */
-export const HA_CONTROL_MANIFEST_DIGEST = '769640c27b3310d391f61d9afff36935be84c02ef885ef4a1537a58b6b81612a';
+export const HA_CONTROL_MANIFEST_DIGEST = 'f01ff613773b750256a6bf91a0c93d9e538a0a88de343775ac9d9bd526b59e1a';
+export const HA_CONTROL_V1_MANIFEST_DIGEST = 'a80069c514d7450a5a2f4482d99952f9b2920ee876d14f51ba5d516ff79eefab';
 
 /** Attest the live catalog hashes to the pinned expected manifest (fail-closed, NOT TOFU). */
 async function attestControlSchema(exec: PgExecutor): Promise<string> {
@@ -528,6 +611,123 @@ export async function provisionControlSchema(db: PgTransactor, schema: string): 
     affectedOne(await exec.query('INSERT INTO tsk_ha_schema (id, version, catalog_manifest) VALUES (1, $1, $2)', [CONTROL_SCHEMA_VERSION, manifestDigest]), 'fresh control schema provision');
   });
   return mintReady({ db, schema, version: CONTROL_SCHEMA_VERSION, manifestDigest });
+}
+
+/**
+ * Explicit OFFLINE v1 -> v2 migration. Serving must be stopped: this transaction takes
+ * ACCESS EXCLUSIVE locks over every v1 authority table, attests the exact compiled v1 catalog
+ * and authority stamp, verifies any legacy activation against both its signed lease grant and
+ * the signed ACTIVE cutover chain, then converts it into signed v2 head+history evidence.
+ * The v2 authority stamp is written only after the converted live catalog attests exactly.
+ */
+export interface ControlSchemaMigrationDb {
+  transaction<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T>;
+}
+
+export async function migrateControlSchemaV1ToV2(
+  db: ControlSchemaMigrationDb,
+  schema: string,
+  migrationSigner: GuardSigner,
+  controlResolver: GuardKeyResolver,
+  sourceLeaseResolver: SourceVerifyKeyResolver,
+): Promise<string> {
+  let manifestDigest = '';
+  await db.transaction(async (exec) => {
+    await assertSerializable(exec);
+    await pinSchema(exec, schema);
+    const resolved = (await exec.query(
+      `SELECT t.name, n.nspname
+       FROM pg_catalog.unnest($1::text[]) AS t(name)
+       LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(t.name)
+       LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace`, [[...HA_CONTROL_V1_TABLES]])).rows;
+    for (const row of resolved) {
+      if (row.nspname !== schema) throw new ContractValidationError(`v1 governed table ${String(row.name)} does not resolve to '${schema}' — quarantine`);
+    }
+    await exec.query(`LOCK TABLE ${HA_CONTROL_V1_TABLES.join(', ')} IN ACCESS EXCLUSIVE MODE`);
+
+    const stampRows = (await exec.query('SELECT version, catalog_manifest FROM tsk_ha_schema WHERE id=1 FOR UPDATE')).rows;
+    if (stampRows.length !== 1) throw new ContractValidationError('v1 control authority stamp must be exactly one row');
+    if (vInt(stampRows[0].version, 'v1 schema version', 1, MAX_EPOCH) !== 1 ||
+        String(stampRows[0].catalog_manifest) !== HA_CONTROL_V1_MANIFEST_DIGEST) {
+      throw new ContractValidationError('v1 control authority stamp does not match the compiled v1 authority');
+    }
+    const v1Live = sha256hex(Buffer.from(await controlManifestFor(exec, HA_CONTROL_V1_TABLES, 1), 'utf8'));
+    if (v1Live !== HA_CONTROL_V1_MANIFEST_DIGEST) {
+      throw new ContractValidationError(`v1 control schema attestation failed: live catalog digest ${v1Live} != pinned ${HA_CONTROL_V1_MANIFEST_DIGEST}`);
+    }
+
+    const legacyRows = (await exec.query(
+      'SELECT stream_id,command_id,epoch,b_key_id,b_receipt_digest,grant_digest,grant_json,guard_key_id,created_at FROM tsk_ha_source_activation ORDER BY stream_id')).rows;
+    const converted: Array<{ values: unknown[]; createdAt: unknown }> = [];
+    for (const row of legacyRows) {
+      const streamId = vId(row.stream_id, STREAM_ID_RE, 'legacy activation stream_id');
+      const commandId = vId(row.command_id, ID_RE, 'legacy activation command_id');
+      const epoch = vInt(row.epoch, 'legacy activation epoch', 1, MAX_EPOCH);
+      const holder = vId(row.b_key_id, KEY_ID_RE, 'legacy activation target key');
+      const receiptDigest = vDigest(row.b_receipt_digest, 'legacy activation receipt digest');
+      const grantDigest = vDigest(row.grant_digest, 'legacy activation grant digest');
+      let grant: LeaseGrant;
+      try { grant = frozenSnapshot(JSON.parse(String(row.grant_json)) as LeaseGrant); }
+      catch { throw new FenceAuthorityQuarantineError('legacy activation grant_json is malformed — quarantine'); }
+      verifyLeaseGrant(sourceLeaseResolver, grant);
+      if (grant.streamId !== streamId || grant.commandId !== commandId || grant.leaseEpoch !== epoch ||
+          grant.holderNodeId !== holder || grant.grantDigest !== grantDigest ||
+          grant.guardKeyId !== String(row.guard_key_id) || grant.leaseStatus !== 'active' ||
+          grant.leaseGrantSeq !== 1 || grant.prevGrantDigest !== null) {
+        throw new FenceAuthorityQuarantineError('legacy activation row does not exactly bind its signed genesis grant — quarantine');
+      }
+
+      const head = (await exec.query(
+        'SELECT epoch,command_id,seqno,phase,evidence,prev_state_digest,state_digest,guard_key_id,guard_signature FROM tsk_ha_cutover_head WHERE stream_id=$1', [streamId])).rows[0];
+      const history = (await exec.query(
+        'SELECT epoch,command_id,seqno,phase,evidence,prev_state_digest,state_digest,guard_key_id,guard_signature FROM tsk_ha_cutover_history WHERE stream_id=$1 ORDER BY seqno', [streamId])).rows;
+      if (!head) throw new FenceAuthorityQuarantineError('legacy activation has no signed cutover head — quarantine');
+      const link = (r: Record<string, unknown>): Linked => {
+        const e = vInt(r.epoch, 'cutover epoch', 0, MAX_EPOCH);
+        const cmd = vId(r.command_id, ID_RE, 'cutover command_id');
+        const seq = vInt(r.seqno, 'cutover seqno', 1, MAX_SEQ);
+        const phase = String(r.phase);
+        const evidence = r.evidence === null || r.evidence === undefined ? null : String(r.evidence);
+        const prev = vNullableDigest(r.prev_state_digest, 'cutover prev digest');
+        const digest = vDigest(r.state_digest, 'cutover state digest');
+        return { seq, prev, digest, keyId: String(r.guard_key_id), sig: String(r.guard_signature),
+          digMsg: cutMsg(streamId, e, cmd, seq, phase, evidence, prev, ''),
+          sigMsg: cutMsg(streamId, e, cmd, seq, phase, evidence, prev, digest) };
+      };
+      verifyChain(controlResolver, history.map(link), link(head));
+      if (String(head.phase) !== 'ACTIVE' || vInt(head.epoch, 'cutover epoch', 1, MAX_EPOCH) !== epoch || String(head.command_id) !== commandId) {
+        throw new FenceAuthorityQuarantineError('legacy activation is not backed by its exact terminal ACTIVE cutover — quarantine');
+      }
+      const activeEvidence = JSON.parse(String(head.evidence ?? '{}')) as { bReceiptDigest?: string; bKeyId?: string };
+      if (activeEvidence.bReceiptDigest !== receiptDigest || activeEvidence.bKeyId !== holder) {
+        throw new FenceAuthorityQuarantineError('legacy activation differs from signed ACTIVE evidence — quarantine');
+      }
+
+      const activationSeq = 1;
+      const priorTargetGrantDigest = null;
+      const prevActivationDigest = null;
+      const activationDigest = digestOf(activationMsg(streamId, commandId, epoch, holder,
+        receiptDigest, activationSeq, priorTargetGrantDigest, grantDigest, prevActivationDigest, ''));
+      const signature = migrationSigner.sign(activationMsg(streamId, commandId, epoch, holder,
+        receiptDigest, activationSeq, priorTargetGrantDigest, grantDigest, prevActivationDigest, activationDigest));
+      converted.push({ values: [streamId, commandId, epoch, holder, receiptDigest, activationSeq,
+        priorTargetGrantDigest, prevActivationDigest, activationDigest, grantDigest,
+        JSON.stringify(grant), migrationSigner.id, signature], createdAt: row.created_at });
+    }
+
+    await exec.query('DROP TABLE tsk_ha_source_activation');
+    for (const statement of SOURCE_ACTIVATION_V2_SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) await exec.query(statement);
+    for (const item of converted) {
+      await exec.query('INSERT INTO tsk_ha_source_activation_history (stream_id,command_id,epoch,b_key_id,b_receipt_digest,activation_seq,prior_target_grant_digest,prev_activation_digest,activation_digest,grant_digest,grant_json,guard_key_id,guard_signature,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)', [...item.values, item.createdAt]);
+      await exec.query('INSERT INTO tsk_ha_source_activation (stream_id,command_id,epoch,b_key_id,b_receipt_digest,activation_seq,prior_target_grant_digest,prev_activation_digest,activation_digest,grant_digest,grant_json,guard_key_id,guard_signature,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)', [...item.values, item.createdAt]);
+    }
+    manifestDigest = sha256hex(Buffer.from(await controlManifest(exec), 'utf8'));
+    if (manifestDigest !== HA_CONTROL_MANIFEST_DIGEST) throw new ContractValidationError(`migrated v2 control schema attestation failed: live catalog digest ${manifestDigest} != pinned ${HA_CONTROL_MANIFEST_DIGEST}`);
+    affectedOne(await exec.query(
+      'UPDATE tsk_ha_schema SET version=$2,catalog_manifest=$3,applied_at=now() WHERE id=1 AND version=$1 AND catalog_manifest=$4',
+      [1, CONTROL_SCHEMA_VERSION, manifestDigest, HA_CONTROL_V1_MANIFEST_DIGEST]), 'v1->v2 authority stamp');
+  });
+  return manifestDigest;
 }
 
 // ── public state shapes ──────────────────────────────────────────────────────
@@ -857,6 +1057,47 @@ export class HaControlFencing {
     return { streamId: s, epoch: vInt(head.epoch, 'epoch', 0, MAX_EPOCH), commandId: String(head.command_id), seqno: vInt(head.seqno, 'seqno', 1, MAX_SEQ), phase: head.phase as CutoverState['phase'], evidence: head.evidence === null || head.evidence === undefined ? null : String(head.evidence), stateDigest: vDigest(head.state_digest, 'state_digest') };
   }
 
+  /** Verify the signed append-only source-activation authority and return its current epoch.
+   * The control signature binds the activation tuple and grant digest; target-side lease
+   * verification remains the responsibility of activateSource/installation. */
+  private async readActivationEpoch(exec: PgExecutor, s: string): Promise<number> {
+    const cols = 'command_id,epoch,b_key_id,b_receipt_digest,activation_seq,prior_target_grant_digest,prev_activation_digest,activation_digest,grant_digest,guard_key_id,guard_signature';
+    const head = (await exec.query(`SELECT ${cols} FROM tsk_ha_source_activation WHERE stream_id=$1 FOR SHARE`, [s])).rows[0];
+    const history = (await exec.query(`SELECT ${cols} FROM tsk_ha_source_activation_history WHERE stream_id=$1 ORDER BY activation_seq`, [s])).rows;
+    if (!head) {
+      if (history.length !== 0) throw new FenceAuthorityQuarantineError('source activation history exists without a head — quarantine');
+      return 0;
+    }
+    const linked = (row: Record<string, unknown>): Linked => {
+      const seq = vInt(row.activation_seq, 'activation_seq', 1, MAX_SEQ);
+      const prev = vNullableDigest(row.prev_activation_digest, 'prev_activation_digest');
+      const digest = vDigest(row.activation_digest, 'activation_digest');
+      const command = vId(row.command_id, ID_RE, 'activation command_id');
+      const epoch = vInt(row.epoch, 'activation epoch', 1, MAX_EPOCH);
+      const targetKey = vId(row.b_key_id, KEY_ID_RE, 'activation target key');
+      const receiptDigest = vDigest(row.b_receipt_digest, 'activation receipt digest');
+      const priorDigest = vNullableDigest(row.prior_target_grant_digest, 'prior_target_grant_digest');
+      const grantDigest = vDigest(row.grant_digest, 'activation grant_digest');
+      return { seq, prev, digest, keyId: String(row.guard_key_id), sig: String(row.guard_signature),
+        digMsg: activationMsg(s, command, epoch, targetKey, receiptDigest, seq, priorDigest, grantDigest, prev, ''),
+        sigMsg: activationMsg(s, command, epoch, targetKey, receiptDigest, seq, priorDigest, grantDigest, prev, digest) };
+    };
+    verifyChain(this.resolver, history.map(linked), linked(head));
+    return vInt(head.epoch, 'activation epoch', 1, MAX_EPOCH);
+  }
+
+  private async assertActivationGap(exec: PgExecutor, s: string, currentEpoch: number, targetEpoch: number): Promise<void> {
+    const skipped = targetEpoch > currentEpoch + 1 ? (await exec.query(
+      'SELECT epoch,phase FROM tsk_ha_cutover_history WHERE stream_id=$1 AND epoch>$2 AND epoch<$3 ORDER BY seqno',
+      [s, currentEpoch, targetEpoch])).rows : [];
+    const activated = targetEpoch > currentEpoch + 1 ? (await exec.query(
+      'SELECT epoch FROM tsk_ha_source_activation_history WHERE stream_id=$1 AND epoch>$2 AND epoch<$3 ORDER BY epoch',
+      [s, currentEpoch, targetEpoch])).rows : [];
+    assertConsumedActivationEpochs(currentEpoch, targetEpoch,
+      skipped.map((row) => ({ epoch: vInt(row.epoch, 'skipped cutover epoch', 1, MAX_EPOCH), phase: String(row.phase) })),
+      activated.map((row) => vInt(row.epoch, 'skipped activation epoch', 1, MAX_EPOCH)));
+  }
+
   private async cutTransition(exec: PgExecutor, s: string, epoch: number, commandId: string, seqno: number, phase: CutoverState['phase'], evidence: string | null, prev: string | null): Promise<CutoverState> {
     const digest = digestOf(cutMsg(s, epoch, commandId, seqno, phase, evidence, prev, ''));
     const sig = this.signer.sign(cutMsg(s, epoch, commandId, seqno, phase, evidence, prev, digest));
@@ -889,6 +1130,34 @@ export class HaControlFencing {
       }
       const seqno = (cur?.seqno ?? 0) + 1;
       return this.cutTransition(exec, s, target, cmd, seqno, 'PREPARING', null, cur ? cur.stateDigest : null);
+    });
+  }
+
+  /**
+   * Consume a post-fence promotion epoch that cannot complete. Only FENCED/IMPORTING/READY may
+   * become ABORTED: at those phases the signed witness has already advanced, so reusing the epoch
+   * would be unsafe. Pre-fence intents remain resumable and cannot consume an epoch through this API.
+   */
+  async abortFencedPromotion(streamId: string, commandId: string, targetEpoch: number, reasonCode: string): Promise<CutoverState> {
+    const s = vId(streamId, STREAM_ID_RE, 'streamId');
+    const cmd = vId(commandId, ID_RE, 'commandId');
+    const target = vInt(targetEpoch, 'targetEpoch', 1, MAX_EPOCH);
+    const reason = vId(reasonCode, ID_RE, 'reasonCode');
+    return this.criticalTx(s, async (exec) => {
+      const cur = await this.readCutover(exec, s);
+      const evidence = JSON.stringify({ k: 'abort/v1', reason });
+      if (cur?.phase === 'ABORTED' && cur.commandId === cmd && cur.epoch === target) {
+        if (cur.evidence !== evidence) throw new FenceAuthorityQuarantineError('ABORTED retry reason differs from signed evidence — quarantine');
+        return cur;
+      }
+      if (!cur || cur.commandId !== cmd || cur.epoch !== target || !new Set(['FENCED', 'IMPORTING', 'READY']).has(cur.phase)) {
+        throw new FenceAuthorityQuarantineError('only a matching post-fence cutover may consume an ABORTED epoch — quarantine');
+      }
+      const witness = await this.readWitness(exec, s);
+      if (!witness || witness.state !== 'provisioned' || witness.epoch !== target) {
+        throw new FenceAuthorityQuarantineError('cannot consume ABORTED epoch without the exact signed witness advance — quarantine');
+      }
+      return this.cutTransition(exec, s, target, cmd, cur.seqno + 1, 'ABORTED', evidence, cur.stateDigest);
     });
   }
 
@@ -989,14 +1258,15 @@ export class HaControlFencing {
     verifySourceFrozenReceipt(resolver, fr); // verifies A's ed25519 signature over the frozen receipt — throws on tamper
     if (fr.commandId !== cmd) throw new FenceAuthorityQuarantineError('frozen receipt commandId != cutover command — quarantine');
     if (fr.streamId !== s) throw new FenceAuthorityQuarantineError('frozen receipt streamId != cutover stream — quarantine');
-    // the freeze at source epoch E promotes to control target epoch E+1 — reject a cross-epoch splice.
-    if (fr.epoch !== target - 1) throw new FenceAuthorityQuarantineError(`frozen receipt epoch ${fr.epoch} != targetEpoch-1 (${target - 1}) — cross-epoch freeze; quarantine`);
     // canonical bound-field set — written as evidence AND re-asserted on an idempotent retry (H3).
     const bound = { k: 'source_fenced/v1', frozenReceiptDigest: fr.receiptDigest, sourceEpoch: fr.epoch, n: fr.n,
       headAtN: fr.signedHeadDigestAtN, stateAtN: fr.sourceStateDigestAtN, sourceNodeId: fr.sourceNodeId,
       revokeCommandId: fr.revokeCommandId, leaseId: fr.leaseId, leaseGrantDigest: fr.leaseGrantDigest, sourceKeyId: fr.sourceKeyId };
     const ev = JSON.stringify(bound);
     return this.criticalTx(s, async (exec) => {
+      const sourceEpoch = await this.readActivationEpoch(exec, s);
+      await this.assertActivationGap(exec, s, sourceEpoch, target);
+      if (fr.epoch !== sourceEpoch) throw new FenceAuthorityQuarantineError(`frozen receipt epoch ${fr.epoch} != current signed source activation epoch ${sourceEpoch} — cross-epoch freeze; quarantine`);
       const cur = await this.readCutover(exec, s);
       if (cur && cur.phase === 'SOURCE_FENCED' && cur.commandId === cmd && cur.epoch === target) {
         // (H3) idempotent ONLY if the incoming receipt equals the stored signed evidence, byte-for-byte.
@@ -1035,7 +1305,8 @@ export class HaControlFencing {
    * the source/guard public-key signatures, which were checked at export/finalize), then binds it to THIS cutover:
    *   • commandId + streamId match the active cutover command;
    *   • frozenReceiptDigest / n / head@N / state@N match the SOURCE_FENCED-bound freeze byte-for-byte;
-   *   • the freeze epoch is targetEpoch-1 and B's receipt epoch equals it (no cross-epoch splice);
+   *   • the freeze/receipt epoch equals the last signed source activation epoch; any intervening
+   *     control epochs are individually proven terminal ABORTED (no cross-epoch splice);
    *   • B's system_identifier is DISTINCT from BOTH the signed source system_identifier (B != source) AND
    *     control's OWN durable PG system_identifier (B != control — the capability §4 was deferred to hold).
    * The READY head (control-signed) records B's finalize digest + both distinct system_identifiers, so a
@@ -1066,8 +1337,11 @@ export class HaControlFencing {
       // B's finalize MUST bind the EXACT frozen N control bound at SOURCE_FENCED (no cross-freeze splice).
       if (br.frozenReceiptDigest !== sf.frozenReceiptDigest) throw new FenceAuthorityQuarantineError('BFinalizedReceipt frozenReceiptDigest != the bound SOURCE_FENCED freeze — quarantine');
       if (br.n !== sf.n || br.signedHeadDigestAtN !== sf.headAtN || br.sourceStateDigestAtN !== sf.stateAtN) throw new FenceAuthorityQuarantineError('BFinalizedReceipt N/head@N/state@N != the bound freeze — quarantine');
-      // epoch binding: the bound freeze is at source epoch target-1, and B's receipt must be at that SAME epoch.
-      if (sf.sourceEpoch !== target - 1) throw new FenceAuthorityQuarantineError(`bound SOURCE_FENCED sourceEpoch ${sf.sourceEpoch} != targetEpoch-1 (${target - 1}) — quarantine`);
+      // Epoch binding: the freeze is at the last signed source activation epoch. One or more
+      // intervening control epochs are permitted only when each is a signed terminal ABORTED cutover.
+      const sourceEpoch = await this.readActivationEpoch(exec, s);
+      await this.assertActivationGap(exec, s, sourceEpoch, target);
+      if (sf.sourceEpoch !== sourceEpoch) throw new FenceAuthorityQuarantineError(`bound SOURCE_FENCED sourceEpoch ${sf.sourceEpoch} != current signed source activation epoch ${sourceEpoch} — quarantine`);
       if (br.epoch !== sf.sourceEpoch) throw new FenceAuthorityQuarantineError(`BFinalizedReceipt epoch ${br.epoch} != the bound freeze sourceEpoch ${sf.sourceEpoch} — cross-epoch splice; quarantine`);
       // Distinctness: B != source (signed in the receipt) AND B != control (control's OWN in-tx sysid).
       const controlSystemId = await this.controlSystemId(exec);
@@ -1119,33 +1393,55 @@ export class HaControlFencing {
    * SOURCE capability: a GUARD-signed (ed25519) lease grant that lets it become writable AT THE
    * PROMOTED EPOCH. This binds the grant to the ratified promotion — it requires the ACTIVE head for this
    * exact command/epoch, re-verifies the target's BFinalizedReceipt, and asserts the ACTIVE evidence pins
-   * that same target. A never-used target receives a genesis lease. A returning target must supply its exact
-   * signed, terminal lease high-water; the returned grant appends to that chain. Activation itself advances
+   * that same target. A never-used target receives a genesis lease. A returning target must supply its full
+   * signed, contiguous lease chain through the terminal high-water; when it has a prior control activation,
+   * that activation grant must be present in the chain. The returned grant appends to that chain. Activation advances
    * a signed append-only control history, so an older activation head cannot be replayed. Control never sees
    * the target's private material.
    */
   async activateSource(streamId: string, commandId: string, targetEpoch: number,
     bReceipt: BFinalizedReceipt, bResolver: SourceVerifyKeyResolver,
-    priorTargetLease: LeaseGrant | null = null): Promise<LeaseGrant> {
+    leaseResolver: SourceVerifyKeyResolver,
+    priorTargetLeaseChain: LeaseGrant[] = []): Promise<LeaseGrant> {
     const s = vId(streamId, STREAM_ID_RE, 'streamId');
     const cmd = vId(commandId, ID_RE, 'commandId');
     const target = vInt(targetEpoch, 'targetEpoch', 1, MAX_EPOCH);
     const guard = this.sourceGuard;
     if (!guard) throw new ContractValidationError('activateSource requires a configured policy.sourceGuard signing authority');
     const br = frozenSnapshot(bReceipt);
-    const prior = priorTargetLease === null ? null : frozenSnapshot(priorTargetLease);
+    const priorChain = snapshotLeaseChain(priorTargetLeaseChain);
     verifyBFinalizedReceipt(bResolver, br);
-    if (prior !== null) {
-      verifyLeaseGrant(bResolver, prior);
-      if (prior.streamId !== s) throw new FenceAuthorityQuarantineError('prior target lease streamId != cutover stream — quarantine');
-      if (prior.leaseStatus !== 'revoked') throw new FenceAuthorityQuarantineError('prior target lease must be terminally revoked — quarantine');
-      if (prior.leaseEpoch >= target) throw new FenceAuthorityQuarantineError('prior target lease epoch must precede the promoted epoch — quarantine');
+    if (!Array.isArray(priorChain)) throw new ContractValidationError('priorTargetLeaseChain must be an array');
+    let prior: LeaseGrant | null = null;
+    let priorDigest: string | null = null;
+    let chainPrev: string | null = null;
+    const epochIdentities = new Map<number, { holderNodeId: string; leaseId: string; revoked: boolean }>();
+    for (let i = 0; i < priorChain.length; i++) {
+      const grant = priorChain[i];
+      verifyLeaseGrant(leaseResolver, grant);
+      if (grant.streamId !== s) throw new FenceAuthorityQuarantineError('prior target lease chain streamId != cutover stream — quarantine');
+      if (grant.leaseGrantSeq !== i + 1 || (grant.prevGrantDigest ?? null) !== chainPrev) {
+        throw new FenceAuthorityQuarantineError('prior target lease chain is not contiguous from genesis — quarantine');
+      }
+      if (grant.leaseEpoch >= target) throw new FenceAuthorityQuarantineError('prior target lease epoch must precede the promoted epoch — quarantine');
+      const identity = epochIdentities.get(grant.leaseEpoch);
+      if (identity && (identity.holderNodeId !== grant.holderNodeId || identity.leaseId !== grant.leaseId)) {
+        throw new FenceAuthorityQuarantineError('prior target lease chain changes holder/leaseId within an epoch — quarantine');
+      }
+      if (identity?.revoked) throw new FenceAuthorityQuarantineError('prior target lease chain continues after a terminal revoke — quarantine');
+      epochIdentities.set(grant.leaseEpoch, { holderNodeId: grant.holderNodeId,
+        leaseId: grant.leaseId, revoked: grant.leaseStatus === 'revoked' });
+      chainPrev = grant.grantDigest;
+      prior = grant;
     }
     if (br.commandId !== cmd) throw new FenceAuthorityQuarantineError('BFinalizedReceipt commandId != cutover command — quarantine');
     if (br.streamId !== s) throw new FenceAuthorityQuarantineError('BFinalizedReceipt streamId != cutover stream — quarantine');
-    if (br.epoch !== target - 1) throw new FenceAuthorityQuarantineError(`BFinalizedReceipt epoch ${br.epoch} != targetEpoch-1 (${target - 1}) — quarantine`);
     // the holder identity is DERIVED from the ratified B (its signing key id), never accepted from the caller.
     const holder = vId(br.bKeyId, ID_RE, 'ratified B key id (holder)');
+    if (prior !== null && (prior.leaseStatus !== 'revoked' || prior.holderNodeId !== holder)) {
+      throw new FenceAuthorityQuarantineError('prior target lease high-water must be revoked and held by the ratified target — quarantine');
+    }
+    priorDigest = prior?.grantDigest ?? null;
     const leaseId = vId(`bsrc-${cmd}`, ID_RE, 'derived leaseId');
     return this.criticalTx(s, async (exec) => {
       const cur = await this.readCutover(exec, s);
@@ -1167,6 +1463,16 @@ export class HaControlFencing {
         const command = vId(row.command_id, ID_RE, 'activation command_id');
         const targetKey = vId(row.b_key_id, KEY_ID_RE, 'activation target key');
         const receiptDigest = vDigest(row.b_receipt_digest, 'activation receipt digest');
+        let storedGrant: LeaseGrant;
+        try { storedGrant = JSON.parse(String(row.grant_json)) as LeaseGrant; }
+        catch { throw new FenceAuthorityQuarantineError('activation grant_json is malformed — quarantine'); }
+        try { verifyLeaseGrant(leaseResolver, storedGrant); }
+        catch (error) { throw new FenceAuthorityQuarantineError(`activation grant_json is not a valid signed lease grant — quarantine: ${error instanceof Error ? error.message : 'unknown verification error'}`); }
+        if (storedGrant.grantDigest !== grantDigest || storedGrant.streamId !== s ||
+            storedGrant.commandId !== command || storedGrant.leaseEpoch !== epoch ||
+            storedGrant.holderNodeId !== targetKey) {
+          throw new FenceAuthorityQuarantineError('activation grant_json does not bind its signed activation row — quarantine');
+        }
         const digMsg = activationMsg(s, command, epoch, targetKey, receiptDigest,
           seq, priorDigest, grantDigest, prev, '');
         return { seq, prev, digest, keyId: String(row.guard_key_id),
@@ -1177,7 +1483,6 @@ export class HaControlFencing {
       if (headRow) verifyChain(this.resolver, historyRows.map(linked), linked(headRow));
       else if (historyRows.length !== 0) throw new FenceAuthorityQuarantineError('activation history exists without a head — quarantine');
 
-      const priorDigest = prior?.grantDigest ?? null;
       if (headRow && String(headRow.command_id) === cmd) {
         if (vInt(headRow.epoch, 'epoch', 1, MAX_EPOCH) !== target ||
             String(headRow.b_key_id) !== holder ||
@@ -1186,13 +1491,27 @@ export class HaControlFencing {
           throw new FenceAuthorityQuarantineError('source activation retry does not byte-bind the current activation — quarantine');
         }
         const existingGrant = JSON.parse(String(headRow.grant_json)) as LeaseGrant;
-        verifyLeaseGrant(bResolver, existingGrant);
+        verifyLeaseGrant(leaseResolver, existingGrant);
         if (existingGrant.grantDigest !== String(headRow.grant_digest)) throw new FenceAuthorityQuarantineError('stored source activation grant digest mismatch — quarantine');
         return existingGrant;
       }
+      const priorTargetActivationRows = historyRows.filter((row) => String(row.b_key_id) === holder);
+      if (priorTargetActivationRows.length > 0) {
+        if (prior === null) throw new FenceAuthorityQuarantineError('returning target omitted its lease chain — quarantine');
+        const lastTargetActivation = priorTargetActivationRows[priorTargetActivationRows.length - 1];
+        const rootedGrant = JSON.parse(String(lastTargetActivation.grant_json)) as LeaseGrant;
+        verifyLeaseGrant(leaseResolver, rootedGrant);
+        const atExpectedSequence = priorChain[rootedGrant.leaseGrantSeq - 1];
+        if (!atExpectedSequence || atExpectedSequence.grantDigest !== rootedGrant.grantDigest) {
+          throw new FenceAuthorityQuarantineError('prior target lease chain is not rooted at its last control activation at the expected sequence — quarantine');
+        }
+      } else if (prior !== null && (priorChain[0].leaseGrantSeq !== 1 || priorChain[0].prevGrantDigest !== null)) {
+        throw new FenceAuthorityQuarantineError('first return target lease chain is not rooted at genesis — quarantine');
+      }
       const currentActivationSeq = headRow ? vInt(headRow.activation_seq, 'activation_seq', 1, MAX_SEQ) : 0;
       const currentActivationEpoch = headRow ? vInt(headRow.epoch, 'activation epoch', 1, MAX_EPOCH) : 0;
-      if (target !== currentActivationEpoch + 1) throw new FenceAuthorityQuarantineError(`source activation epoch ${target} must follow current ${currentActivationEpoch} exactly — quarantine`);
+      await this.assertActivationGap(exec, s, currentActivationEpoch, target);
+      if (br.epoch !== currentActivationEpoch) throw new FenceAuthorityQuarantineError(`BFinalizedReceipt epoch ${br.epoch} != current signed source activation epoch ${currentActivationEpoch} — quarantine`);
 
       // A never-used target receives a genesis grant. A returning target supplies its exact signed,
       // terminal lease high-water, so the new grant appends to that target's immutable chain.

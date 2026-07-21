@@ -27,6 +27,7 @@
     "test:control-cutover": "npm run build -w packages/server && npx tsx tsk-control-cutover-drill.mts",
     "test:sigkill": "npm run build -w packages/server && npx tsx tsk-cutover-sigkill-drill.mts",
     "test:b-activation": "npm run build -w packages/server && npx tsx tsk-b-activation-drill.mts",
+    "test:ha-control-migration": "npm run build -w packages/server && npx tsx tsk-ha-control-migration-drill.mts",
     "test:sentinel": "npm run build -w packages/server && bash ci/redis-sentinel/run.sh tsk-ha-sentinel-drill.mts",
     "test:partition": "npm run build -w packages/server && bash ci/redis-sentinel/run.sh tsk-ha-partition-drill.mts",
     "test:two-node": "npm run build -w packages/server && npx tsx tsk-two-node-drill.mts",

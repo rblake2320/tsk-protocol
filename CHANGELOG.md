@@ -40,6 +40,11 @@
   signed, terminal lease high-water and receives the next guard-signed lease
   transition instead of an un-installable second genesis grant. Control schema
   version 2 is intentionally required for this history-bearing layout.
+- Added an owned, crash-atomic receiver-to-source activation authority that
+  rebuilds only persisted finalized staging, re-verifies both export signatures
+  and the complete ledger, then installs rows, fence, checkpoint, and lease in
+  one serializable target transaction. Manual multi-transaction import is not
+  an activation path.
 - Closed numeric HOTP rollover paths across core derivation, lookahead, atomic
   stores, client persistence, and replica input. Wire v1 now commits MAX only as
   an exhausted sentinel and never writes or derives MAX+1.

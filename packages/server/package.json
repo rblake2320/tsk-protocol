@@ -24,6 +24,7 @@
     "test:hotp-outbox": "vitest run tests/tsk-hotp-outbox-pg.test.ts",
     "test:pg-transactor": "vitest run tests/tsk-pg-transactor.test.ts",
     "test:http-outbox": "vitest run tests/http-outbox-transport.test.ts",
+    "test:ha-control-continuity": "npx vitest run tests/ha-control-activation-continuity.test.ts",
     "typecheck:contract": "tsc --noEmit -p tsconfig.contract-typecheck.json"
   },
   "dependencies": {
