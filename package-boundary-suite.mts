@@ -87,6 +87,13 @@ for (const workspace of workspaces) {
     for (const sym of ['NodePostgresTransactor', 'AmbiguousCommitError', 'PostCommitReleaseError', 'ConnectionDisposalError']) {
       assert(typeof (exports as Record<string, unknown>)[sym] === 'function', `@tsk/server must export ${sym}`);
     }
+    for (const sym of ['PgHaTumblerMapStore', 'PgTskCredentialReceiverCheckpoint',
+      'assertCredentialAuthorityReady', 'provisionCredentialRuntimeMutationBoundary',
+      'assertCredentialRuntimeMutationBoundary', 'HmacCredentialMutationTicketSigner']) {
+      assert(typeof (exports as Record<string, unknown>)[sym] === 'function', `@tsk/server must export ${sym}`);
+    }
+    assert(typeof (exports as Record<string, unknown>).TSK_CREDENTIAL_AUTHORITY_SCHEMA === 'string',
+      '@tsk/server must export the credential-authority provisioning DDL');
   }
   passed++;
   console.log(`  PASS ${manifest.name} entry points exist and import (no mint/unsafe export)`);

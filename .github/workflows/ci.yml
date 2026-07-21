@@ -181,6 +181,14 @@ jobs:
           TSK_TEST_RECEIVER_PG_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5433/tsk_test
           TSK_TEST_CONTROL_PG_URL: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5434/tsk_test
           TSK_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # Enterprise credential authority: every TumblerMapStore mutation commits its
+      # authoritative map change and a secret-free signed TSK record in one
+      # SERIALIZABLE source-A transaction. Independent B verifies the head chain,
+      # revision continuity, fencing, gaps, replays and tampering before staging.
+      - run: npm run test:credential-authority
+        env:
+          TSK_TEST_POSTGRES_URL_A: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5432/tsk_test
+          TSK_TEST_POSTGRES_URL_B: postgresql://tsk_test:tsk-test-only-password@127.0.0.1:5433/tsk_test
       # (PR2c acceptance) REAL Redis Sentinel/quorum: 1 master + 2 REPLICAS + 3 sentinels (quorum 2),
       # AOF, min-replicas-to-write. A real master CRASH → automatic promotion; claim() ENFORCES a WAIT
       # replica-quorum ACK so the fence SURVIVES (RPO=0), stays monotonic, RTO measured. run.sh brings up

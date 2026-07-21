@@ -8,6 +8,7 @@ export * from './replicating-tumbler-store.js';
 export * from './replica-receiver.js';
 export * from './promotion.js';
 export * from './redis-fencing-store.js';
+export * from './ha-tumbler-map-store.js';
 export * from './ha-outbox-contract.js';
 // Explicit named exports for the durable HOTP-outbox — deliberately OMITS
 // __internalUnsafeMintReadyToken so the public package API cannot mint an
