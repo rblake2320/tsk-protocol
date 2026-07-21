@@ -719,7 +719,7 @@ async function sourceFenceManifest(exec: PgExecutor, tables: readonly string[], 
 export const SOURCE_LEASE_MANIFEST_DIGEST = '548ad3d75a8d9dc612afe2f6e3734d5660fb79ce768a011d5a2de3cfca4c04f3';
 export const SOURCE_WITNESS_MANIFEST_DIGEST = 'ec71067986cb82d06fc8fa3e4e9f934b4a961b0759a92199789de33c19ce0a82';
 
-async function attestSourceLease(exec: PgExecutor): Promise<void> {
+export async function attestSourceLease(exec: PgExecutor): Promise<void> {
   const digest = sha256hex(Buffer.from(await sourceFenceManifest(exec, TSK_SOURCE_LEASE_TABLES, 'Vsource_lease/1'), 'utf8'));
   if (digest !== SOURCE_LEASE_MANIFEST_DIGEST) throw new ContractValidationError(`source lease attestation failed: live catalog digest ${digest} != pinned ${SOURCE_LEASE_MANIFEST_DIGEST}`);
 }

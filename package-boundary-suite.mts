@@ -87,6 +87,8 @@ for (const workspace of workspaces) {
     for (const sym of ['NodePostgresTransactor', 'AmbiguousCommitError', 'PostCommitReleaseError', 'ConnectionDisposalError']) {
       assert(typeof (exports as Record<string, unknown>)[sym] === 'function', `@tsk/server must export ${sym}`);
     }
+    assert(typeof (exports as Record<string, unknown>).activateFinalizedReceiverAsSource === 'function',
+      '@tsk/server must export the owned atomic receiver-to-source activation authority');
     for (const sym of ['PgHaTumblerMapStore', 'PgTskCredentialReceiverCheckpoint',
       'assertCredentialAuthorityReady', 'provisionCredentialRuntimeMutationBoundary',
       'assertCredentialRuntimeMutationBoundary', 'HmacCredentialMutationTicketSigner']) {

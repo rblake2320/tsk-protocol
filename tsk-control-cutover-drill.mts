@@ -236,14 +236,14 @@ async function main() {
   });
 
   // ── negative: a freeze at the WRONG source epoch cannot bind (cross-epoch splice) ─
-  await check('bindSourceFenced REJECTS a freeze whose epoch != targetEpoch-1 (foreign-epoch freeze)', async () => {
+  await check('bindSourceFenced REJECTS a freeze outside the current signed source activation epoch', async () => {
     const SIDE = 'tsk:pair:epoch/v1';
     const frE1 = await genesisFreezeAtEpoch(SIDE, 'promote-epoch', 1); // frozen at source epoch 1
     await ctl.provision(SIDE, 'g-epoch');
     const past = (await ctrlNowMs()) - 5_000;
     await ctl.writeLease({ streamId: SIDE, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'active', grantedMaxExpiryMs: past, grantCommandId: 'a-epoch' });
     await ctl.beginPromotionIntent(SIDE, 'promote-epoch', 1); // target 1 → target-1 = 0, but the freeze is epoch 1
-    await assert.rejects(() => ctl.bindSourceFenced(SIDE, 'promote-epoch', 1, frE1, resolver), /epoch 1 != targetEpoch-1|cross-epoch/);
+    await assert.rejects(() => ctl.bindSourceFenced(SIDE, 'promote-epoch', 1, frE1, resolver), /current signed source activation epoch|cross-epoch/);
   });
 
   // ── negative: the ORDERING gate is enforced AT advanceEpoch (single chokepoint) ─

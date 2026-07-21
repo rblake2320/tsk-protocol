@@ -30,6 +30,7 @@ import {
   assertHeaderConformant,
   assertStreamHeadBinds,
   canonicalOpDigest,
+  canonicalize,
   isTerminalTransportError,
   fenceTokenToDecimal,
   streamHeadDigest,
@@ -37,6 +38,7 @@ import {
   type EpochTransitionAuthorizer,
   type FenceToken,
   type HotpMutationSanitizer,
+  type MutationSanitizer,
   type OutboxRecord,
   type OutboxRecordHeader,
   type PublisherBackpressure,
@@ -48,8 +50,17 @@ import {
   type TskHotpMutation,
   type TskReceiverCheckpoint,
 } from './ha-outbox-contract.js';
-import { assertSourceLeaseWritable, requireSourceFenceReady } from './tsk-source-fence.js';
-import type { SourceVerifyKeyResolver, SourceFenceReadyToken } from './tsk-source-fence.js';
+import {
+  assertSourceLeaseWritable, requireSourceFenceReady, requireReceiverReady,
+  attestReceiver, attestSourceLease, verifyGuardCountersignedExport,
+  assertExportBundleBinds, verifyBFinalizedReceipt, verifyLeaseGrant,
+  installLeaseGrant, TSK_RECEIVER_TABLES, TSK_SOURCE_LEASE_TABLES,
+} from './tsk-source-fence.js';
+import type {
+  SourceVerifyKeyResolver, SourceFenceReadyToken, SourceReceiverReadyToken,
+  SourceExportBundle, GuardCountersignedExport, SourceFrozenReceipt,
+  BFinalizedReceipt, LeaseGrant,
+} from './tsk-source-fence.js';
 
 /** Contract HOTP counter bound (mirrors the TSK segment counter ceiling). */
 export const TSK_HOTP_MAX_COUNTER = 2_147_483_647;
@@ -738,6 +749,254 @@ export class UnfencedSingleNodeTskDurableOutbox extends AbstractTskDurableOutbox
   constructor(db: PgTransactor, ready: SchemaReadyToken, opts: PgTskOutboxOptions) {
     super(db, ready, opts, null);
   }
+}
+
+export interface ImportedSourceActivationOptions {
+  sanitizer: Pick<MutationSanitizer<unknown, TskHotpMutation>, 'sanitize'>;
+  sourceResolver: SourceVerifyKeyResolver;
+  guardResolver: SourceVerifyKeyResolver;
+  headResolver: SourceVerifyKeyResolver;
+  frozenResolver: SourceVerifyKeyResolver;
+  bReceiptResolver: SourceVerifyKeyResolver;
+  leaseResolver: SourceVerifyKeyResolver;
+  frozenReceipt: SourceFrozenReceipt;
+  finalizedReceipt: BFinalizedReceipt;
+  activationLease: LeaseGrant;
+  targetEpoch: number;
+  maxSnapshotBytes?: number;
+}
+
+function validateSnapshotBytes(value: number | undefined): number {
+  const n = value ?? 32 * 1024 * 1024;
+  if (!Number.isSafeInteger(n) || n < 1 || n > 64 * 1024 * 1024) {
+    throw new ContractValidationError('maxSnapshotBytes must be a safe integer in [1, 67108864]');
+  }
+  return n;
+}
+
+function strictPlainSnapshot<T>(input: T, label: string, seen = new Set<object>()): T {
+  if (input === null || typeof input === 'string' || typeof input === 'boolean') return input;
+  if (typeof input === 'number') {
+    if (!Number.isSafeInteger(input)) throw new ContractValidationError(`${label} contains a non-safe integer`);
+    return input;
+  }
+  if (typeof input !== 'object') throw new ContractValidationError(`${label} contains unsupported data`);
+  const object = input as unknown as object;
+  if (seen.has(object)) throw new ContractValidationError(`${label} contains a cycle`);
+  seen.add(object);
+  if (Object.getOwnPropertySymbols(object).length !== 0) throw new ContractValidationError(`${label} contains symbol keys`);
+  const proto = Object.getPrototypeOf(object);
+  if (proto !== Object.prototype && proto !== Array.prototype) throw new ContractValidationError(`${label} must contain only plain data`);
+  const out: unknown[] | Record<string, unknown> = Array.isArray(object) ? [] : {};
+  const names = Object.getOwnPropertyNames(object);
+  if (Array.isArray(object)) {
+    const expected = Array.from({ length: object.length }, (_, i) => String(i));
+    if (names.filter((n) => n !== 'length').join('\0') !== expected.join('\0')) throw new ContractValidationError(`${label} contains a sparse or extra-key array`);
+  }
+  for (const name of names) {
+    if (name === 'length' && Array.isArray(object)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(object, name);
+    if (!descriptor || !('value' in descriptor)) throw new ContractValidationError(`${label} contains an accessor`);
+    const value = strictPlainSnapshot(descriptor.value, `${label}.${name}`, seen);
+    if (Array.isArray(out)) out[Number(name)] = value;
+    else out[name] = value;
+  }
+  seen.delete(object);
+  return Object.freeze(out) as T;
+}
+
+function ownData<T>(object: object, name: string, label: string): T {
+  const descriptor = Object.getOwnPropertyDescriptor(object, name);
+  if (!descriptor || !('value' in descriptor)) throw new ContractValidationError(`${label}.${name} must be an own data property`);
+  return descriptor.value as T;
+}
+
+/** Atomically turn an already-finalized receiver generation into a writable source ledger.
+ * The bundle is rebuilt from isolated persisted staging, both export signatures and the full
+ * 1..N signed-head chain are re-verified, and the exact target receipt is re-verified. Only then,
+ * in the SAME SERIALIZABLE transaction, are missing ledger rows installed, the fence/checkpoint
+ * advanced, and the guard-signed activation lease appended. A crash exposes all or none. Receipt/lease
+ * inputs are strict plain-data snapshots taken synchronously; resolver/sanitizer objects are trusted
+ * capability handles captured before the first await. */
+export async function activateFinalizedReceiverAsSource(
+  db: PgTransactor,
+  outboxReady: SchemaReadyToken,
+  receiverReady: SourceReceiverReadyToken,
+  streamIdInput: string,
+  generationIdInput: string,
+  rawOptions: ImportedSourceActivationOptions,
+): Promise<{ streamId: string; generationId: string; targetEpoch: number; n: number;
+  headDigest: string; activationGrantDigest: string }> {
+  const schema = requireReady(outboxReady, db);
+  const receiverBinding = requireReceiverReady(receiverReady, { db });
+  if (receiverBinding.schema !== schema) throw new ContractValidationError('receiver/outbox readiness schema mismatch');
+  const streamId = reqString(streamIdInput, 'streamId');
+  const generationId = reqString(generationIdInput, 'generationId');
+  if (!rawOptions || Object.getPrototypeOf(rawOptions) !== Object.prototype || Object.getOwnPropertySymbols(rawOptions).length !== 0) {
+    throw new ContractValidationError('source activation options must be an exact plain object');
+  }
+  const optionKeys = Object.getOwnPropertyNames(rawOptions).sort();
+  const allowedKeys = ['activationLease', 'bReceiptResolver', 'finalizedReceipt', 'frozenReceipt', 'frozenResolver', 'guardResolver',
+    'headResolver', 'leaseResolver', 'maxSnapshotBytes', 'sanitizer', 'sourceResolver', 'targetEpoch'];
+  if (optionKeys.some((key) => !allowedKeys.includes(key)) || allowedKeys.filter((key) => key !== 'maxSnapshotBytes').some((key) => !optionKeys.includes(key))) {
+    throw new ContractValidationError('source activation options have missing or extra keys');
+  }
+  const maxSnapshotBytes = validateSnapshotBytes(optionKeys.includes('maxSnapshotBytes')
+    ? ownData<number | undefined>(rawOptions, 'maxSnapshotBytes', 'source activation options') : undefined);
+  const frozenReceipt = strictPlainSnapshot(ownData<SourceFrozenReceipt>(rawOptions, 'frozenReceipt', 'source activation options'), 'frozenReceipt');
+  const finalizedReceipt = strictPlainSnapshot(ownData<BFinalizedReceipt>(rawOptions, 'finalizedReceipt', 'source activation options'), 'finalizedReceipt');
+  const activationLease = strictPlainSnapshot(ownData<LeaseGrant>(rawOptions, 'activationLease', 'source activation options'), 'activationLease');
+  const snapshotJson = JSON.stringify({
+    frozenReceipt, finalizedReceipt, activationLease,
+  });
+  if (Buffer.byteLength(snapshotJson, 'utf8') > maxSnapshotBytes) throw new ContractValidationError('source activation snapshot exceeds maxSnapshotBytes');
+  const captured = { frozenReceipt, finalizedReceipt, activationLease };
+  const sanitizer = ownData<ImportedSourceActivationOptions['sanitizer']>(rawOptions, 'sanitizer', 'source activation options');
+  const sourceResolver = ownData<SourceVerifyKeyResolver>(rawOptions, 'sourceResolver', 'source activation options');
+  const guardResolver = ownData<SourceVerifyKeyResolver>(rawOptions, 'guardResolver', 'source activation options');
+  const headResolver = ownData<SourceVerifyKeyResolver>(rawOptions, 'headResolver', 'source activation options');
+  const frozenResolver = ownData<SourceVerifyKeyResolver>(rawOptions, 'frozenResolver', 'source activation options');
+  const bReceiptResolver = ownData<SourceVerifyKeyResolver>(rawOptions, 'bReceiptResolver', 'source activation options');
+  const leaseResolver = ownData<SourceVerifyKeyResolver>(rawOptions, 'leaseResolver', 'source activation options');
+  const targetEpoch = safeSeq(ownData<number>(rawOptions, 'targetEpoch', 'source activation options'), 'targetEpoch');
+  if (targetEpoch < 1 || targetEpoch > 2_147_483_647) throw new ContractValidationError('targetEpoch out of range [1, 2^31-1]');
+  verifyBFinalizedReceipt(bReceiptResolver, captured.finalizedReceipt);
+  verifyLeaseGrant(leaseResolver, captured.activationLease);
+  if (captured.finalizedReceipt.streamId !== streamId ||
+      captured.finalizedReceipt.generationId !== generationId ||
+      captured.finalizedReceipt.bKeyId !== captured.activationLease.holderNodeId ||
+      captured.finalizedReceipt.epoch >= targetEpoch ||
+      captured.activationLease.streamId !== streamId ||
+      captured.activationLease.leaseEpoch !== targetEpoch ||
+      captured.activationLease.leaseStatus !== 'active' ||
+      captured.activationLease.commandId !== captured.finalizedReceipt.commandId) {
+    throw new ContractValidationError('activation lease/finalized receipt does not bind the target generation');
+  }
+  return db.transaction(async (exec) => {
+    await enterCriticalTx(exec, schema);
+    // Freeze every governed catalog through commit: ACCESS SHARE blocks ALTER/DROP while allowing
+    // normal row work. Re-attest inside this exact authority transaction, not only at token mint.
+    await exec.query(`LOCK TABLE ${[...TSK_OUTBOX_TABLES, ...TSK_RECEIVER_TABLES, ...TSK_SOURCE_LEASE_TABLES].join(', ')} IN ACCESS SHARE MODE`);
+    await attestSchema(exec);
+    await assertVersionInTx(exec);
+    await attestReceiver(exec);
+    await attestSourceLease(exec);
+    const targetSystemId = String((await exec.query('SELECT system_identifier::text AS s FROM pg_catalog.pg_control_system()')).rows[0]?.s ?? '');
+    if (targetSystemId !== captured.finalizedReceipt.bSystemId) throw new ContractValidationError('activation target PostgreSQL system_identifier differs from the finalized receiver authority');
+    const pointer = (await exec.query(
+      `SELECT p.active_generation_id,p.checkpoint_seq,p.head_digest,p.state_digest,p.b_finalized_receipt,
+              g.command_id,g.epoch,g.source_epoch,g.n,g.manifest_digest,g.manifest_root,g.frozen_receipt_digest
+         FROM tsk_receiver_pointer p JOIN tsk_receiver_generation g
+           ON g.stream_id=p.stream_id AND g.generation_id=p.active_generation_id
+        WHERE p.stream_id=$1 FOR UPDATE OF p,g`, [streamId],
+    )).rows[0];
+    if (!pointer || String(pointer.active_generation_id) !== generationId) throw new ContractValidationError('receiver generation is not the active finalized generation');
+    const storedReceipt = typeof pointer.b_finalized_receipt === 'string'
+      ? JSON.parse(pointer.b_finalized_receipt) : pointer.b_finalized_receipt;
+    if (canonicalize(storedReceipt) !== canonicalize(captured.finalizedReceipt)) throw new ContractValidationError('stored finalized receipt differs from the activation receipt');
+    const stage = (await exec.query(
+      'SELECT manifest,pg_catalog.octet_length(manifest::text) AS manifest_bytes FROM tsk_receiver_stage WHERE stream_id=$1 AND generation_id=$2 AND status=$3 FOR SHARE',
+      [streamId, generationId, 'installed'],
+    )).rows[0];
+    if (!stage) throw new ContractValidationError('installed receiver staging manifest is missing');
+    const chunkStats = (await exec.query(
+      'SELECT count(*) AS n,COALESCE(sum(pg_catalog.octet_length(content::text)),0) AS bytes FROM tsk_receiver_stage_chunk WHERE stream_id=$1 AND generation_id=$2',
+      [streamId, generationId],
+    )).rows[0];
+    const chunkCount = safeSeq(chunkStats.n, 'receiver staging chunk count');
+    const persistedBytes = safeSeq(chunkStats.bytes, 'receiver staging bytes') + safeSeq(stage.manifest_bytes, 'receiver manifest bytes');
+    if (chunkCount < 2 || chunkCount > 100_000 || persistedBytes > maxSnapshotBytes) {
+      throw new ContractValidationError('persisted receiver activation material exceeds configured count/byte bounds');
+    }
+    const manifest = (typeof stage.manifest === 'string' ? JSON.parse(stage.manifest) : stage.manifest) as GuardCountersignedExport;
+    const chunkRows = (await exec.query(
+      'SELECT ordinal,kind,seq_from,seq_to,item_count,byte_digest,content FROM tsk_receiver_stage_chunk WHERE stream_id=$1 AND generation_id=$2 ORDER BY ordinal FOR SHARE',
+      [streamId, generationId],
+    )).rows;
+    const historyChunks = chunkRows.filter((row) => row.kind === 'history').map((row) => ({
+      ordinal: Number(row.ordinal), seqFrom: Number(row.seq_from), seqTo: Number(row.seq_to),
+      records: typeof row.content === 'string' ? JSON.parse(row.content) : row.content,
+      byteDigest: String(row.byte_digest),
+    }));
+    const stateRows = chunkRows.filter((row) => row.kind === 'state');
+    if (stateRows.length !== 1) throw new ContractValidationError('receiver staging must contain exactly one state chunk');
+    const stateChunk = {
+      ordinal: Number(stateRows[0].ordinal),
+      pairs: typeof stateRows[0].content === 'string' ? JSON.parse(stateRows[0].content) : stateRows[0].content,
+      itemCount: Number(stateRows[0].item_count), byteDigest: String(stateRows[0].byte_digest),
+    };
+    const bundle = { historyChunks, stateChunk } as SourceExportBundle;
+    verifyGuardCountersignedExport(sourceResolver, guardResolver, manifest);
+    const replay = assertExportBundleBinds(bundle, manifest, captured.frozenReceipt,
+      frozenResolver, sanitizer, headResolver);
+    if (replay.n !== Number(pointer.n) || replay.n !== captured.finalizedReceipt.n ||
+        replay.signedHeadDigestAtN !== String(pointer.head_digest) ||
+        replay.sourceStateDigestAtN !== String(pointer.state_digest) ||
+        manifest.canonicalDigest !== String(pointer.manifest_digest) ||
+        manifest.manifestRoot !== String(pointer.manifest_root) ||
+        captured.frozenReceipt.receiptDigest !== String(pointer.frozen_receipt_digest)) {
+      throw new ContractValidationError('persisted receiver generation does not bind replay outputs');
+    }
+    const records = bundle.historyChunks.flatMap((chunk) => chunk.records);
+    const maxExisting = safeSeq((await exec.query(
+      'SELECT COALESCE(MAX(sequence),0) AS n FROM tsk_outbox_rows WHERE stream_id=$1', [streamId],
+    )).rows[0].n, 'existing source max sequence');
+    if (maxExisting > replay.n) throw new ContractValidationError('target source ledger is ahead of the imported generation');
+    for (const record of records) {
+      const mutation = sanitizer.sanitize(JSON.parse(record.payload));
+      const existing = (await exec.query(
+        'SELECT source_epoch,fence_token::text,op_digest,mutation,head_prev,head_digest,head_key_id,head_alg,head_sig FROM tsk_outbox_rows WHERE stream_id=$1 AND sequence=$2 FOR UPDATE',
+        [streamId, record.sequence],
+      )).rows[0];
+      if (existing) {
+        const exact = String(existing.source_epoch) === record.sourceEpoch &&
+          String(existing.fence_token) === record.fenceToken && String(existing.op_digest) === record.opDigest &&
+          canonicalize(existing.mutation) === canonicalize(mutation) &&
+          String(existing.head_prev) === record.prevHeadDigest && String(existing.head_digest) === record.headDigest &&
+          String(existing.head_key_id) === record.keyId && String(existing.head_alg) === record.alg &&
+          String(existing.head_sig) === record.signature;
+        if (!exact) throw new ContractValidationError(`target source ledger conflicts at sequence ${record.sequence}`);
+        continue;
+      }
+      const hotp = mutation as TskHotpMutation;
+      affectedOne(await exec.query(
+        `INSERT INTO tsk_outbox_rows
+         (stream_id,source_epoch,sequence,fence_token,op_digest,tumbler_id,hotp_counter,mutation,
+          head_prev,head_digest,head_key_id,head_alg,head_sig,acked_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now())`,
+        [streamId, record.sourceEpoch, record.sequence, record.fenceToken, record.opDigest,
+          hotp.tumblerId, hotp.counter, canonicalize(mutation), record.prevHeadDigest,
+          record.headDigest, record.keyId, record.alg, record.signature]),
+      'imported source row insert');
+    }
+    const fence = (await exec.query('SELECT fence_token FROM tsk_outbox_fence WHERE stream_id=$1 FOR UPDATE', [streamId])).rows[0];
+    if (!fence) affectedOne(await exec.query('INSERT INTO tsk_outbox_fence(stream_id,fence_token) VALUES ($1,$2)', [streamId, targetEpoch]), 'target fence install');
+    else {
+      const current = Number(fence.fence_token);
+      if (!Number.isSafeInteger(current) || current < 0 || current > targetEpoch) throw new ContractValidationError('target fence is ahead of the activation epoch');
+      if (current < targetEpoch) affectedOne(await exec.query('UPDATE tsk_outbox_fence SET fence_token=$2 WHERE stream_id=$1 AND fence_token=$3', [streamId, targetEpoch, current]), 'target fence advance');
+    }
+    const cp = (await exec.query('SELECT source_epoch,sequence,head_digest FROM tsk_outbox_source_checkpoint WHERE stream_id=$1 FOR UPDATE', [streamId])).rows[0];
+    if (!cp) affectedOne(await exec.query(
+      'INSERT INTO tsk_outbox_source_checkpoint(stream_id,source_epoch,sequence,head_digest) VALUES ($1,$2,$3,$4)',
+      [streamId, manifest.sourceEpoch, replay.n, replay.signedHeadDigestAtN]), 'target source checkpoint install');
+    else {
+      if (Number(cp.sequence) > replay.n) throw new ContractValidationError('target source checkpoint is ahead of imported N');
+      if (Number(cp.sequence) === replay.n) {
+        if (String(cp.source_epoch) !== manifest.sourceEpoch || String(cp.head_digest) !== replay.signedHeadDigestAtN) {
+          throw new ContractValidationError('target source checkpoint conflicts at imported N');
+        }
+      } else {
+        affectedOne(await exec.query(
+          'UPDATE tsk_outbox_source_checkpoint SET source_epoch=$2,sequence=$3,head_digest=$4 WHERE stream_id=$1 AND sequence=$5',
+          [streamId, manifest.sourceEpoch, replay.n, replay.signedHeadDigestAtN, Number(cp.sequence)]), 'target source checkpoint install');
+      }
+    }
+    await installLeaseGrant(exec, leaseResolver, captured.activationLease);
+    return { streamId, generationId, targetEpoch, n: replay.n,
+      headDigest: replay.signedHeadDigestAtN,
+      activationGrantDigest: captured.activationLease.grantDigest };
+  });
 }
 
 export interface PgTskPublisherOptions { leaseMs: number; scopeDeadlineMs?: number }
