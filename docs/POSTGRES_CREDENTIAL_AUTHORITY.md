@@ -12,7 +12,10 @@ outbox. It can invoke only fixed `SECURITY DEFINER` routines. Each atomic apply
 requires a transaction-bound, five-second, single-use HMAC mutation ticket over
 the exact signed record and credential effects. The ticket key is installed by
 the provisioning identity, is unreadable by the runtime database role, and is
-bound into an unforgeable runtime-boundary capability.
+proved at capability mint with a fresh challenge. Missing, inactive, rotated,
+or mismatched key material fails closed without disclosing the key. Nonces use
+the database clock, indexed expiry pruning, and a serialized hard capacity of
+10,000 rows; live tickets are never pruned early.
 
 The replicated mutation is deliberately secret-free. It contains the public map,
 its digest, a digest of the source secret, and the monotonic per-credential
@@ -27,6 +30,14 @@ and separately reprovision secret material through an approved custody channel.
 - Run the application with no DDL privilege. Every owned operation pins the
   schema, holds `ACCESS SHARE` locks, and compares the live full catalog to the
   compiled PostgreSQL 16 manifest before reading or mutating authority state.
+- The runtime identity must not inherit ownership, DDL, direct DML, secret-table
+  reads, or helper-routine execution through another role. Every mutation and
+  its pre-commit hook reassert this posture and re-prove the active ticket key,
+  so a grant or key change after startup invalidates the capability in use.
+- Routine/table owners and routine definitions are catalog-attested. The
+  provisioning identity must serialize routine/ACL changes with deployments;
+  runtime execution is restricted to the four reviewed `SECURITY DEFINER`
+  entry points with a fixed `search_path`.
 - Obtain `CredentialAuthorityReadyToken` only through
   `assertCredentialAuthorityReady`; it is bound to the exact transactor and
   schema and has no public mint helper.

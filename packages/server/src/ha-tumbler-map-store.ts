@@ -1,6 +1,8 @@
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 
 import type { TumblerMap } from '@tsk/core';
+import { assertValidHOTPStoredCounter, isUsableHOTPDerivationCounter,
+  minimumHOTPUsesRemaining } from '@tsk/core';
 
 import {
   ContractValidationError,
@@ -28,7 +30,7 @@ import {
 import { fenceTokenForEpoch } from './ha-control-fencing.js';
 import { requireSourceFenceReady } from './tsk-source-fence.js';
 import { assertTumblerMapCounterState, commitValidationToMap, type TumblerMapStore, type ValidationCommitInput,
-  type ValidationCommitResult } from './store.js';
+  reconcileTumblerMapCounterStatus, type ValidationCommitResult } from './store.js';
 
 const ID = /^[A-Za-z0-9_.:/-]{1,128}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -36,8 +38,16 @@ const SCHEMA = /^[a-z_][a-z0-9_]{0,62}$/;
 const MAX_MAP_BYTES = 256 * 1024;
 const CREDENTIAL_TABLES = ['tsk_credential_maps', 'tsk_credential_replica_maps',
   'tsk_credential_mutation_key', 'tsk_credential_mutation_nonce'] as const;
+const GOVERNED_TABLES = [...CREDENTIAL_TABLES, 'tsk_outbox_meta', 'tsk_outbox_fence',
+  'tsk_outbox_source_checkpoint', 'tsk_outbox_receiver_checkpoint', 'tsk_outbox_rows',
+  'tsk_outbox_publisher_lease', 'tsk_outbox_quarantine', 'tsk_outbox_applied',
+  'tsk_hotp_consumed', 'tsk_outbox_stream_halted', 'tsk_source_lease',
+  'tsk_source_lease_history'] as const;
+const EXPOSED_ROUTINES = ['tsk_apply_credential_mutation', 'tsk_prepare_credential_append',
+  'tsk_credential_ticket_context', 'tsk_verify_credential_mutation_key'] as const;
+const GOVERNED_ROUTINES = [...EXPOSED_ROUTINES, 'tsk_credential_constant_time_equal'] as const;
 /** Compiled PG16 catalog pin. Re-pin only through a reviewed schema change. */
-export const CREDENTIAL_AUTHORITY_MANIFEST_DIGEST = 'f8629f7ddfe5fad3e8389e80a4c633fa49813e3c2a2f6f1d2056f2bab3a048c3';
+export const CREDENTIAL_AUTHORITY_MANIFEST_DIGEST = 'c207b21cd263ee68228754572593230eade3895091577e544797d512c0349696';
 const MAP_KEYS = ['checksum', 'clientId', 'createdAt', 'expiresAt', 'hotpRotationWarningCounters',
   'keyLength', 'label', 'lastUsedAt', 'maxRequests', 'requestCount', 'rotationWarningRequests',
   'segments', 'sharedSecret', 'status', 'version'] as const;
@@ -74,6 +84,8 @@ CREATE TABLE IF NOT EXISTS tsk_credential_mutation_nonce (
   expires_at_ms bigint NOT NULL,
   used_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
 );
+CREATE INDEX IF NOT EXISTS tsk_credential_mutation_nonce_expires_idx
+  ON tsk_credential_mutation_nonce(expires_at_ms,nonce);
 CREATE OR REPLACE FUNCTION tsk_credential_constant_time_equal(left_value bytea, right_value bytea)
 RETURNS boolean LANGUAGE plpgsql IMMUTABLE STRICT SET search_path = public, pg_temp AS $fn$
 DECLARE difference integer:=0; i integer;
@@ -85,6 +97,23 @@ BEGIN
   RETURN difference=0;
 END $fn$;
 REVOKE ALL ON FUNCTION tsk_credential_constant_time_equal(bytea,bytea) FROM PUBLIC;
+CREATE OR REPLACE FUNCTION tsk_verify_credential_mutation_key(
+  requested_key_id text, challenge text, supplied_mac text
+) RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $fn$
+DECLARE k record;
+BEGIN
+  IF requested_key_id !~ '^[A-Za-z0-9._-]{1,64}$'
+     OR challenge !~ '^[A-Za-z0-9_-]{32,128}$' OR supplied_mac !~ '^[0-9a-f]{64}$' THEN
+    RETURN false;
+  END IF;
+  SELECT * INTO k FROM tsk_credential_mutation_key
+    WHERE key_id=requested_key_id AND active FOR SHARE;
+  IF NOT FOUND THEN RETURN false; END IF;
+  RETURN tsk_credential_constant_time_equal(
+    public.hmac(pg_catalog.convert_to(challenge,'UTF8'),k.secret,'sha256'),
+    pg_catalog.decode(supplied_mac,'hex'));
+END $fn$;
+REVOKE ALL ON FUNCTION tsk_verify_credential_mutation_key(text,text,text) FROM PUBLIC;
 CREATE OR REPLACE FUNCTION tsk_credential_ticket_context(
   ticket jsonb, requested_stream text, requested_epoch text, requested_sequence bigint,
   requested_fence numeric, requested_digest text, mutation jsonb,
@@ -106,6 +135,7 @@ CREATE OR REPLACE FUNCTION tsk_prepare_credential_append(
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $fn$
 DECLARE lease record; latest record; cp record; now_ms bigint; pending bigint;
 BEGIN
+  LOCK TABLE tsk_credential_mutation_key, tsk_credential_mutation_nonce IN ACCESS SHARE MODE;
   SELECT * INTO lease FROM tsk_source_lease WHERE stream_id=requested_stream FOR SHARE;
   SELECT lease_grant_seq,grant_digest INTO latest FROM tsk_source_lease_history
     WHERE stream_id=requested_stream ORDER BY lease_grant_seq DESC LIMIT 1;
@@ -161,6 +191,14 @@ BEGIN
       pg_catalog.decode(ticket->>'mac','hex')) THEN
     RAISE EXCEPTION 'credential mutation ticket MAC invalid';
   END IF;
+  LOCK TABLE tsk_credential_mutation_nonce IN SHARE ROW EXCLUSIVE MODE;
+  DELETE FROM tsk_credential_mutation_nonce WHERE nonce IN (
+    SELECT nonce FROM tsk_credential_mutation_nonce WHERE expires_at_ms<now_ms
+      ORDER BY expires_at_ms,nonce LIMIT 1000
+  );
+  IF (SELECT count(*) FROM tsk_credential_mutation_nonce)>=10000 THEN
+    RAISE EXCEPTION 'credential mutation nonce capacity exhausted';
+  END IF;
   INSERT INTO tsk_credential_mutation_nonce(nonce,expires_at_ms)
     VALUES(ticket->>'nonce',(ticket->>'expiresAtMs')::bigint);
   SELECT * INTO cp FROM tsk_outbox_source_checkpoint WHERE stream_id=requested_stream FOR UPDATE;
@@ -180,6 +218,8 @@ BEGIN
     IF effect->>'action'<>'upsert' OR effect->>'clientId'<>mutation->>'clientId'
        OR effect->>'revision'<>mutation->>'counter'
        OR effect->'map'->>'clientId'<>mutation->>'clientId'
+       OR effect->'map'->>'sharedSecret' !~ '^[0-9a-f]{64}$'
+       OR pg_catalog.encode(public.digest(pg_catalog.convert_to(effect->'map'->>'sharedSecret','UTF8'),'sha256'),'hex')<>mutation->>'secretDigest'
        OR (effect->'map')-'sharedSecret'<>mutation->'publicMap' THEN
       RAISE EXCEPTION 'snapshot effect does not bind the signed mutation';
     END IF;
@@ -208,6 +248,10 @@ BEGIN
        OR effects->1->>'clientId'<>mutation->'replacement'->>'clientId'
        OR effects->0->>'revision'<>mutation->'old'->>'counter'
        OR effects->1->>'revision'<>mutation->'replacement'->>'counter'
+       OR effects->0->'map'->>'sharedSecret' !~ '^[0-9a-f]{64}$'
+       OR effects->1->'map'->>'sharedSecret' !~ '^[0-9a-f]{64}$'
+       OR pg_catalog.encode(public.digest(pg_catalog.convert_to(effects->0->'map'->>'sharedSecret','UTF8'),'sha256'),'hex')<>mutation->'old'->>'secretDigest'
+       OR pg_catalog.encode(public.digest(pg_catalog.convert_to(effects->1->'map'->>'sharedSecret','UTF8'),'sha256'),'hex')<>mutation->'replacement'->>'secretDigest'
        OR ((effects->0->'map')-'sharedSecret')<>mutation->'old'->'publicMap'
        OR ((effects->1->'map')-'sharedSecret')<>mutation->'replacement'->'publicMap' THEN
       RAISE EXCEPTION 'replace effects do not bind the signed mutation';
@@ -386,7 +430,7 @@ function validateMap(value: unknown, requireSecret: boolean): TumblerMap {
     throw new ContractValidationError('checksum or HOTP coverage invalid');
   }
   safeOptionalInt(map.expiresAt, 'expiresAt');
-  safeOptionalInt(map.maxRequests, 'maxRequests', 1);
+  safeOptionalInt(map.maxRequests, 'maxRequests');
   safeOptionalInt(map.rotationWarningRequests, 'rotationWarningRequests', 1);
   safeOptionalInt(map.hotpRotationWarningCounters, 'hotpRotationWarningCounters', 1);
   safeOptionalInt(map.requestCount, 'requestCount');
@@ -532,8 +576,10 @@ async function enter(exec: PgExecutor, schema: string): Promise<void> {
 async function credentialAuthorityManifest(exec: PgExecutor): Promise<string> {
   const tables = [...CREDENTIAL_TABLES];
   const rel = (await exec.query(
-    `SELECT rel.relname AS t,rel.relkind,rel.relpersistence,rel.relrowsecurity,rel.relforcerowsecurity
+    `SELECT rel.relname AS t,rel.relkind,rel.relpersistence,rel.relrowsecurity,rel.relforcerowsecurity,
+            owner.rolname AS owner
        FROM pg_catalog.pg_class rel JOIN pg_catalog.pg_namespace ns ON ns.oid=rel.relnamespace
+       JOIN pg_catalog.pg_roles owner ON owner.oid=rel.relowner
       WHERE ns.nspname=pg_catalog.current_schema() AND rel.relname=ANY($1)`, [tables])).rows;
   const cols = (await exec.query(
     `SELECT rel.relname AS table_name,a.attnum AS ordinal_position,a.attname AS column_name,
@@ -563,20 +609,20 @@ async function credentialAuthorityManifest(exec: PgExecutor): Promise<string> {
        FROM pg_catalog.pg_policies WHERE schemaname=pg_catalog.current_schema() AND tablename=ANY($1)`, [tables])).rows;
   const routines = (await exec.query(
     `SELECT p.proname AS n,p.prosecdef,p.proconfig,pg_catalog.pg_get_function_identity_arguments(p.oid) AS args,
-            pg_catalog.pg_get_functiondef(p.oid) AS def
+            pg_catalog.pg_get_functiondef(p.oid) AS def,owner.rolname AS owner
        FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace ns ON ns.oid=p.pronamespace
+       JOIN pg_catalog.pg_roles owner ON owner.oid=p.proowner
       WHERE ns.nspname=pg_catalog.current_schema() AND p.proname=ANY($1)`,
-    [['tsk_apply_credential_mutation', 'tsk_prepare_credential_append', 'tsk_credential_ticket_context',
-      'tsk_credential_constant_time_equal']])).rows;
+    [[...GOVERNED_ROUTINES]])).rows;
   const present = rel.map((row) => String(row.t)).sort();
   const lines = [`PRESENT|${present.join(',')}|n=${present.length}`,
-    ...rel.map((r) => `R|${r.t}|${r.relkind}|${r.relpersistence}|${r.relrowsecurity}|${r.relforcerowsecurity}`),
+    ...rel.map((r) => `R|${r.t}|${r.relkind}|${r.relpersistence}|${r.relrowsecurity}|${r.relforcerowsecurity}|${r.owner}`),
     ...cols.map((r) => `C|${r.table_name}|${r.ordinal_position}|${r.column_name}|${r.data_type}|${r.is_nullable}|${r.d}`),
     ...cons.map((r) => `K|${r.t}|${r.contype}|${r.def}`),
     ...idx.map((r) => `I|${r.t}|${r.n}|${r.def}`),
     ...trg.map((r) => `T|${r.t}|${r.n}|${r.tgenabled}|${r.def}`),
     ...pol.map((r) => `P|${r.t}|${r.n}|${r.permissive}|${r.roles}|${r.cmd}|${r.qual}|${r.wc}`),
-    ...routines.map((r) => `F|${r.n}|${r.args}|${r.prosecdef}|${JSON.stringify(r.proconfig)}|${r.def}`)];
+    ...routines.map((r) => `F|${r.n}|${r.args}|${r.prosecdef}|${JSON.stringify(r.proconfig)}|${r.owner}|${r.def}`)];
   lines.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
   return ['Vcredential_authority/1', ...lines].join('\n');
 }
@@ -601,6 +647,66 @@ function requireReady(token: CredentialAuthorityReadyToken, db: PgTransactor, sc
   }
 }
 
+async function assertRuntimeBoundaryInTx(exec: PgExecutor, schema: string,
+  expectedRole: string, signer: CredentialMutationTicketSigner): Promise<void> {
+  const current = String((await exec.query('SELECT current_user AS role')).rows[0]?.role);
+  if (current !== expectedRole || !SCHEMA.test(current)) {
+    throw new ContractValidationError('credential runtime role changed or is invalid');
+  }
+  const attrs = (await exec.query(
+    'SELECT rolsuper,rolbypassrls FROM pg_catalog.pg_roles WHERE rolname=$1', [current],
+  )).rows[0];
+  if (!attrs || attrs.rolsuper || attrs.rolbypassrls) {
+    throw new ContractValidationError('credential runtime holds bypass authority');
+  }
+  const posture = (await exec.query(
+    `SELECT
+       pg_catalog.has_schema_privilege($1,$2,'CREATE') AS can_create,
+       EXISTS(SELECT 1 FROM pg_catalog.unnest($3::text[]) t
+         WHERE pg_catalog.has_table_privilege($1,$2||'.'||t,'INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER')) AS has_dml,
+       EXISTS(SELECT 1 FROM pg_catalog.unnest($4::text[]) t
+         WHERE pg_catalog.has_table_privilege($1,$2||'.'||t,'SELECT')) AS has_secret_read,
+       EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname=$2 AND c.relname=ANY($3)
+           AND pg_catalog.pg_has_role($1,c.relowner,'MEMBER')) AS owns_table,
+       EXISTS(SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+         WHERE n.nspname=$2 AND p.proname=ANY($5)
+           AND pg_catalog.pg_has_role($1,p.proowner,'MEMBER')) AS owns_routine`,
+    [current, schema, [...GOVERNED_TABLES], ['tsk_credential_mutation_key', 'tsk_credential_mutation_nonce'],
+      [...GOVERNED_ROUTINES]],
+  )).rows[0];
+  const fn = (await exec.query(
+    `SELECT count(*)::int n,bool_and(p.prosecdef) secdef,
+            bool_and(p.proconfig @> ARRAY['search_path=public, pg_temp']::text[]) fixed_path,
+            bool_and(pg_catalog.has_function_privilege($2,p.oid,'EXECUTE')) runtime_exec,
+            bool_or(pg_catalog.has_function_privilege('public',p.oid,'EXECUTE')) public_exec
+       FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+      WHERE n.nspname=$1 AND p.proname=ANY($3)`,
+    [schema, current, [...EXPOSED_ROUTINES]],
+  )).rows[0];
+  const helper = (await exec.query(
+    `SELECT count(*)::int n,bool_or(pg_catalog.has_function_privilege($2,p.oid,'EXECUTE')) runtime_exec,
+            bool_or(pg_catalog.has_function_privilege('public',p.oid,'EXECUTE')) public_exec
+       FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+      WHERE n.nspname=$1 AND p.proname='tsk_credential_constant_time_equal'`,
+    [schema, current],
+  )).rows[0];
+  if (!posture || posture.can_create || posture.has_dml || posture.has_secret_read ||
+      posture.owns_table || posture.owns_routine || Number(fn?.n) !== EXPOSED_ROUTINES.length ||
+      !fn.secdef || !fn.fixed_path || !fn.runtime_exec || fn.public_exec ||
+      Number(helper?.n) !== 1 || helper.runtime_exec || helper.public_exec) {
+    throw new ContractValidationError('credential runtime mutation boundary is unsafe or drifted');
+  }
+  const challenge = randomBytes(32).toString('base64url');
+  const mac = await signer.sign(challenge);
+  if (!HEX64.test(mac) || (await exec.query(
+    'SELECT tsk_verify_credential_mutation_key($1,$2,$3) AS verified',
+    [signer.keyId, challenge, mac],
+  )).rows[0]?.verified !== true) {
+    throw new ContractValidationError('credential mutation key is missing, inactive, or mismatched');
+  }
+}
+
 export async function provisionCredentialRuntimeMutationBoundary(
   db: PgTransactor, schema: string, runtimeRole: string, keyId: string, secretValue: Uint8Array,
 ): Promise<void> {
@@ -619,14 +725,25 @@ export async function provisionCredentialRuntimeMutationBoundary(
         throw new ContractValidationError('credential runtime role missing or holds bypass authority');
       }
       const owner = (await exec.query(
-        `SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-          WHERE n.nspname=$2 AND c.relname=ANY($3) AND pg_catalog.pg_has_role($1,c.relowner,'MEMBER') LIMIT 1`,
-        [runtimeRole, schema, [...CREDENTIAL_TABLES]],
+        `SELECT 1 FROM (
+           SELECT c.relowner AS owner FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname=$2 AND c.relname=ANY($3)
+           UNION ALL
+           SELECT p.proowner AS owner FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+            WHERE n.nspname=$2 AND p.proname=ANY($4)
+         ) governed WHERE pg_catalog.pg_has_role($1,governed.owner,'MEMBER') LIMIT 1`,
+        [runtimeRole, schema, [...GOVERNED_TABLES], [...GOVERNED_ROUTINES]],
       )).rows[0];
       if (owner) throw new ContractValidationError('credential runtime role inherits authority ownership');
       await exec.query(`REVOKE CREATE ON SCHEMA ${schema} FROM PUBLIC,${runtimeRole}`);
-      await exec.query(`REVOKE ALL ON TABLE ${schema}.tsk_credential_maps,${schema}.tsk_credential_replica_maps,
-        ${schema}.tsk_credential_mutation_key,${schema}.tsk_credential_mutation_nonce FROM PUBLIC,${runtimeRole}`);
+      await exec.query(`REVOKE INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER ON ALL TABLES IN SCHEMA ${schema} FROM PUBLIC,${runtimeRole}`);
+      await exec.query(`REVOKE ALL ON TABLE ${schema}.tsk_credential_mutation_key,
+        ${schema}.tsk_credential_mutation_nonce FROM PUBLIC,${runtimeRole}`);
+      await exec.query(`REVOKE ALL ON FUNCTION ${schema}.tsk_apply_credential_mutation(jsonb,text,text,bigint,numeric,text,jsonb,text,text,text,text,text,jsonb),
+        ${schema}.tsk_prepare_credential_append(text,bigint,text,text,text,bigint,bigint),
+        ${schema}.tsk_credential_ticket_context(jsonb,text,text,bigint,numeric,text,jsonb,text,text,text,text,text,jsonb),
+        ${schema}.tsk_verify_credential_mutation_key(text,text,text),
+        ${schema}.tsk_credential_constant_time_equal(bytea,bytea) FROM PUBLIC,${runtimeRole}`);
       await exec.query(`GRANT USAGE ON SCHEMA ${schema} TO ${runtimeRole}`);
       await exec.query(`GRANT SELECT ON TABLE ${schema}.tsk_credential_maps,${schema}.tsk_credential_replica_maps,
         ${schema}.tsk_outbox_meta,${schema}.tsk_outbox_fence,${schema}.tsk_outbox_source_checkpoint,
@@ -637,6 +754,7 @@ export async function provisionCredentialRuntimeMutationBoundary(
       await exec.query(`GRANT EXECUTE ON FUNCTION ${schema}.tsk_prepare_credential_append(text,bigint,text,text,text,bigint,bigint) TO ${runtimeRole}`);
       await exec.query(`GRANT EXECUTE ON FUNCTION ${schema}.tsk_credential_ticket_context(jsonb,text,text,bigint,numeric,text,jsonb,text,text,text,text,text,jsonb) TO ${runtimeRole}`);
       await exec.query(`GRANT EXECUTE ON FUNCTION ${schema}.tsk_apply_credential_mutation(jsonb,text,text,bigint,numeric,text,jsonb,text,text,text,text,text,jsonb) TO ${runtimeRole}`);
+      await exec.query(`GRANT EXECUTE ON FUNCTION ${schema}.tsk_verify_credential_mutation_key(text,text,text) TO ${runtimeRole}`);
       await exec.query(`INSERT INTO ${schema}.tsk_credential_mutation_key(key_id,secret,active) VALUES($1,$2,true)
         ON CONFLICT(key_id) DO UPDATE SET secret=excluded.secret,active=true`, [keyId, secret]);
     });
@@ -646,56 +764,28 @@ export async function provisionCredentialRuntimeMutationBoundary(
 }
 
 export async function assertCredentialRuntimeMutationBoundary(
-  db: PgTransactor, schema: string, keyId: string,
+  db: PgTransactor, schema: string, signer: CredentialMutationTicketSigner,
 ): Promise<CredentialMutationBoundaryToken> {
-  id(keyId, 'credential mutation keyId');
+  id(signer.keyId, 'credential mutation keyId');
   if (schema !== 'public') throw new ContractValidationError('credential runtime v1 requires public schema');
   const role = await db.transaction(async (exec) => {
     await enter(exec, schema);
     const current = String((await exec.query('SELECT current_user AS role')).rows[0]?.role);
-    if (!SCHEMA.test(current)) throw new ContractValidationError('credential runtime role invalid');
-    const attrs = (await exec.query(
-      'SELECT rolsuper,rolbypassrls FROM pg_catalog.pg_roles WHERE rolname=$1', [current],
-    )).rows[0];
-    if (!attrs || attrs.rolsuper || attrs.rolbypassrls) throw new ContractValidationError('credential runtime holds bypass authority');
-    const posture = (await exec.query(
-      `SELECT
-        pg_catalog.has_schema_privilege($1,$2,'CREATE') AS can_create,
-        pg_catalog.has_table_privilege($1,$2||'.tsk_credential_maps','INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER') AS map_dml,
-        pg_catalog.has_table_privilege($1,$2||'.tsk_credential_replica_maps','INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER') AS replica_dml,
-        pg_catalog.has_table_privilege($1,$2||'.tsk_credential_mutation_key','SELECT,INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER') AS key_access,
-        pg_catalog.has_function_privilege($1,$2||'.tsk_apply_credential_mutation(jsonb,text,text,bigint,numeric,text,jsonb,text,text,text,text,text,jsonb)','EXECUTE') AS can_apply,
-        pg_catalog.has_function_privilege($1,$2||'.tsk_prepare_credential_append(text,bigint,text,text,text,bigint,bigint)','EXECUTE') AS can_prepare,
-        pg_catalog.has_function_privilege($1,$2||'.tsk_credential_ticket_context(jsonb,text,text,bigint,numeric,text,jsonb,text,text,text,text,text,jsonb)','EXECUTE') AS can_context`,
-      [current, schema],
-    )).rows[0];
-    const fn = (await exec.query(
-      `SELECT count(*)::int n,bool_and(p.prosecdef) secdef,bool_and(p.proconfig @> ARRAY['search_path=public, pg_temp']::text[]) fixed_path,
-              bool_or(r.rolname=$2) runtime_owns
-         FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
-         JOIN pg_catalog.pg_roles r ON r.oid=p.proowner
-        WHERE n.nspname=$1 AND p.proname=ANY($3)`,
-      [schema, current, ['tsk_apply_credential_mutation', 'tsk_prepare_credential_append',
-        'tsk_credential_ticket_context']],
-    )).rows[0];
-    if (!posture || posture.can_create || posture.map_dml || posture.replica_dml || posture.key_access ||
-        !posture.can_apply || !posture.can_prepare || !posture.can_context ||
-        Number(fn?.n) !== 3 || !fn.secdef || !fn.fixed_path || fn.runtime_owns) {
-      throw new ContractValidationError('credential runtime mutation boundary is unsafe or drifted');
-    }
+    await assertRuntimeBoundaryInTx(exec, schema, current, signer);
     return current;
   });
   const token = Object.freeze({}) as CredentialMutationBoundaryToken;
-  BOUNDARY.set(token as object, { db, schema, role, keyId });
+  BOUNDARY.set(token as object, { db, schema, role, keyId: signer.keyId });
   return token;
 }
 
 function requireBoundary(token: CredentialMutationBoundaryToken, db: PgTransactor, schema: string,
-  signer: CredentialMutationTicketSigner): void {
+  signer: CredentialMutationTicketSigner): { role: string } {
   const state = BOUNDARY.get(token as object);
   if (!state || state.db !== db || state.schema !== schema || state.keyId !== signer.keyId) {
     throw new ContractValidationError('invalid credential mutation-boundary capability');
   }
+  return { role: state.role };
 }
 
 export interface PgHaTumblerMapStoreOptions {
@@ -715,6 +805,7 @@ export class PgHaTumblerMapStore implements TumblerMapStore {
   private readonly maxPendingRows: number;
   private readonly lease: { holderNodeId: string; leaseId: string; grantDigest: string; skewMs: number };
   private readonly ticketSigner: CredentialMutationTicketSigner;
+  private readonly runtimeRole: string;
 
   constructor(
     private readonly db: PgTransactor,
@@ -730,7 +821,7 @@ export class PgHaTumblerMapStore implements TumblerMapStore {
       throw new ContractValidationError('outbox readiness is foreign to credential authority');
     }
     requireReady(credentialReady, db, this.schema);
-    requireBoundary(mutationBoundary, db, this.schema, ticketSigner);
+    this.runtimeRole = requireBoundary(mutationBoundary, db, this.schema, ticketSigner).role;
     this.ticketSigner = ticketSigner;
     this.streamId = id(options.streamId, 'streamId');
     if (!Number.isSafeInteger(options.sourceEpoch) || options.sourceEpoch < 0 || options.sourceEpoch > 2 ** 40) {
@@ -767,8 +858,15 @@ export class PgHaTumblerMapStore implements TumblerMapStore {
   }
 
   private mutate<T>(fn: (exec: PgExecutor) => Promise<T>): Promise<T> {
-    return this.db.transaction(async (exec) => { await enter(exec, this.schema); return fn(exec); }, {
-      onBeforeCommit: async (exec) => { await this.prepare(exec, this.maxPendingRows + 1); },
+    return this.db.transaction(async (exec) => {
+      await enter(exec, this.schema);
+      await assertRuntimeBoundaryInTx(exec, this.schema, this.runtimeRole, this.ticketSigner);
+      return fn(exec);
+    }, {
+      onBeforeCommit: async (exec) => {
+        await assertRuntimeBoundaryInTx(exec, this.schema, this.runtimeRole, this.ticketSigner);
+        await this.prepare(exec, this.maxPendingRows + 1);
+      },
     });
   }
 
@@ -884,37 +982,48 @@ export class PgHaTumblerMapStore implements TumblerMapStore {
     const captured = [...updates.entries()].map(([segmentId, counter]) => ({
       segmentId: id(segmentId, 'segmentId'), counter,
     }));
-    for (const update of captured) {
-      if (!Number.isSafeInteger(update.counter) || update.counter < 0 || update.counter > 2_147_483_647) {
-        throw new ContractValidationError('HOTP counter update invalid');
-      }
-    }
+    for (const update of captured) assertValidHOTPStoredCounter(update.counter,
+      `HOTP counter for ${update.segmentId}`);
     await this.mutate(async (exec) => {
       await enter(exec, this.schema);
       const row = await this.readInTx(exec, clientId, true);
       if (!row) return;
-      for (const segment of row.map.segments) {
-        const update = captured.find((item) => item.segmentId === segment.segmentId);
-        if (segment.type === 'hotp' && update) {
-          const next = update.counter;
-          if (!Number.isSafeInteger(next) || next < (segment.counter ?? 0) || next > 2_147_483_647) {
-            throw new ContractValidationError('HOTP counter update must be monotonic and bounded');
-          }
-          segment.counter = next;
+      for (const update of captured) {
+        const segment = row.map.segments.find((item) => item.segmentId === update.segmentId);
+        if (!segment || segment.type !== 'hotp') throw new ContractValidationError('HOTP counter update target invalid');
+        if (update.counter < (segment.counter ?? 0)) {
+          throw new ContractValidationError('HOTP counter update must be monotonic');
         }
+        segment.counter = update.counter;
       }
+      const remaining = minimumHOTPUsesRemaining(row.map.segments);
+      if (remaining !== undefined) reconcileTumblerMapCounterStatus(row.map, remaining);
       await this.persist(exec, row.map, row.revision + 1);
     });
   }
 
   async consumeCounter(clientId: string, segmentId: string, matchedCounter: number): Promise<boolean> {
+    const capturedClientId = id(clientId, 'clientId');
+    const capturedSegmentId = id(segmentId, 'segmentId');
+    if (!isUsableHOTPDerivationCounter(matchedCounter)) return false;
     return this.mutate(async (exec) => {
       await enter(exec, this.schema);
-      const row = await this.readInTx(exec, clientId, true);
+      const row = await this.readInTx(exec, capturedClientId, true);
       if (!row) return false;
-      const segment = row.map.segments.find((s) => s.segmentId === segmentId);
-      if (!segment || segment.type !== 'hotp' || (segment.counter ?? 0) > matchedCounter) return false;
+      const segment = row.map.segments.find((s) => s.segmentId === capturedSegmentId);
+      if (!segment || segment.type !== 'hotp') return false;
+      const stored = segment.counter ?? 0;
+      if (!isUsableHOTPDerivationCounter(stored)) {
+        if (stored === 2_147_483_647 && row.map.status !== 'expired' && row.map.status !== 'revoked') {
+          row.map.status = 'expired';
+          await this.persist(exec, row.map, row.revision + 1);
+        }
+        return false;
+      }
+      if (stored > matchedCounter) return false;
       segment.counter = matchedCounter + 1;
+      const remaining = minimumHOTPUsesRemaining(row.map.segments);
+      if (remaining !== undefined) reconcileTumblerMapCounterStatus(row.map, remaining);
       await this.persist(exec, row.map, row.revision + 1);
       return true;
     });
@@ -1023,12 +1132,13 @@ export class PgTskCredentialReceiverCheckpoint {
       if (String(cp.source_epoch) !== record.sourceEpoch ||
           String(cp.head_digest || GENESIS_HEAD) !== head.prevHeadDigest) return 'reject-fork';
       const readReplica = async (clientId: string) => (await exec.query(
-        'SELECT public_map,revision FROM tsk_credential_replica_maps WHERE stream_id=$1 AND client_id=$2 FOR UPDATE',
+        'SELECT public_map,revision,secret_digest FROM tsk_credential_replica_maps WHERE stream_id=$1 AND client_id=$2 FOR UPDATE',
         [this.streamId, clientId],
       )).rows[0];
       const verifySnapshot = (snapshot: CredentialSnapshot, current: Record<string, unknown> | undefined): boolean => {
         if (snapshot.counter !== (current ? Number(current.revision) + 1 : 1)) return false;
         if (current) {
+          if (snapshot.secretDigest !== current.secret_digest) return false;
           try {
             const secret = '0'.repeat(64);
             assertMonotonicMap({ ...current.public_map as TumblerMap, sharedSecret: secret },

@@ -85,8 +85,24 @@ async function main() {
     const runtimeDb = new NodePostgresTransactor(runtimePool as never, { maxSerializationRetries: 2 });
     const runtimeOutboxReady = await assertSchemaReady(runtimeDb, 'public');
     const runtimeCredentialReady = await assertCredentialAuthorityReady(runtimeDb, 'public', runtimeOutboxReady);
+    await assert.rejects(assertCredentialRuntimeMutationBoundary(runtimeDb, 'public',
+      new HmacCredentialMutationTicketSigner(mutationTicketSigner.keyId, randomBytes(32))), /key.*mismatch/i);
+    await assert.rejects(assertCredentialRuntimeMutationBoundary(runtimeDb, 'public',
+      new HmacCredentialMutationTicketSigner('missing-key', randomBytes(32))), /key.*missing/i);
+    await a.query('UPDATE tsk_credential_mutation_key SET active=false WHERE key_id=$1',
+      [mutationTicketSigner.keyId]);
+    await assert.rejects(assertCredentialRuntimeMutationBoundary(runtimeDb, 'public',
+      mutationTicketSigner), /key.*inactive/i);
+    await a.query('UPDATE tsk_credential_mutation_key SET active=true WHERE key_id=$1',
+      [mutationTicketSigner.keyId]);
+    const rotatedSecret = randomBytes(32);
+    const rotatedSigner = new HmacCredentialMutationTicketSigner('credential-runtime-2', rotatedSecret);
+    await provisionCredentialRuntimeMutationBoundary(pa.db, 'public', RUNTIME_ROLE,
+      rotatedSigner.keyId, rotatedSecret);
+    rotatedSecret.fill(0);
+    await assertCredentialRuntimeMutationBoundary(runtimeDb, 'public', rotatedSigner);
     const mutationBoundary = await assertCredentialRuntimeMutationBoundary(runtimeDb, 'public',
-      mutationTicketSigner.keyId);
+      mutationTicketSigner);
     const fenceReady = await assertSourceFenceReady(runtimeDb, 'public', leaseResolver, {
       streamId: SID, holderNodeId: lease.holderNodeId, leaseId: lease.leaseId,
       grantDigest: lease.grantDigest,
@@ -99,6 +115,31 @@ async function main() {
     map.label = 'agent:test'; map.status = 'active';
     const hotp = map.segments.find((segment) => segment.type === 'hotp')!;
     await source.set(map.clientId, map);
+    const sourceRowsBeforeSecretMismatch = Number((await a.query(
+      'SELECT count(*)::int n FROM tsk_outbox_rows WHERE stream_id=$1', [SID])).rows[0].n);
+    await assert.rejects(runtimeDb.transaction(async (exec) => {
+      const snapshot = (source as any).snapshot(map, 2);
+      const mutation = { kind: 'tsk.credential.snapshot.v1', tumblerId: snapshot.clientId, ...snapshot };
+      const mismatched = structuredClone(map); mismatched.sharedSecret = 'f'.repeat(64);
+      await (source as any).appendAndApply(exec, mutation,
+        [{ action: 'upsert', clientId: map.clientId, revision: 2, map: mismatched }]);
+    }), /does not bind the signed mutation/i);
+    assert.equal(Number((await a.query(
+      'SELECT count(*)::int n FROM tsk_outbox_rows WHERE stream_id=$1', [SID])).rows[0].n),
+    sourceRowsBeforeSecretMismatch);
+    await a.query(`GRANT UPDATE ON tsk_credential_maps TO ${RUNTIME_ROLE}`);
+    await assert.rejects(source.set(map.clientId, map), /boundary.*unsafe/i);
+    await a.query(`REVOKE UPDATE ON tsk_credential_maps FROM ${RUNTIME_ROLE}`);
+    await a.query(`DO $do$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='tsk_credential_inherited')
+      THEN CREATE ROLE tsk_credential_inherited NOLOGIN; END IF; END $do$`);
+    await a.query(`GRANT UPDATE ON tsk_credential_maps TO tsk_credential_inherited`);
+    await a.query(`GRANT tsk_credential_inherited TO ${RUNTIME_ROLE}`);
+    await assert.rejects(source.set(map.clientId, map), /boundary.*unsafe/i);
+    await a.query(`REVOKE tsk_credential_inherited FROM ${RUNTIME_ROLE}`);
+    await a.query(`REVOKE ALL ON tsk_credential_maps FROM tsk_credential_inherited`);
+    await a.query(`REVOKE EXECUTE ON FUNCTION tsk_verify_credential_mutation_key(text,text,text) FROM ${RUNTIME_ROLE}`);
+    await assert.rejects(source.set(map.clientId, map), /boundary.*unsafe/i);
+    await a.query(`GRANT EXECUTE ON FUNCTION tsk_verify_credential_mutation_key(text,text,text) TO ${RUNTIME_ROLE}`);
     await assert.rejects(runtimePool.query(
       'UPDATE tsk_credential_maps SET revision=revision+1 WHERE client_id=$1', [map.clientId]),
     /permission denied/);
@@ -115,14 +156,28 @@ async function main() {
     hiddenSecret.apiToken = 'must-not-be-accepted';
     await assert.rejects(source.set(map.clientId, hiddenSecret), /unsupported fields/);
     const counterUpdates = new Map([[hotp.segmentId, 1]]);
+    await a.query(`INSERT INTO tsk_credential_mutation_nonce(nonce,expires_at_ms)
+      SELECT 'expired_'||lpad(g::text,22,'0'),0 FROM generate_series(1,1001) g`);
     const counterUpdate = source.updateCounters(map.clientId, counterUpdates);
     counterUpdates.set(hotp.segmentId, 999);
     await counterUpdate;
+    assert.equal(Number((await a.query(
+      'SELECT count(*)::int n FROM tsk_credential_mutation_nonce WHERE expires_at_ms<0+1')).rows[0].n), 1);
     const consumed = await Promise.all([
       source.consumeCounter(map.clientId, hotp.segmentId, 1),
       source.consumeCounter(map.clientId, hotp.segmentId, 1),
     ]);
     assert.deepEqual(consumed.sort(), [false, true]);
+    assert.equal(Number((await a.query(
+      'SELECT count(*)::int n FROM tsk_credential_mutation_nonce WHERE expires_at_ms<0+1')).rows[0].n), 0);
+    await a.query(`INSERT INTO tsk_credential_mutation_nonce(nonce,expires_at_ms)
+      SELECT 'livecap_'||lpad(g::text,22,'0'),9007199254740991 FROM generate_series(1,10000) g`);
+    const rowsBeforeCapacity = Number((await a.query(
+      'SELECT count(*)::int n FROM tsk_outbox_rows WHERE stream_id=$1', [SID])).rows[0].n);
+    await assert.rejects(source.set(map.clientId, (await source.get(map.clientId))!), /nonce capacity/i);
+    assert.equal(Number((await a.query(
+      'SELECT count(*)::int n FROM tsk_outbox_rows WHERE stream_id=$1', [SID])).rows[0].n), rowsBeforeCapacity);
+    await a.query("DELETE FROM tsk_credential_mutation_nonce WHERE nonce LIKE 'livecap_%'");
     const current = (await source.get(map.clientId))!;
     const validationInput = {
       counterMatches: current.segments.filter((segment) => segment.type === 'hotp')
@@ -138,6 +193,23 @@ async function main() {
     assert.equal((await source.commitValidation(map.clientId, { counterMatches: [], usedAt: Date.now() })).ok, false);
     assert.equal(Number((await a.query(
       'SELECT count(*)::int n FROM tsk_outbox_rows WHERE stream_id=$1', [SID])).rows[0].n), beforeRejectedValidation);
+    const zeroCap = generateTumblerMap({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+    zeroCap.status = 'active'; zeroCap.maxRequests = 0;
+    await source.set(zeroCap.clientId, zeroCap);
+    const exhausted = generateTumblerMap({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+    exhausted.status = 'expiring'; exhausted.hotpRotationWarningCounters = 2;
+    const exhaustedHotp = exhausted.segments.find((segment) => segment.type === 'hotp')!;
+    exhaustedHotp.counter = 2_147_483_646;
+    await source.set(exhausted.clientId, exhausted);
+    assert.equal(await source.consumeCounter(exhausted.clientId, exhaustedHotp.segmentId, 2_147_483_646), true);
+    assert.equal((await source.get(exhausted.clientId))!.status, 'expired');
+    const beforeInvalidConsume = Number((await a.query(
+      'SELECT count(*)::int n FROM tsk_outbox_rows WHERE stream_id=$1', [SID])).rows[0].n);
+    assert.equal(await source.consumeCounter(exhausted.clientId, exhaustedHotp.segmentId, 2_147_483_647), false);
+    assert.equal(Number((await a.query(
+      'SELECT count(*)::int n FROM tsk_outbox_rows WHERE stream_id=$1', [SID])).rows[0].n), beforeInvalidConsume);
+    await assert.rejects(source.updateCounters(exhausted.clientId,
+      new Map([[exhaustedHotp.segmentId, 2_147_483_648]])), /counter/i);
     const replacement = generateTumblerMap({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
     replacement.label = 'agent:test'; replacement.status = 'active';
     assert.equal(await source.replaceCredential(map.clientId, replacement), true);
@@ -148,9 +220,9 @@ async function main() {
     const rows = (await a.query(`SELECT stream_id,source_epoch,sequence,fence_token::text,op_digest,
       mutation,head_prev,head_digest,head_key_id,head_alg,head_sig
       FROM tsk_outbox_rows WHERE stream_id=$1 ORDER BY sequence`, [SID])).rows;
-    assert.equal(rows.length, 6);
+    assert.equal(rows.length, 9);
     assert.equal(JSON.stringify(rows).includes(map.sharedSecret), false);
-    assert.deepEqual(rows.map((row) => Number(row.sequence)), [1, 2, 3, 4, 5, 6]);
+    assert.deepEqual(rows.map((row) => Number(row.sequence)), Array.from({ length: rows.length }, (_, i) => i + 1));
     assert.equal((await source.get(map.clientId))!.status, 'revoked');
     assert.equal(await source.get(replacement.clientId), null);
     const receiver = new PgTskCredentialReceiverCheckpoint(pb.db, SID, headVerifier,
@@ -184,9 +256,15 @@ async function main() {
     [SID, map.clientId]);
     assert.equal(await receiver.verifyAndApplyDelivered(inputs[0]!.record, inputs[0]!.head), 'reject-fork');
     await b.query('DELETE FROM tsk_credential_replica_maps WHERE stream_id=$1', [SID]);
-    const decisions = [];
-    for (const input of inputs) decisions.push(await receiver.verifyAndApplyDelivered(input.record, input.head));
-    assert.deepEqual(decisions, Array(6).fill('applied'));
+    assert.equal(await receiver.verifyAndApplyDelivered(inputs[0]!.record, inputs[0]!.head), 'applied');
+    await b.query(`UPDATE tsk_credential_replica_maps SET secret_digest=$3
+      WHERE stream_id=$1 AND client_id=$2`, [SID, map.clientId, 'f'.repeat(64)]);
+    assert.equal(await receiver.verifyAndApplyDelivered(inputs[1]!.record, inputs[1]!.head), 'reject-fork');
+    await b.query(`UPDATE tsk_credential_replica_maps SET secret_digest=$3
+      WHERE stream_id=$1 AND client_id=$2`, [SID, map.clientId, inputs[0]!.record.mutation.secretDigest]);
+    const decisions = ['applied'];
+    for (const input of inputs.slice(1)) decisions.push(await receiver.verifyAndApplyDelivered(input.record, input.head));
+    assert.deepEqual(decisions, Array(rows.length).fill('applied'));
     assert.equal(await receiver.verifyAndApplyDelivered(inputs[0]!.record, inputs[0]!.head), 'duplicate-ok');
     const replayedAtWrongEpoch = structuredClone(inputs[0]!);
     replayedAtWrongEpoch.record.sourceEpoch = 'evil-epoch';
@@ -209,7 +287,7 @@ async function main() {
     await assert.rejects(source.set(staleAttempt.clientId, staleAttempt), /revoked|grant digest|source lease/i);
     assert.equal(Number((await a.query(
       'SELECT count(*)::int n FROM tsk_outbox_rows WHERE stream_id=$1', [SID],
-    )).rows[0].n), 6);
+    )).rows[0].n), rows.length);
     const oversized = structuredClone(map);
     oversized.label = 'x'.repeat(300_000);
     await assert.rejects(source.set(oversized.clientId, oversized), /exceeds (?:262144 bytes|CANON_MAX_STRING_BYTES)/);
@@ -219,7 +297,7 @@ async function main() {
     await a.query('ALTER TABLE tsk_outbox_source_checkpoint ADD COLUMN drifted boolean');
     await assert.rejects(source.list(), /attestation failed/);
     await a.query('ALTER TABLE tsk_outbox_source_checkpoint DROP COLUMN drifted');
-    console.log(JSON.stringify({ checks: 27, records: 6, duplicateEffects: 0,
+    console.log(JSON.stringify({ checks: 47, records: rows.length, duplicateEffects: 0,
       staleWritesAdmitted: 0, secretBearingReplicaRecords: 0 }));
   } finally { if (runtimePool) await runtimePool.end(); await a.end(); await b.end(); }
 }
