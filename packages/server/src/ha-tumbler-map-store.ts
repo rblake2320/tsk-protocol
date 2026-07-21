@@ -47,7 +47,7 @@ const EXPOSED_ROUTINES = ['tsk_apply_credential_mutation', 'tsk_prepare_credenti
   'tsk_credential_ticket_context', 'tsk_verify_credential_mutation_key'] as const;
 const GOVERNED_ROUTINES = [...EXPOSED_ROUTINES, 'tsk_credential_constant_time_equal'] as const;
 /** Compiled PG16 catalog pin. Re-pin only through a reviewed schema change. */
-export const CREDENTIAL_AUTHORITY_MANIFEST_DIGEST = 'c207b21cd263ee68228754572593230eade3895091577e544797d512c0349696';
+export const CREDENTIAL_AUTHORITY_MANIFEST_DIGEST = 'c24a259460dd46531df48bcf06b674850e4805f2a698c8ee6b55c23d8383c02b';
 const MAP_KEYS = ['checksum', 'clientId', 'createdAt', 'expiresAt', 'hotpRotationWarningCounters',
   'keyLength', 'label', 'lastUsedAt', 'maxRequests', 'requestCount', 'rotationWarningRequests',
   'segments', 'sharedSecret', 'status', 'version'] as const;
@@ -614,15 +614,19 @@ async function credentialAuthorityManifest(exec: PgExecutor): Promise<string> {
        JOIN pg_catalog.pg_roles owner ON owner.oid=p.proowner
       WHERE ns.nspname=pg_catalog.current_schema() AND p.proname=ANY($1)`,
     [[...GOVERNED_ROUTINES]])).rows;
+  const authorityOwners = new Set([...rel, ...routines].map((row) => String(row.owner)));
+  if (authorityOwners.size !== 1) {
+    throw new ContractValidationError('credential authority objects do not have one consistent owner');
+  }
   const present = rel.map((row) => String(row.t)).sort();
   const lines = [`PRESENT|${present.join(',')}|n=${present.length}`,
-    ...rel.map((r) => `R|${r.t}|${r.relkind}|${r.relpersistence}|${r.relrowsecurity}|${r.relforcerowsecurity}|${r.owner}`),
+    ...rel.map((r) => `R|${r.t}|${r.relkind}|${r.relpersistence}|${r.relrowsecurity}|${r.relforcerowsecurity}|authority-owner`),
     ...cols.map((r) => `C|${r.table_name}|${r.ordinal_position}|${r.column_name}|${r.data_type}|${r.is_nullable}|${r.d}`),
     ...cons.map((r) => `K|${r.t}|${r.contype}|${r.def}`),
     ...idx.map((r) => `I|${r.t}|${r.n}|${r.def}`),
     ...trg.map((r) => `T|${r.t}|${r.n}|${r.tgenabled}|${r.def}`),
     ...pol.map((r) => `P|${r.t}|${r.n}|${r.permissive}|${r.roles}|${r.cmd}|${r.qual}|${r.wc}`),
-    ...routines.map((r) => `F|${r.n}|${r.args}|${r.prosecdef}|${JSON.stringify(r.proconfig)}|${r.owner}|${r.def}`)];
+    ...routines.map((r) => `F|${r.n}|${r.args}|${r.prosecdef}|${JSON.stringify(r.proconfig)}|authority-owner|${r.def}`)];
   lines.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
   return ['Vcredential_authority/1', ...lines].join('\n');
 }

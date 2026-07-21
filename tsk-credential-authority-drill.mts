@@ -297,7 +297,11 @@ async function main() {
     await a.query('ALTER TABLE tsk_outbox_source_checkpoint ADD COLUMN drifted boolean');
     await assert.rejects(source.list(), /attestation failed/);
     await a.query('ALTER TABLE tsk_outbox_source_checkpoint DROP COLUMN drifted');
-    console.log(JSON.stringify({ checks: 47, records: rows.length, duplicateEffects: 0,
+    const authorityOwner = String((await a.query('SELECT current_user AS role')).rows[0].role);
+    await a.query('ALTER TABLE tsk_credential_maps OWNER TO tsk_credential_inherited');
+    await assert.rejects(source.list(), /consistent owner/);
+    await a.query(`ALTER TABLE tsk_credential_maps OWNER TO ${authorityOwner}`);
+    console.log(JSON.stringify({ checks: 48, records: rows.length, duplicateEffects: 0,
       staleWritesAdmitted: 0, secretBearingReplicaRecords: 0 }));
   } finally { if (runtimePool) await runtimePool.end(); await a.end(); await b.end(); }
 }
