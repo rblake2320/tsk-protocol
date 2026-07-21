@@ -3,7 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { ContractValidationError } from './ha-outbox-contract.js';
 import type { PgExecutor, PgTransactor } from './tsk-hotp-outbox-pg.js';
 import type { FencingStore, FenceRecord } from './promotion.js';
-import { verifySourceFrozenReceipt, verifyBFinalizedReceipt, signLeaseGrant } from './tsk-source-fence.js';
+import { verifySourceFrozenReceipt, verifyBFinalizedReceipt, signLeaseGrant, verifyLeaseGrant } from './tsk-source-fence.js';
 import type { SourceFrozenReceipt, BFinalizedReceipt, SourceVerifyKeyResolver, LeaseGrant } from './tsk-source-fence.js';
 import type { KeyObject } from 'node:crypto';
 
@@ -32,7 +32,7 @@ import type { KeyObject } from 'node:crypto';
 
 // ── bounds + grammars (H9: exhaust safe integers; enforce id/digest grammar) ──
 
-export const CONTROL_SCHEMA_VERSION = 1;
+export const CONTROL_SCHEMA_VERSION = 2;
 const MAX_EPOCH = 2 ** 40;                    // >> any real promotion count, safely < 2^53
 const MAX_SEQ = 2 ** 40;
 const MAX_MS = 8.64e15;                        // JS Date range bound
@@ -150,6 +150,12 @@ const leaseMsg = (s: string, leaseId: string, holder: string, epoch: number, seq
   frame('tsk_ha_lease/v1', s, leaseId, holder, epoch, seq, status, maxExpiryMs, grantCmd, prev, digest);
 const cutMsg = (s: string, epoch: number, commandId: string, seqno: number, phase: string, evidence: string | null, prev: string | null, digest: string): Buffer =>
   frame('tsk_ha_cutover/v1', s, epoch, commandId, seqno, phase, evidence, prev, digest);
+const activationMsg = (s: string, commandId: string, epoch: number, targetKeyId: string,
+  receiptDigest: string, activationSeq: number, priorTargetGrantDigest: string | null,
+  grantDigest: string, prevActivationDigest: string | null, activationDigest: string): Buffer =>
+  frame('tsk_ha_source_activation/v2', s, commandId, epoch, targetKeyId,
+    receiptDigest, activationSeq, priorTargetGrantDigest, grantDigest,
+    prevActivationDigest, activationDigest);
 const claimDigest = (r: FenceRecord): string => sha256hex(frame('tsk_ha_claim/v1', r.nodeId, r.fenceEpoch, r.expiresAt, r.commandId));
 
 /** (§3.4 + Erratum-R4) Cross-check the Redis claim vs the SIGNED witness floor before a fence.
@@ -312,10 +318,34 @@ CREATE TABLE IF NOT EXISTS tsk_ha_source_activation (
   epoch bigint NOT NULL CHECK (epoch >= 1),
   b_key_id text NOT NULL,
   b_receipt_digest text NOT NULL CHECK (b_receipt_digest ~ '^[0-9a-f]{64}$'),
+  activation_seq bigint NOT NULL CHECK (activation_seq >= 1),
+  prior_target_grant_digest text CHECK (prior_target_grant_digest IS NULL OR prior_target_grant_digest ~ '^[0-9a-f]{64}$'),
+  prev_activation_digest text CHECK (prev_activation_digest IS NULL OR prev_activation_digest ~ '^[0-9a-f]{64}$'),
+  activation_digest text NOT NULL CHECK (activation_digest ~ '^[0-9a-f]{64}$'),
   grant_digest text NOT NULL CHECK (grant_digest ~ '^[0-9a-f]{64}$'),
   grant_json text NOT NULL,
   guard_key_id text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
+  guard_signature text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS tsk_ha_source_activation_history (
+  stream_id text NOT NULL,
+  command_id text NOT NULL,
+  epoch bigint NOT NULL CHECK (epoch >= 1),
+  b_key_id text NOT NULL,
+  b_receipt_digest text NOT NULL CHECK (b_receipt_digest ~ '^[0-9a-f]{64}$'),
+  activation_seq bigint NOT NULL CHECK (activation_seq >= 1),
+  prior_target_grant_digest text CHECK (prior_target_grant_digest IS NULL OR prior_target_grant_digest ~ '^[0-9a-f]{64}$'),
+  prev_activation_digest text CHECK (prev_activation_digest IS NULL OR prev_activation_digest ~ '^[0-9a-f]{64}$'),
+  activation_digest text NOT NULL CHECK (activation_digest ~ '^[0-9a-f]{64}$'),
+  grant_digest text NOT NULL CHECK (grant_digest ~ '^[0-9a-f]{64}$'),
+  grant_json text NOT NULL,
+  guard_key_id text NOT NULL,
+  guard_signature text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (stream_id, activation_seq),
+  UNIQUE (stream_id, command_id),
+  UNIQUE (stream_id, activation_digest)
 )
 `.trim();
 
@@ -323,7 +353,7 @@ export const HA_CONTROL_TABLES = [
   'tsk_ha_schema', 'tsk_ha_provisioning', 'tsk_ha_provisioning_history',
   'tsk_ha_epoch_witness', 'tsk_ha_epoch_witness_history', 'tsk_ha_lease_head',
   'tsk_ha_lease_history', 'tsk_ha_cutover_head', 'tsk_ha_cutover_history',
-  'tsk_ha_source_activation',
+  'tsk_ha_source_activation', 'tsk_ha_source_activation_history',
 ] as const;
 const MANIFEST_TABLES = [...HA_CONTROL_TABLES]; // attest the FULL set incl tsk_ha_schema (R4-H3)
 // (R8-HIGH) governed tables locked ACCESS SHARE per critical tx to freeze the catalog against a
@@ -420,7 +450,7 @@ async function controlManifest(exec: PgExecutor): Promise<string> {
  *  defeat the pin). To RE-PIN after an intentional DDL change, run provisionControlSchema against
  *  the new schema in an OFFLINE, code-reviewed step and copy the digest reported in the attestation
  *  error ("live catalog digest <D>") into this constant. */
-export const HA_CONTROL_MANIFEST_DIGEST = 'a80069c514d7450a5a2f4482d99952f9b2920ee876d14f51ba5d516ff79eefab';
+export const HA_CONTROL_MANIFEST_DIGEST = '769640c27b3310d391f61d9afff36935be84c02ef885ef4a1537a58b6b81612a';
 
 /** Attest the live catalog hashes to the pinned expected manifest (fail-closed, NOT TOFU). */
 async function attestControlSchema(exec: PgExecutor): Promise<string> {
@@ -527,10 +557,9 @@ export interface HaControlPolicy {
    *  (CREATE/ALTER/DROP) on this schema — then drift is impossible under the operating identity and
    *  the per-op re-attestation is redundant. */
   attestEveryTx?: boolean;
-  /** (PR2c) The CONFIGURED source-guard signing authority used by activateSource() to mint B's promoted
+  /** The CONFIGURED source-guard signing authority used by activateSource() to mint the promoted
    *  source lease. Held by the control as deployment configuration — NOT accepted per call — so no caller
-   *  can supply an arbitrary (evil) key. `activationTtlMs` is the (deterministic, config-fixed) lease
-   *  horizon of the genesis promotion grant. Absent → activateSource() is disabled (throws). */
+   *  can supply an arbitrary key. `activationTtlMs` is the config-fixed lease horizon. */
   sourceGuard?: { keyId: string; privateKey: import('node:crypto').KeyObject | string; activationTtlMs: number };
 }
 export interface FenceEvidence {
@@ -1086,23 +1115,32 @@ export class HaControlFencing {
   }
 
   /**
-   * (§5 / PR2c) GOVERNED B source-authority activation. After the cutover is ACTIVE, mint B's unforgeable
-   * SOURCE capability: a GUARD-signed (ed25519) lease grant that lets B become the writable source AT THE
+   * GOVERNED source-authority activation. After the cutover is ACTIVE, mint the target's unforgeable
+   * SOURCE capability: a GUARD-signed (ed25519) lease grant that lets it become writable AT THE
    * PROMOTED EPOCH. This binds the grant to the ratified promotion — it requires the ACTIVE head for this
-   * exact command/epoch, re-verifies B's BFinalizedReceipt, and asserts the ACTIVE evidence pins the SAME B
-   * (bReceiptDigest + n + bSystemId). The grant is at leaseEpoch == targetEpoch (the exact new epoch), holder
-   * == B, commandId == the cutover command — so B installs a GENESIS lease at epoch N's successor while the old
-   * A, still at the prior epoch with a revoked lease, is denied. B verifies the grant with the guard PUBLIC
-   * key (unforgeable); control never sees B's private material. Returns the signed grant for B to install.
+   * exact command/epoch, re-verifies the target's BFinalizedReceipt, and asserts the ACTIVE evidence pins
+   * that same target. A never-used target receives a genesis lease. A returning target must supply its exact
+   * signed, terminal lease high-water; the returned grant appends to that chain. Activation itself advances
+   * a signed append-only control history, so an older activation head cannot be replayed. Control never sees
+   * the target's private material.
    */
-  async activateSource(streamId: string, commandId: string, targetEpoch: number, bReceipt: BFinalizedReceipt, bResolver: SourceVerifyKeyResolver): Promise<LeaseGrant> {
+  async activateSource(streamId: string, commandId: string, targetEpoch: number,
+    bReceipt: BFinalizedReceipt, bResolver: SourceVerifyKeyResolver,
+    priorTargetLease: LeaseGrant | null = null): Promise<LeaseGrant> {
     const s = vId(streamId, STREAM_ID_RE, 'streamId');
     const cmd = vId(commandId, ID_RE, 'commandId');
     const target = vInt(targetEpoch, 'targetEpoch', 1, MAX_EPOCH);
     const guard = this.sourceGuard;
     if (!guard) throw new ContractValidationError('activateSource requires a configured policy.sourceGuard signing authority');
     const br = frozenSnapshot(bReceipt);
+    const prior = priorTargetLease === null ? null : frozenSnapshot(priorTargetLease);
     verifyBFinalizedReceipt(bResolver, br);
+    if (prior !== null) {
+      verifyLeaseGrant(bResolver, prior);
+      if (prior.streamId !== s) throw new FenceAuthorityQuarantineError('prior target lease streamId != cutover stream — quarantine');
+      if (prior.leaseStatus !== 'revoked') throw new FenceAuthorityQuarantineError('prior target lease must be terminally revoked — quarantine');
+      if (prior.leaseEpoch >= target) throw new FenceAuthorityQuarantineError('prior target lease epoch must precede the promoted epoch — quarantine');
+    }
     if (br.commandId !== cmd) throw new FenceAuthorityQuarantineError('BFinalizedReceipt commandId != cutover command — quarantine');
     if (br.streamId !== s) throw new FenceAuthorityQuarantineError('BFinalizedReceipt streamId != cutover stream — quarantine');
     if (br.epoch !== target - 1) throw new FenceAuthorityQuarantineError(`BFinalizedReceipt epoch ${br.epoch} != targetEpoch-1 (${target - 1}) — quarantine`);
@@ -1116,26 +1154,78 @@ export class HaControlFencing {
       // the receipt must be EXACTLY the one ratified into the ACTIVE head, and the holder == that ratified B.
       if (rd.bReceiptDigest !== br.receiptDigest || rd.n !== br.n || rd.bSystemId !== br.bSystemId || rd.bKeyId !== br.bKeyId) throw new FenceAuthorityQuarantineError('BFinalizedReceipt is not the one ratified into the ACTIVE head — quarantine');
       if (rd.bKeyId !== holder) throw new FenceAuthorityQuarantineError('holder != the ratified B identity — quarantine');
-      // (recovery / idempotency) if this stream was already activated, REHYDRATE the byte-identical signed
-      // grant — a retry can NEVER mint a different or conflicting grant.
-      const existing = (await exec.query('SELECT command_id, epoch, b_key_id, b_receipt_digest, grant_json FROM tsk_ha_source_activation WHERE stream_id=$1 FOR UPDATE', [s])).rows[0];
-      if (existing) {
-        if (String(existing.command_id) !== cmd || vInt(existing.epoch, 'epoch', 1, MAX_EPOCH) !== target || String(existing.b_key_id) !== holder || String(existing.b_receipt_digest) !== br.receiptDigest) {
-          throw new FenceAuthorityQuarantineError('a DIFFERENT source activation already exists for this stream — quarantine (no conflicting re-grant)');
+      const cols = 'command_id,epoch,b_key_id,b_receipt_digest,activation_seq,prior_target_grant_digest,prev_activation_digest,activation_digest,grant_digest,grant_json,guard_key_id,guard_signature';
+      const headRow = (await exec.query(`SELECT ${cols} FROM tsk_ha_source_activation WHERE stream_id=$1 FOR UPDATE`, [s])).rows[0];
+      const historyRows = (await exec.query(`SELECT ${cols} FROM tsk_ha_source_activation_history WHERE stream_id=$1 ORDER BY activation_seq`, [s])).rows;
+      const linked = (row: Record<string, unknown>): Linked => {
+        const seq = vInt(row.activation_seq, 'activation_seq', 1, MAX_SEQ);
+        const prev = vNullableDigest(row.prev_activation_digest, 'prev_activation_digest');
+        const digest = vDigest(row.activation_digest, 'activation_digest');
+        const priorDigest = vNullableDigest(row.prior_target_grant_digest, 'prior_target_grant_digest');
+        const grantDigest = vDigest(row.grant_digest, 'grant_digest');
+        const epoch = vInt(row.epoch, 'activation epoch', 1, MAX_EPOCH);
+        const command = vId(row.command_id, ID_RE, 'activation command_id');
+        const targetKey = vId(row.b_key_id, KEY_ID_RE, 'activation target key');
+        const receiptDigest = vDigest(row.b_receipt_digest, 'activation receipt digest');
+        const digMsg = activationMsg(s, command, epoch, targetKey, receiptDigest,
+          seq, priorDigest, grantDigest, prev, '');
+        return { seq, prev, digest, keyId: String(row.guard_key_id),
+          sig: String(row.guard_signature), digMsg,
+          sigMsg: activationMsg(s, command, epoch, targetKey, receiptDigest,
+            seq, priorDigest, grantDigest, prev, digest) };
+      };
+      if (headRow) verifyChain(this.resolver, historyRows.map(linked), linked(headRow));
+      else if (historyRows.length !== 0) throw new FenceAuthorityQuarantineError('activation history exists without a head — quarantine');
+
+      const priorDigest = prior?.grantDigest ?? null;
+      if (headRow && String(headRow.command_id) === cmd) {
+        if (vInt(headRow.epoch, 'epoch', 1, MAX_EPOCH) !== target ||
+            String(headRow.b_key_id) !== holder ||
+            String(headRow.b_receipt_digest) !== br.receiptDigest ||
+            vNullableDigest(headRow.prior_target_grant_digest, 'prior_target_grant_digest') !== priorDigest) {
+          throw new FenceAuthorityQuarantineError('source activation retry does not byte-bind the current activation — quarantine');
         }
-        return JSON.parse(String(existing.grant_json)) as LeaseGrant; // rehydrated, byte-identical
+        const existingGrant = JSON.parse(String(headRow.grant_json)) as LeaseGrant;
+        verifyLeaseGrant(bResolver, existingGrant);
+        if (existingGrant.grantDigest !== String(headRow.grant_digest)) throw new FenceAuthorityQuarantineError('stored source activation grant digest mismatch — quarantine');
+        return existingGrant;
       }
-      // FIRST activation: GUARD-sign B's genesis source lease at the promoted epoch using the CONFIGURED
-      // authority (deterministic tuple; holder == ratified B; expiry = configured horizon read in-tx).
+      const currentActivationSeq = headRow ? vInt(headRow.activation_seq, 'activation_seq', 1, MAX_SEQ) : 0;
+      const currentActivationEpoch = headRow ? vInt(headRow.epoch, 'activation epoch', 1, MAX_EPOCH) : 0;
+      if (target !== currentActivationEpoch + 1) throw new FenceAuthorityQuarantineError(`source activation epoch ${target} must follow current ${currentActivationEpoch} exactly — quarantine`);
+
+      // A never-used target receives a genesis grant. A returning target supplies its exact signed,
+      // terminal lease high-water, so the new grant appends to that target's immutable chain.
       const nowMs = await this.controlNowMs(exec);
       const grantObj = signLeaseGrant(guard.keyId, guard.privateKey, {
         streamId: s, leaseEpoch: target, leaseStatus: 'active', holderNodeId: holder,
-        leaseId, commandId: cmd, leaseExpiresAtMs: Math.min(nowMs + guard.activationTtlMs, MAX_MS), leaseGrantSeq: 1, prevGrantDigest: null,
+        leaseId, commandId: cmd, leaseExpiresAtMs: Math.min(nowMs + guard.activationTtlMs, MAX_MS),
+        leaseGrantSeq: (prior?.leaseGrantSeq ?? 0) + 1,
+        prevGrantDigest: priorDigest,
       });
-      // bind the exact genesis grant tuple/digest into durable signed activation evidence.
-      affectedOne(await exec.query(
-        'INSERT INTO tsk_ha_source_activation (stream_id, command_id, epoch, b_key_id, b_receipt_digest, grant_digest, grant_json, guard_key_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-        [s, cmd, target, holder, br.receiptDigest, grantObj.grantDigest, JSON.stringify(grantObj), guard.keyId]), 'source activation insert');
+      const activationSeq = currentActivationSeq + 1;
+      const prevActivationDigest = headRow ? vDigest(headRow.activation_digest, 'activation_digest') : null;
+      const digMsg = activationMsg(s, cmd, target, holder, br.receiptDigest,
+        activationSeq, priorDigest, grantObj.grantDigest, prevActivationDigest, '');
+      const activationDigest = digestOf(digMsg);
+      const activationSignature = this.signer.sign(activationMsg(s, cmd, target, holder,
+        br.receiptDigest, activationSeq, priorDigest, grantObj.grantDigest,
+        prevActivationDigest, activationDigest));
+      const values = [s, cmd, target, holder, br.receiptDigest, activationSeq,
+        priorDigest, prevActivationDigest, activationDigest, grantObj.grantDigest,
+        JSON.stringify(grantObj), this.signer.id, activationSignature];
+      await exec.query(
+        'INSERT INTO tsk_ha_source_activation_history (stream_id,command_id,epoch,b_key_id,b_receipt_digest,activation_seq,prior_target_grant_digest,prev_activation_digest,activation_digest,grant_digest,grant_json,guard_key_id,guard_signature) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
+        values);
+      if (!headRow) {
+        affectedOne(await exec.query(
+          'INSERT INTO tsk_ha_source_activation (stream_id,command_id,epoch,b_key_id,b_receipt_digest,activation_seq,prior_target_grant_digest,prev_activation_digest,activation_digest,grant_digest,grant_json,guard_key_id,guard_signature) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)', values),
+        'source activation head insert');
+      } else {
+        affectedOne(await exec.query(
+          'UPDATE tsk_ha_source_activation SET command_id=$2,epoch=$3,b_key_id=$4,b_receipt_digest=$5,activation_seq=$6,prior_target_grant_digest=$7,prev_activation_digest=$8,activation_digest=$9,grant_digest=$10,grant_json=$11,guard_key_id=$12,guard_signature=$13,updated_at=now() WHERE stream_id=$1 AND activation_digest=$14',
+          [...values, prevActivationDigest]), 'source activation head forward-CAS');
+      }
       return grantObj;
     });
   }

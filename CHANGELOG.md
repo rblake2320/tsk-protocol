@@ -34,6 +34,12 @@
 
 ### Security
 
+- Made source activation a signed, append-only head/history chain so repeated
+  promotions on one stream cannot overwrite or replay an earlier activation.
+- Added governed return-site activation: a returning target supplies its exact
+  signed, terminal lease high-water and receives the next guard-signed lease
+  transition instead of an un-installable second genesis grant. Control schema
+  version 2 is intentionally required for this history-bearing layout.
 - Closed numeric HOTP rollover paths across core derivation, lookahead, atomic
   stores, client persistence, and replica input. Wire v1 now commits MAX only as
   an exhausted sentinel and never writes or derives MAX+1.

@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign as edSign } from 'node:crypto';
 import pg from 'pg';
 import { Redis } from 'ioredis';
+import { MemoryFencingStore } from './packages/server/dist/promotion.js';
 import {
   TSK_OUTBOX_PG_SCHEMA, TSK_SOURCE_LEASE_SCHEMA, TSK_SOURCE_WITNESS_SCHEMA, TSK_RECEIVER_SCHEMA, TSK_RECEIVER_TABLES, provisionSchemaVersion,
   PgTskDurableOutbox, NodePostgresTransactor, ContractValidationError,
@@ -34,10 +35,12 @@ if (!A_URL || !B_URL || !CTRL_URL || !REDIS_URL) throw new Error('need A + B + c
 const SCHEMA = 'public'; const HOUR = 3_600_000;
 const GUARD_KEY = 'guard-1'; const guard = generateKeyPairSync('ed25519');
 const SOURCE_KEY = 'source-1'; const source = generateKeyPairSync('ed25519');
+const B_SOURCE_KEY = 'source-b-1'; const bSource = generateKeyPairSync('ed25519');
 const HEAD_KEY = 'k1'; const headKp = generateKeyPairSync('ed25519');
 const BHEAD_KEY = 'kb'; const bHeadKp = generateKeyPairSync('ed25519'); // B signs its OWN new heads
 const B_KEY = 'b-1'; const bKp = generateKeyPairSync('ed25519');
-const resolver: SourceVerifyKeyResolver = { resolve: (k) => (k === GUARD_KEY ? guard.publicKey : k === SOURCE_KEY ? source.publicKey : k === HEAD_KEY ? headKp.publicKey : k === BHEAD_KEY ? bHeadKp.publicKey : k === B_KEY ? bKp.publicKey : null) };
+const A_KEY = 'a-return-1'; const aKp = generateKeyPairSync('ed25519');
+const resolver: SourceVerifyKeyResolver = { resolve: (k) => (k === GUARD_KEY ? guard.publicKey : k === SOURCE_KEY ? source.publicKey : k === B_SOURCE_KEY ? bSource.publicKey : k === HEAD_KEY ? headKp.publicKey : k === BHEAD_KEY ? bHeadKp.publicKey : k === B_KEY ? bKp.publicKey : k === A_KEY ? aKp.publicKey : null) };
 const CTRL_KEY = 'ctrl-1'; const ctrlSecret = Buffer.alloc(32, 0x2b);
 const ctrlResolver: GuardKeyResolver = { resolve: (kid) => (kid === CTRL_KEY ? ctrlSecret : null) };
 const POLICY: HaControlPolicy = { minClaimRemainingMs: 5_000, sourceGuard: { keyId: GUARD_KEY, privateKey: guard.privateKey, activationTtlMs: 3_600_000 } };
@@ -51,6 +54,24 @@ const sanitizer: HotpMutationSanitizer = {
 let passed = 0;
 async function check(name: string, fn: () => Promise<void>) { await fn(); passed++; console.log(`  ok - ${name}`); }
 
+async function installVerifiedHistory(pool: pg.Pool, streamId: string,
+  bundle: SourceExportBundle, fromSequence = 1): Promise<void> {
+  for (const record of bundle.historyChunks.flatMap((chunk) => chunk.records)) {
+    if (record.sequence < fromSequence) continue;
+    const mutation = JSON.parse(record.payload) as { tumblerId: string; counter: number };
+    await pool.query(
+      `INSERT INTO tsk_outbox_rows
+       (stream_id,source_epoch,sequence,fence_token,op_digest,tumbler_id,hotp_counter,
+        mutation,head_prev,head_digest,head_key_id,head_alg,head_sig,acked_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now())`,
+      [streamId, record.sourceEpoch, record.sequence, record.fenceToken,
+        record.opDigest, mutation.tumblerId, mutation.counter, mutation,
+        record.prevHeadDigest, record.headDigest, record.keyId, record.alg,
+        record.signature],
+    );
+  }
+}
+
 async function main() {
   console.log('# TSK PR2c governed B source-authority activation (B originates N+1; old A denied)');
   const aPool = new pg.Pool({ connectionString: A_URL, max: 4 }); aPool.on('error', () => {});
@@ -59,8 +80,9 @@ async function main() {
   const aTx = new NodePostgresTransactor(aPool as never) as unknown as PgTransactor;
   const bTx = new NodePostgresTransactor(bPool as never) as unknown as PgTransactor;
   const cTx = new NodePostgresTransactor(cPool as never) as unknown as PgTransactor;
-  const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2, lazyConnect: false }); redis.on('error', () => {});
-  await redis.flushdb();
+  const redis = REDIS_URL === 'memory://' ? null : new Redis(REDIS_URL, { maxRetriesPerRequest: 2, lazyConnect: false });
+  redis?.on('error', () => {});
+  await redis?.flushdb();
 
   const OUTBOX_DROP = 'DROP TABLE IF EXISTS tsk_outbox_rows, tsk_outbox_applied, tsk_outbox_fence, tsk_outbox_source_checkpoint, tsk_outbox_receiver_checkpoint, tsk_outbox_publisher_lease, tsk_outbox_quarantine, tsk_hotp_consumed, tsk_outbox_stream_halted, tsk_outbox_meta, tsk_source_lease, tsk_source_lease_history, tsk_source_witness, tsk_source_witness_history CASCADE';
   const installSource = async (pool: pg.Pool) => {
@@ -69,6 +91,7 @@ async function main() {
     for (const s of TSK_SOURCE_LEASE_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
     for (const s of TSK_SOURCE_WITNESS_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await pool.query(s);
   };
+  await aPool.query(`DROP TABLE IF EXISTS ${TSK_RECEIVER_TABLES.join(', ')} CASCADE`);
   await installSource(aPool);
   // B is BOTH a receiver (staged generation) AND, after activation, a source (outbox) — install both catalogs.
   await bPool.query(`DROP TABLE IF EXISTS ${TSK_RECEIVER_TABLES.join(', ')} CASCADE`);
@@ -105,6 +128,9 @@ async function main() {
   const bReceipt = await stageAndFinalizeReceiverGeneration(bTx, SCHEMA, await assertReceiverReady(bTx, SCHEMA), 'gen-1', bundle, dual, ropts);
   verifyBFinalizedReceipt(resolver, bReceipt);
   const headAtN = bReceipt.signedHeadDigestAtN;
+  // The independently replayed receiver generation is now materialized as B's source ledger.
+  // These exact signed rows are what the next freeze/export replays; no history is synthesized.
+  await installVerifiedHistory(bPool, SID, bundle);
 
   // ── control drives the cutover to ACTIVE ──
   const ctlReady = await provisionControlSchema(cTx as never, SCHEMA);
@@ -115,7 +141,7 @@ async function main() {
   await ctl.beginPromotionIntent(SID, CMD, TARGET);
   await ctl.bindSourceFenced(SID, CMD, TARGET, frozen, resolver);
   await ctl.writeLease({ streamId: SID, leaseId: 'l1', holderNodeId: 'A', epoch: 0, status: 'revoked', grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'a2' });
-  const store = new RedisFencingStore(redis, 'tsk:fence:' + SID);
+  const store = redis ? new RedisFencingStore(redis, 'tsk:fence:' + SID) : new MemoryFencingStore();
   const proof: FenceProof = { safetyMarginMs: 0, claimExpiresAtMs: (await ctlNow()) + HOUR };
   await ctl.advanceEpoch(SID, CMD, TARGET, 'Bnode', store, proof);
   await ctl.markImporting(SID, CMD, TARGET);
@@ -123,6 +149,7 @@ async function main() {
   await ctl.activate(SID, CMD, TARGET);
 
   let bGrant: Awaited<ReturnType<typeof ctl.activateSource>>;
+  let bOb: InstanceType<typeof PgTskDurableOutbox>;
   await check('activateSource mints a GUARD-signed governed B lease at the PROMOTED epoch via the CONFIGURED authority, holder==ratified B, durable + rehydratable', async () => {
     bGrant = await ctl.activateSource(SID, CMD, TARGET, bReceipt, resolver); // no per-call key; guard from config
     verifyLeaseGrant(resolver, bGrant); // B independently verifies with the guard PUBLIC key (unforgeable)
@@ -142,7 +169,7 @@ async function main() {
     await bTx.transaction((exec) => installLeaseGrant(exec, resolver, bGrant));
     const bReadySrc = await assertSourceFenceReady(bTx, SCHEMA, resolver, { streamId: SID, holderNodeId: bGrant.holderNodeId, leaseId: bGrant.leaseId, grantDigest: bGrant.grantDigest });
     const bREADY = await provisionSchemaVersion(bTx, SCHEMA);
-    const bOb = new PgTskDurableOutbox(bTx, bREADY, { streamId: SID, sanitizer, signer: bSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready: bReadySrc });
+    bOb = new PgTskDurableOutbox(bTx, bREADY, { streamId: SID, sanitizer, signer: bSigner, maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation' }, { resolver, controlToASkewBoundMs: 0, ready: bReadySrc });
     const res = await bOb.withOutboxTx((wtx) => bOb.appendInTx(wtx, { streamId: SID, rawMutation: { tumblerId: 'T9', counter: 1 }, fenceToken: BigInt(TARGET) }));
     assert.equal(res.head.sequence, N + 1, 'B appended the NEXT sequence (N+1)');
     assert.equal(res.head.prevHeadDigest, headAtN, 'B chained N+1 from the verified head@N');
@@ -157,7 +184,133 @@ async function main() {
     assert.equal(aMax, N, 'A wrote nothing past N — the old source is fenced');
   });
 
+  // ── governed B -> A return failback on the SAME stream ──
+  const RETURN_CMD = 'return-2'; const RETURN_TARGET = 2;
+  let bRev: ReturnType<typeof signLeaseGrant>;
+  let returnedGrant: Awaited<ReturnType<typeof ctl.activateSource>>;
+  let returnReceipt: Awaited<ReturnType<typeof stageAndFinalizeReceiverGeneration>>;
+  await check('B freezes N+1 and A independently replays the complete signed ledger for return failback', async () => {
+    bRev = signLeaseGrant(GUARD_KEY, guard.privateKey, {
+      streamId: SID, leaseEpoch: TARGET, leaseStatus: 'revoked',
+      holderNodeId: bGrant.holderNodeId, leaseId: bGrant.leaseId,
+      commandId: RETURN_CMD, leaseExpiresAtMs: bGrant.leaseExpiresAtMs,
+      leaseGrantSeq: 2, prevGrantDigest: bGrant.grantDigest,
+    });
+    await bTx.transaction((exec) => installLeaseGrant(exec, resolver, bRev));
+    const frozenB = await emitSourceFrozenReceipt(bTx, SCHEMA, {
+      sourceKeyId: B_SOURCE_KEY, sourcePrivateKey: bSource.privateKey,
+      leaseResolver: resolver, headResolver: resolver,
+    }, { streamId: SID, commandId: RETURN_CMD, epoch: TARGET, sourceNodeId: B_KEY });
+    assert.equal(frozenB.n, N + 1);
+    const builtB = await buildSourceExportManifest(bTx, SCHEMA, {
+      streamId: SID, epoch: TARGET, commandId: RETURN_CMD, sourceNodeId: B_KEY,
+    }, {
+      sourceKeyId: B_SOURCE_KEY, sourcePrivateKey: bSource.privateKey,
+      sanitizer, leaseResolver: resolver, headResolver: resolver,
+      frozenReceipt: frozenB, maxChunkItems: 4,
+    });
+    const dualB = guardCountersignSourceExport(builtB.bundle, builtB.manifest, {
+      guardKeyId: GUARD_KEY, guardPrivateKey: guard.privateKey,
+      sanitizer, sourceManifestResolver: resolver, headResolver: resolver,
+      frozenResolver: resolver, frozenReceipt: frozenB,
+      expectedCommandId: RETURN_CMD,
+    });
+    for (const s of TSK_RECEIVER_SCHEMA.split(';').map((x) => x.trim()).filter(Boolean)) await aPool.query(s);
+    returnReceipt = await stageAndFinalizeReceiverGeneration(
+      aTx, SCHEMA, await assertReceiverReady(aTx, SCHEMA), 'gen-return-2',
+      builtB.bundle, dualB, {
+        sanitizer, sourceResolver: resolver, guardResolver: resolver,
+        headResolver: resolver, frozenResolver: resolver, bVerifyResolver: resolver,
+        frozenReceipt: frozenB, expectedCommandId: RETURN_CMD,
+        bKeyId: A_KEY, bPrivateKey: aKp.privateKey,
+      },
+    );
+    verifyBFinalizedReceipt(resolver, returnReceipt);
+    assert.equal(returnReceipt.n, N + 1);
+
+    await ctl.writeLease({ streamId: SID, leaseId: bGrant.leaseId,
+      holderNodeId: bGrant.holderNodeId, epoch: TARGET, status: 'active',
+      grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'b-active-2' });
+    await ctl.beginPromotionIntent(SID, RETURN_CMD, RETURN_TARGET);
+    await ctl.bindSourceFenced(SID, RETURN_CMD, RETURN_TARGET, frozenB, resolver);
+    await ctl.writeLease({ streamId: SID, leaseId: bGrant.leaseId,
+      holderNodeId: bGrant.holderNodeId, epoch: TARGET, status: 'revoked',
+      grantedMaxExpiryMs: (await ctlNow()) - 5_000, grantCommandId: 'b-revoke-2' });
+    await ctl.advanceEpoch(SID, RETURN_CMD, RETURN_TARGET, 'Anode', store,
+      { safetyMarginMs: 0, claimExpiresAtMs: (await ctlNow()) + HOUR });
+    await ctl.markImporting(SID, RETURN_CMD, RETURN_TARGET);
+    await ctl.markReady(SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver);
+    await ctl.activate(SID, RETURN_CMD, RETURN_TARGET);
+    returnedGrant = await ctl.activateSource(
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, rev,
+    );
+    verifyLeaseGrant(resolver, returnedGrant);
+    assert.equal(returnedGrant.holderNodeId, A_KEY);
+    assert.equal(returnedGrant.leaseEpoch, RETURN_TARGET);
+    assert.equal(returnedGrant.leaseGrantSeq, 3);
+    assert.equal(returnedGrant.prevGrantDigest, rev.grantDigest);
+
+    // A already owns 1..N. Import only B's independently verified signed N+1 row.
+    await installVerifiedHistory(aPool, SID, builtB.bundle, N + 1);
+    await aPool.query('UPDATE tsk_outbox_fence SET fence_token=$2 WHERE stream_id=$1', [SID, RETURN_TARGET]);
+    await aPool.query(
+      'UPDATE tsk_outbox_source_checkpoint SET sequence=$2,head_digest=$3 WHERE stream_id=$1',
+      [SID, N + 1, returnReceipt.signedHeadDigestAtN],
+    );
+    await aTx.transaction((exec) => installLeaseGrant(exec, resolver, returnedGrant));
+  });
+
+  await check('returned A originates N+2 while old B and replayed activation inputs fail closed', async () => {
+    const returnedReady = await assertSourceFenceReady(aTx, SCHEMA, resolver, {
+      streamId: SID, holderNodeId: returnedGrant.holderNodeId,
+      leaseId: returnedGrant.leaseId, grantDigest: returnedGrant.grantDigest,
+    });
+    const returnedOutbox = new PgTskDurableOutbox(aTx, await provisionSchemaVersion(aTx, SCHEMA), {
+      streamId: SID, sanitizer, signer,
+      maxPendingRows: 100_000, backpressure: 'fail-authoritative-mutation',
+    }, { resolver, controlToASkewBoundMs: 0, ready: returnedReady });
+    const result = await returnedOutbox.withOutboxTx((wtx) => returnedOutbox.appendInTx(wtx, {
+      streamId: SID, rawMutation: { tumblerId: 'T10', counter: 2 },
+      fenceToken: BigInt(RETURN_TARGET),
+    }));
+    assert.equal(result.head.sequence, N + 2);
+    assert.equal(result.head.prevHeadDigest, returnReceipt.signedHeadDigestAtN);
+    await assert.rejects(() => bOb.withOutboxTx((wtx) => bOb.appendInTx(wtx, {
+      streamId: SID, rawMutation: { tumblerId: 'T9', counter: 2 }, fenceToken: 1n,
+    })), /revoked|not writable|lease|fence/i);
+    await assert.rejects(() => ctl.activateSource(
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, g,
+    ), /prior target lease must be terminally revoked|does not byte-bind/i);
+    await assert.rejects(() => ctl.activateSource(
+      SID, CMD, TARGET, bReceipt, resolver,
+    ), /epoch|activation|quarantine/i);
+    const retry = await ctl.activateSource(
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, rev,
+    );
+    assert.deepEqual(retry, returnedGrant);
+    const activationCols = 'command_id,epoch,b_key_id,b_receipt_digest,activation_seq,' +
+      'prior_target_grant_digest,prev_activation_digest,activation_digest,grant_digest,' +
+      'grant_json,guard_key_id,guard_signature';
+    await cPool.query(
+      `UPDATE tsk_ha_source_activation h SET (${activationCols}) =
+       (SELECT ${activationCols} FROM tsk_ha_source_activation_history
+         WHERE stream_id=$1 AND activation_seq=1) WHERE h.stream_id=$1`, [SID],
+    );
+    await assert.rejects(() => ctl.activateSource(
+      SID, RETURN_CMD, RETURN_TARGET, returnReceipt, resolver, rev,
+    ), /head is not the latest|replay|rollback/i);
+    await cPool.query(
+      `UPDATE tsk_ha_source_activation h SET (${activationCols}) =
+       (SELECT ${activationCols} FROM tsk_ha_source_activation_history
+         WHERE stream_id=$1 AND activation_seq=2) WHERE h.stream_id=$1`, [SID],
+    );
+    const activationRows = Number((await cPool.query(
+      'SELECT count(*) AS n FROM tsk_ha_source_activation_history WHERE stream_id=$1', [SID],
+    )).rows[0].n);
+    assert.equal(activationRows, 2, 'A->B and B->A activations are append-only history');
+  });
+
   console.log(`\n# ${passed} PR2c B-source-activation checks passed`);
-  await aPool.end(); await bPool.end(); await cPool.end(); await redis.quit();
+  await aPool.end(); await bPool.end(); await cPool.end(); await redis?.quit();
 }
 main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
