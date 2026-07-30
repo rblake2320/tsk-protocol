@@ -137,7 +137,9 @@ export function generateClientId(): string {
  * Uses rejection sampling to eliminate modulo bias.
  */
 export function secureRandomInt(max: number): number {
-  if (max <= 0) throw new RangeError('max must be > 0');
+  if (!Number.isSafeInteger(max) || max <= 0 || max > 0x100000000) {
+    throw new RangeError('max must be a positive safe integer no greater than 2^32');
+  }
   if (max === 1) return 0;
   // Rejection sampling: discard values in the biased tail
   const limit = 0x100000000 - (0x100000000 % max);
