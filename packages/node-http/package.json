@@ -1,0 +1,20 @@
+{
+  "name": "@tsk/node-http",
+  "version": "0.1.0",
+  "description": "Secure Node.js HTTP integration and credential administration for TSK",
+  "type": "module",
+  "engines": { "node": ">=24 <25" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "import": "./dist/index.js", "types": "./dist/index.d.ts" } },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build --prefix ../.."
+  },
+  "dependencies": {
+    "@tsk/server": "^0.1.0",
+    "@tsk/bpc-bridge": "^0.1.0"
+  },
+  "devDependencies": { "@types/node": "^24.13.3", "typescript": "^5.4.0" }
+}
