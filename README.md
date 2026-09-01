@@ -92,3 +92,5 @@ version: `1`.
 For customer deployment requirements and the supported single-node topology,
 see [docs/CUSTOMER_DEPLOYMENT.md](docs/CUSTOMER_DEPLOYMENT.md). For BPC
 composition, see [docs/BPC_INTEGRATION.md](docs/BPC_INTEGRATION.md).
+Release and marketing claims are governed by
+[docs/PRODUCT_CLAIMS.md](docs/PRODUCT_CLAIMS.md).

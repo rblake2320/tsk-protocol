@@ -23,6 +23,9 @@ import {
 import { FileTumblerStore } from '../packages/server/src/file-store.js';
 
 const PORT         = 3200;
+// The demo has intentionally simplified lifecycle routes for browser exercises.
+// Keep it loopback-only so it cannot accidentally become a network service.
+const HOST         = '127.0.0.1';
 const DEMO_DIR     = dirname(fileURLToPath(import.meta.url));
 const EVENT_LOG    = join(DEMO_DIR, 'analytics.ndjson');
 const SERVER_START = Date.now();
@@ -397,8 +400,8 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 process.on('uncaughtException',  (err)    => console.error('[CRITICAL] Uncaught:', err));
 process.on('unhandledRejection', (reason) => console.error('[CRITICAL] Rejection:', reason));
 
-server.listen(PORT, () => {
-  console.log(`\nTSK Demo Server running on http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`\nTSK Demo Server running on http://${HOST}:${PORT}`);
   console.log('');
   console.log('  POST /tsk/provision               Provision a new client');
   console.log('  POST /tsk/revoke                  Revoke a client');

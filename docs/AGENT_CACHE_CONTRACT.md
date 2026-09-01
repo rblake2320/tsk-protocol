@@ -4,7 +4,7 @@ Status: normative behavioral contract for agent credential cache implementations
 
 ## Purpose
 
-The agent credential cache is a patent-linked fail-closed recovery primitive. It
+The agent credential cache is a fail-closed recovery primitive. It
 allows a previously bound agent to restore bounded authorization from a locally
 sealed cache when the live authority is unavailable, without turning outage
 handling into an authorization bypass.
@@ -152,6 +152,9 @@ implementations conformant with that shared contract.
 """
 ```
 
-## Patent Claim Language
+## Design description (not patent claim language)
 
 > Cached credential material is encrypted using the OS-provided user-scoped data protection API, restricting decryption to the identity that performed the original binding, and the cache verifier fails closed with named errors when policy, permissions, binding, credential version, checkpoint, TTL, or tamper checks fail.
+
+This describes the implementation only. It makes no assertion of novelty,
+patentability, ownership, filing status, or freedom to operate.

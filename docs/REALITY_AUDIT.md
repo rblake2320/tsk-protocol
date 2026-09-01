@@ -17,6 +17,14 @@ fencing could not be exercised because its required service was absent, and the
 included demo has deliberately unsafe operational defaults. Docs, parked code,
 and unexecuted browser UI remain UNKNOWN rather than being counted as real.
 
+### Post-audit remediation
+
+The audit found that the former `live-demo.mts` printed generated secrets and
+implemented an independent demonstration algorithm. It has since been replaced
+with a redacted demonstration that imports `@tsk/core`; see
+[PRODUCT_CLAIMS.md](PRODUCT_CLAIMS.md) for the current claim boundary. This
+report retains the original findings as historical audit evidence.
+
 ## Decision gates
 
 1. Is `demo/server.ts` strictly local demonstration code, or is it expected to
