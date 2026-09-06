@@ -19,7 +19,7 @@ interface PackageManifest {
   };
 }
 
-const workspaces = ['core', 'server', 'client-sdk', 'bpc-bridge'];
+const workspaces = ['core', 'server', 'client-sdk', 'bpc-bridge', 'node-http'];
 let passed = 0;
 
 function assert(condition: unknown, message: string): asserts condition {

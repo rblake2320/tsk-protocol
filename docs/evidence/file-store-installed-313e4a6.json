@@ -1,0 +1,173 @@
+{
+  "ok": true,
+  "steps": [
+    {
+      "name": "commit",
+      "exit": 0
+    },
+    {
+      "name": "build",
+      "exit": 0
+    },
+    {
+      "name": "pack",
+      "exit": 0
+    },
+    {
+      "name": "install",
+      "exit": 0
+    },
+    {
+      "name": "regression",
+      "exit": 0
+    },
+    {
+      "name": "authority",
+      "exit": 0
+    }
+  ],
+  "scope": "installed npm package; real filesystem rename failures; single writer only",
+  "commit": "313e4a69c43b8139d37cbe1fd0a02f2e4605db27",
+  "packages": [
+    {
+      "name": "tsk-core-0.1.0.tgz",
+      "sha256": "df262ea2b61362ea5d00770150b64056f48d585191975fd8ba7d7ea996e4c6e8"
+    },
+    {
+      "name": "tsk-server-0.1.0.tgz",
+      "sha256": "6ef0f652da405d721e7f2d8a16fd94cf3faba7823870ec98d1431a88a751234b"
+    }
+  ],
+  "installed_file_store_sha256": "f472412a8ab65ca6f91a6d5c178c000cce6866c4c83ee149ccc10ac3fdc65635",
+  "regression": {
+    "mode": "regression",
+    "failure": "EPERM",
+    "liveCounter": 7,
+    "diskCounter": 7,
+    "liveRequestCount": 0,
+    "diskRequestCount": 0,
+    "reopenedCounter": 8,
+    "reopenedRequestCount": 1,
+    "mutationCases": [
+      {
+        "operation": "set",
+        "failedWritePreservedAuthority": true
+      },
+      {
+        "operation": "delete",
+        "failedWritePreservedAuthority": true
+      },
+      {
+        "operation": "updateCounters",
+        "failedWritePreservedAuthority": true
+      },
+      {
+        "operation": "consumeCounter",
+        "failedWritePreservedAuthority": true
+      },
+      {
+        "operation": "replaceCredential",
+        "failedWritePreservedAuthority": true
+      }
+    ],
+    "ok": true
+  },
+  "authority": {
+    "ok": true,
+    "cases": [
+      {
+        "name": "reserved/empty identity rejected: __proto__",
+        "ok": true
+      },
+      {
+        "name": "reserved/empty identity rejected: constructor",
+        "ok": true
+      },
+      {
+        "name": "reserved/empty identity rejected: prototype",
+        "ok": true
+      },
+      {
+        "name": "reserved/empty identity rejected: ",
+        "ok": true
+      },
+      {
+        "name": "two instances cannot both consume same counter",
+        "ok": true
+      },
+      {
+        "name": "persisted count equals one accepted validation",
+        "ok": true
+      },
+      {
+        "name": "two processes produce exactly one acceptance",
+        "ok": true
+      },
+      {
+        "name": "two-process persisted count is one",
+        "ok": true
+      },
+      {
+        "name": "missing-created rejected without altering file",
+        "ok": true
+      },
+      {
+        "name": "string-created rejected without altering file",
+        "ok": true
+      },
+      {
+        "name": "negative-counter rejected without altering file",
+        "ok": true
+      },
+      {
+        "name": "missing-counter rejected without altering file",
+        "ok": true
+      },
+      {
+        "name": "invalid-status rejected without altering file",
+        "ok": true
+      },
+      {
+        "name": "identity-mismatch rejected without altering file",
+        "ok": true
+      },
+      {
+        "name": "overlapping-segment rejected without altering file",
+        "ok": true
+      },
+      {
+        "name": "nan-age rejected",
+        "ok": true
+      },
+      {
+        "name": "infinite-age rejected",
+        "ok": true
+      },
+      {
+        "name": "zero-capacity rejected",
+        "ok": true
+      },
+      {
+        "name": "direct commit rechecks TTL",
+        "ok": true
+      },
+      {
+        "name": "expired map never returned",
+        "ok": true
+      },
+      {
+        "name": "retained lock refuses operation without breaking ownership",
+        "ok": true
+      }
+    ],
+    "children": [
+      {
+        "accepted": true
+      },
+      {
+        "accepted": false,
+        "error": "TSK_HOTP_REPLAY_DETECTED"
+      }
+    ]
+  }
+}

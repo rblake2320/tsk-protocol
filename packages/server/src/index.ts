@@ -1,4 +1,5 @@
 export * from './store.js';
+export * from './file-store.js';
 export * from './provisioner.js';
 export * from './anomaly.js';
 export * from './middleware.js';

@@ -18,10 +18,12 @@ not a public issue.
 | Numeric HOTP exhaustion | `hotp-exhaustion-suite.mts` | Wire v1 uses a project-specific 31-bit counter ceiling; MAX is an exhausted sentinel, not a usable derivation input. |
 | Authentication header ambiguity | `ultra-bridge-test.mts` | Client, key, and version headers must each contain exactly one value; duplicates fail before validation commits state. |
 | Restart persistence | `client-lifecycle-suite.mts` | File store is single-process and relies on host file protections. |
+| Local file-store write integrity | `scripts/verify_file_store_install.py`, `file-store-authority-suite.mjs`, `file-store-failure-suite.mts`, `file-store-identity-suite.mjs` | Fresh-install checks cover Windows sharing-lock write failures, two-instance/two-process counter competition, malformed-state/configuration, TTL, and own-key membership against inherited object names. Does not cover power failure, network filesystems, hostile local filesystem mutation, high sustained load, or safe automatic resolution of abandoned locks; store failures after a possible commit remain outcome-unknown. |
 | HA replication | `npm run test:ha` | Signed ordered streams fail closed on gaps; metadata-only replicas and volatile checkpoints cannot qualify for promotion. |
 | Writer fencing | `failover-promotion-suite.mts`, `redis-fencing-integration.mts` | Every authority must use `FencedTumblerStore`; Redis durability/topology remains deployment-specific. |
 | Cross-protocol identity and scope | `ultra-bridge-test.mts`, `bpc-compatibility-suite.mts` | Requires a fresh, frozen BPC 0.2 `AuthSnapshot`; rejects legacy mutable results, ghost/shadow evidence, non-closed scopes, malformed identifiers, resolver failures, and claimed-identity mismatches before TSK state consumption. Application authorization remains separate. CI tests the exact BPC commit pinned in the workflow. |
 | Bridge dependency failure | `ultra-bridge-test.mts` | BPC callback, identity resolver, and TSK verifier/store exceptions return explicit denials; durable store recovery and availability remain deployment responsibilities. |
+| HTTP administration authentication | `node-http-suite.mts` | `@tsk/node-http` requires a deployment-owned operator principal (`AdminPrincipal.operatorId`) supplied through the deployment's own authentication boundary (OIDC/mTLS/etc.); it does not return the shared secret in its lifecycle HTTP response. |
 | Package entry integrity | `package-boundary-suite.mts`, `npm run test:pack` | Verifies declared local entry points and dry-run tarball contents; it does not establish registry provenance or consumer deployment policy. |
 
 Passing finite tests establishes only the named propositions and inputs. It does
@@ -67,6 +69,11 @@ not prove the absence of other attacks.
     BPC stage only. The deployment must durably record the final Ultra decision
     and downstream authorization result; this bridge does not provide a
     transactional cross-protocol audit store.
+12. Supply `@tsk/node-http`'s operator-authentication callback and
+    credential-delivery callback from the deployment's own authentication and
+    secret-distribution infrastructure. This adapter does not implement
+    operator identity itself and does not transmit the shared secret over its
+    lifecycle HTTP response.
 
 ## Known Limits
 
@@ -85,6 +92,11 @@ not prove the absence of other attacks.
 - Wire v1 intentionally uses a JavaScript-safe project counter ceiling rather
   than RFC 4226's full 8-byte moving-factor range. A wider counter requires a
   new wire/storage version and migration; it cannot be enabled in place.
+- Local file-store evidence covers the tested failure classes only (see the
+  table above); power failure, network filesystems, hostile local filesystem
+  mutation, high sustained load, and abandoned-lock resolution are not covered,
+  and a store outcome after a possible commit that cannot be confirmed remains
+  reported as unknown, not as success.
 
 Historical findings remain in
 `parked/legacy-redteam/Adversarial_Break_Report.md`; superseded claims,

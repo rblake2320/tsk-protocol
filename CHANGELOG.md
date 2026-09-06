@@ -31,6 +31,10 @@
   events through built package entry points.
 - Made client lifecycle evidence counts deterministic while still asserting
   every generated counter-based segment.
+- Added `@tsk/node-http`, a Node HTTP authentication and lifecycle-
+  administration adapter. It requires deployment-owned operator authentication
+  and a secure credential-delivery callback, and does not return the shared
+  secret in its lifecycle HTTP response (`npm run test:http`).
 
 ### Security
 
@@ -71,6 +75,13 @@
 - Removed unused Jest dependencies.
 - Corrected layout, checksum, FIPS, Impact Level, device identity, and compliance
   descriptions to match implemented evidence.
+- Closed a real Windows file-store race: a failed rename could previously
+  advance the live counter while disk retained the prior value, two cached
+  instances could accept the same counter, and missing timestamps could bypass
+  TTL. Writes now publish a validated candidate only after fsync/rename, and an
+  exclusive file transaction reloads authority before every operation. Own-key
+  membership prevents inherited object names from bypassing capacity or
+  appearing as stored clients.
 
 ### Evidence
 
@@ -83,6 +94,16 @@
 - Added named concurrent-cap, replacement, application-error, restart, and
   no-confirmation cases.
 - Added repository CI/typecheck/HA commands to the release gate.
+- Added an installed-package Windows file-store evidence gate
+  (`scripts/verify_file_store_install.py`) exercising real sharing-lock write
+  failures, two-instance/two-process counter competition, and malformed-
+  state/TTL checks against a fresh npm tarball install; CI retains the Windows
+  evidence artifacts and runs a Linux authority counterpart. This does not
+  cover power failure, network filesystems, hostile local filesystem
+  mutation, high sustained load, or automatic resolution of abandoned locks,
+  and store failures after a possible commit remain outcome-unknown -- the
+  BPC HTTP adapter preserves that distinction with a non-retryable unknown
+  result.
 
 ## 0.1.0
 

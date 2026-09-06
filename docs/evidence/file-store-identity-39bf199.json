@@ -1,0 +1,92 @@
+{
+  "ok": true,
+  "steps": [
+    {
+      "name": "commit",
+      "exit": 0
+    },
+    {
+      "name": "build",
+      "exit": 0
+    },
+    {
+      "name": "pack",
+      "exit": 0
+    },
+    {
+      "name": "install",
+      "exit": 0
+    },
+    {
+      "name": "identity",
+      "exit": 0
+    }
+  ],
+  "scope": "installed package; inherited-key boundary only",
+  "commit": "39bf199b25b17ca861dbe987517e9b9dee67a946",
+  "packages": [
+    {
+      "name": "tsk-core-0.1.0.tgz",
+      "sha256": "df262ea2b61362ea5d00770150b64056f48d585191975fd8ba7d7ea996e4c6e8"
+    },
+    {
+      "name": "tsk-server-0.1.0.tgz",
+      "sha256": "a5151bbfdffe4c16ce771181919c8b27c3cf1eff9c2a411bec92211a84ea0ac8"
+    }
+  ],
+  "installed_file_store_sha256": "b5aa8b072ea4db96bdb3e4ae80b3bde4125870d4f57421d2f35f1bf27aa8fcf4",
+  "identity": {
+    "ok": true,
+    "cases": [
+      {
+        "id": "constructor",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "__defineGetter__",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "__defineSetter__",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "hasOwnProperty",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "__lookupGetter__",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "__lookupSetter__",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "isPrototypeOf",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "propertyIsEnumerable",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "toString",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "valueOf",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "__proto__",
+        "absentAndCapacityGuarded": true
+      },
+      {
+        "id": "toLocaleString",
+        "absentAndCapacityGuarded": true
+      }
+    ],
+    "unusualOwnKeyWorks": true
+  }
+}

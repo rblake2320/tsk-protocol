@@ -10,8 +10,8 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w packages/core && npm run build -w packages/server && npm run build -w packages/client-sdk && npm run build -w packages/bpc-bridge",
-    "test": "npx tsx test-suite.mts && npx tsx crypto-boundary-suite.mts && npx tsx lifecycle-suite.mts && npx tsx hotp-exhaustion-suite.mts && npx tsx client-lifecycle-suite.mts && npx tsx store-durability-suite.mts && npx tsx anomaly-integration-suite.mts && npx tsx attack-suite.mts && npx tsx adversarial-proof.mts && npx tsx ultra-bridge-test.mts && npx tsx runtime-capture-suite.mts",
+    "build": "npm run build -w packages/core && npm run build -w packages/server && npm run build -w packages/client-sdk && npm run build -w packages/bpc-bridge && npm run build -w packages/node-http",
+    "test": "npx tsx test-suite.mts && npx tsx crypto-boundary-suite.mts && npx tsx lifecycle-suite.mts && npx tsx hotp-exhaustion-suite.mts && npx tsx client-lifecycle-suite.mts && npx tsx store-durability-suite.mts && npx tsx anomaly-integration-suite.mts && npx tsx attack-suite.mts && npx tsx adversarial-proof.mts && npx tsx ultra-bridge-test.mts && npx tsx runtime-capture-suite.mts && npm run test:http",
     "test:ha": "npx tsx replicating-tumbler-suite.mts && npx tsx replica-receiver-suite.mts && npx tsx failover-promotion-suite.mts",
     "test:redis": "npx tsx redis-fencing-integration.mts",
     "test:postgres:ha": "npm run build -w packages/server && npx tsx tsk-hotp-outbox-integration.mts",
@@ -33,7 +33,8 @@
     "test:two-node": "npm run build -w packages/server && npx tsx tsk-two-node-drill.mts",
     "test:pack": "npm run build && npx tsx package-boundary-suite.mts && npm pack --dry-run --workspaces",
     "test:bpc-compat": "npm run build && npx tsx bpc-compatibility-suite.mts",
-    "typecheck": "tsc --noEmit --allowImportingTsExtensions -p tsconfig.json"
+    "typecheck": "tsc --noEmit --allowImportingTsExtensions -p tsconfig.json",
+    "test:http": "npx tsx node-http-suite.mts"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
