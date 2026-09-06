@@ -112,10 +112,17 @@ export async function verifyUltraRequest(
   bpcVerify: (req: TSKRequestData) => Promise<BPCLikeResult>,
   options: UltraVerifyOptions,
 ): Promise<UltraVerifyResult> {
+  // The BPC verifier, binding resolver, and TSK verifier are awaited. Snapshot
+  // all supported mutable request material before the first await so a caller
+  // or trusted integration callback cannot switch the authenticated identity
+  // between those checks. TSKRequestData currently contains headers only;
+  // scalar values are copied and header arrays are copied then frozen.
+  const request = immutableRequest(req);
+
   // --- Layers 1-5: BPC ---
   let bpcResult: BPCLikeResult;
   try {
-    bpcResult = await bpcVerify(req);
+    bpcResult = await bpcVerify(request);
   } catch {
     return {
       ok: false,
@@ -158,7 +165,7 @@ export async function verifyUltraRequest(
   // verification. TSK validation commits replay-sensitive counter/lifecycle
   // state on success, so a missing or mismatched binding must never reach it.
   const pairId = bpcResult.pairId;
-  const claimedClientId = singleHeader(req, 'x-tsk-client-id');
+  const claimedClientId = singleHeader(request, 'x-tsk-client-id');
   if (!pairId || !claimedClientId) {
     return {
       ok: false,
@@ -201,7 +208,7 @@ export async function verifyUltraRequest(
   // --- Layers 6-7: TSK ---
   let tskResult: TSKVerifyResult;
   try {
-    tskResult = await verifyTSKRequest(req, options.tskStore, options.tskConfig);
+    tskResult = await verifyTSKRequest(request, options.tskStore, options.tskConfig);
   } catch {
     return {
       ok: false,
@@ -257,6 +264,19 @@ export async function verifyUltraRequest(
 function singleHeader(req: TSKRequestData, name: string): string | undefined {
   const value = req.headers[name];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function immutableRequest(req: TSKRequestData): TSKRequestData {
+  const headers: Record<string, string | string[] | undefined> = {};
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) {
+      const copied = [...value];
+      Object.freeze(copied);
+      headers[name] = copied;
+    } else headers[name] = value;
+  }
+  Object.freeze(headers);
+  return Object.freeze({ headers });
 }
 
 /**

@@ -498,6 +498,62 @@ console.log('\n[12] Dependency Exception Containment');
     `Got: ${response.statusCode} ${response.payload}`);
   assert('HTTP adapter response exposes no thrown text', !response.payload.includes('secret'), `Got: ${response.payload}`);
 }
+
+// ── Group 13: one immutable request snapshot spans every awaited dependency ──
+console.log('\n[13] Immutable Request Binding Across Awaits');
+{
+  const { store: mutationStore, provisioner: mutationProvisioner } = createTSKServer();
+  const provisionedA = await mutationProvisioner.provision({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+  const provisionedB = await mutationProvisioner.provision({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+  if (!provisionedA.ok || !provisionedA.tumblerMap || !provisionedB.ok || !provisionedB.tumblerMap) {
+    throw new Error('mutation fixture provision failed');
+  }
+  const mapA = provisionedA.tumblerMap;
+  const mapB = provisionedB.tumblerMap;
+  const sharedRequest: TSKRequestData = { headers: {
+    'x-tsk-client-id': mapA.clientId,
+    'x-tsk-key': generateKeyFromMap(mapA),
+    'x-tsk-version': '1',
+  } };
+  const beforeB = JSON.stringify(await mutationStore.get(mapB.clientId));
+  const mutationResult = await verifyUltraRequest(sharedRequest, bpcPass('pair-mutation-a'), {
+    tskStore: mutationStore,
+    identityBinding: {
+      resolve: async pair => {
+        if (pair !== 'pair-mutation-a') return null;
+        // Reproduce the reviewed shared-request mutation while resolution is
+        // awaited. The bridge must still verify the original A snapshot.
+        sharedRequest.headers = {
+          'x-tsk-client-id': mapB.clientId,
+          'x-tsk-key': generateKeyFromMap(mapB),
+          'x-tsk-version': '1',
+        };
+        return mapA.clientId;
+      },
+    },
+  });
+  const afterB = JSON.stringify(await mutationStore.get(mapB.clientId));
+  assert('resolver-side request mutation cannot redirect TSK verification',
+    mutationResult.ok && mutationResult.clientId === mapA.clientId, `Got: ${JSON.stringify(mutationResult)}`);
+  assert('mutation negative leaves alternate client map byte-equivalent', beforeB === afterB, 'Client B map changed');
+  assert('mutation negative consumes the original bound client once',
+    (await mutationStore.get(mapA.clientId))?.requestCount === 1, 'Client A request count was not one');
+
+  const { store: positiveStore, provisioner: positiveProvisioner } = createTSKServer();
+  const positiveProvisioned = await positiveProvisioner.provision({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+  if (!positiveProvisioned.ok || !positiveProvisioned.tumblerMap) throw new Error('immutable positive fixture provision failed');
+  const positiveMap = positiveProvisioned.tumblerMap;
+  const positive = await verifyUltraRequest({ headers: {
+    'x-tsk-client-id': positiveMap.clientId,
+    'x-tsk-key': generateKeyFromMap(positiveMap),
+    'x-tsk-version': '1',
+  } }, bpcPass('pair-immutable-positive'), {
+    tskStore: positiveStore,
+    identityBinding: { resolve: async pair => pair === 'pair-immutable-positive' ? positiveMap.clientId : null },
+  });
+  assert('unchanged bound request remains accepted once',
+    positive.ok && (await positiveStore.get(positiveMap.clientId))?.requestCount === 1, `Got: ${JSON.stringify(positive)}`);
+}
 // ─── Results ──────────────────────────────────────────────────────────────────
 
 const passed = results.filter(r => r.passed).length;
