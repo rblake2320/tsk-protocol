@@ -60,6 +60,8 @@ export interface UltraVerifyResult {
   clientId?: string;
   layers: ('bpc' | 'tsk')[];
   error?: string;
+  /** Dependency may have committed; no automatic replay. */
+  outcomeUnknown?: true;
   /** Closed BPC scope captured in the immutable authorization snapshot. */
   scope?: BPCScope;
 }
@@ -125,11 +127,15 @@ export async function verifyUltraRequest(
   bpcVerify: (req: TSKRequestData) => Promise<BPCLikeResult>,
   options: UltraVerifyOptions,
 ): Promise<UltraVerifyResult> {
+  let request: TSKRequestData;
+  try { request = immutableRequest(req); }
+  catch { return { ok: false, error: 'BPC: REQUEST_INVALID', layers: [] }; }
+
   let untrustedResult: unknown;
   try {
-    untrustedResult = await bpcVerify(req);
+    untrustedResult = await bpcVerify(request);
   } catch {
-    return { ok: false, error: 'BPC: CALLBACK_EXCEPTION', layers: [] };
+    return { ok: false, error: 'BPC: CALLBACK_EXCEPTION', outcomeUnknown: true, layers: [] };
   }
 
   let pairId: string;
@@ -182,7 +188,7 @@ export async function verifyUltraRequest(
     return {
       ok: false,
       pairId,
-      error: 'IDENTITY_BINDING_RESOLVER_EXCEPTION',
+      error: 'IDENTITY_BINDING_RESOLVER_EXCEPTION', outcomeUnknown: true,
       layers: ['bpc'],
     };
   }
@@ -197,7 +203,7 @@ export async function verifyUltraRequest(
 
   let claimedClientId: string | undefined;
   try {
-    claimedClientId = getSingleHeader(req, TSK_HEADERS.CLIENT_ID);
+    claimedClientId = getSingleHeader(request, TSK_HEADERS.CLIENT_ID);
   } catch {
     return {
       ok: false,
@@ -226,12 +232,12 @@ export async function verifyUltraRequest(
 
   let tskResult: TSKVerifyResult;
   try {
-    tskResult = await verifyTSKRequest(req, options.tskStore, options.tskConfig);
+    tskResult = await verifyTSKRequest(request, options.tskStore, options.tskConfig);
   } catch {
     return {
       ok: false,
       pairId,
-      error: 'TSK: VERIFIER_EXCEPTION',
+      error: 'TSK: VERIFIER_EXCEPTION', outcomeUnknown: true,
       layers: ['bpc'],
     };
   }
@@ -249,7 +255,7 @@ export async function verifyUltraRequest(
       ok: false,
       pairId,
       clientId: tskResult.clientId,
-      error: 'IDENTITY_BINDING_POSTCHECK_MISMATCH',
+      error: 'IDENTITY_BINDING_POSTCHECK_MISMATCH', outcomeUnknown: true,
       layers: ['bpc', 'tsk'],
     };
   }
@@ -261,6 +267,26 @@ export async function verifyUltraRequest(
     layers: ['bpc', 'tsk'],
     scope,
   };
+}
+
+function immutableRequest(req: TSKRequestData): TSKRequestData {
+  if (!req || typeof req !== 'object') throw new TypeError('request must be an object');
+  const sourceHeaders: unknown = req.headers;
+  if (!sourceHeaders || typeof sourceHeaders !== 'object' || Array.isArray(sourceHeaders)) {
+    throw new TypeError('request headers must be an object');
+  }
+  const headers: Record<string, string | string[] | undefined> = {};
+  for (const [name, value] of Object.entries(sourceHeaders)) {
+    if (Array.isArray(value)) {
+      if (!value.every(item => typeof item === 'string')) throw new TypeError('request header array must contain strings');
+      const copied = [...value];
+      Object.freeze(copied);
+      headers[name] = copied;
+    } else if (typeof value === 'string' || value === undefined) headers[name] = value;
+    else throw new TypeError('request header must be a string');
+  }
+  Object.freeze(headers);
+  return Object.freeze({ headers });
 }
 
 /** The seven bounded security properties composed by the Ultra bridge. */

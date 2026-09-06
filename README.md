@@ -60,6 +60,7 @@ See [SECURITY.md](SECURITY.md), [WHY.md](WHY.md), and [PARKED.md](PARKED.md).
 - `@tsk/server`: stores, verification, lifecycle, replacement, HA, and promotion.
 - `@tsk/client-sdk`: client key generation and persistent counter handling.
 - `@tsk/bpc-bridge`: composed BPC/TSK verification with identity binding.
+- `@tsk/node-http`: Node HTTP authentication and secure lifecycle adapter.
 
 ## HTTP Adapter Contract
 
@@ -97,3 +98,10 @@ than a floating branch.
 
 Current package version: `0.1.0` (beta reference implementation). Wire protocol
 version: `1`.
+
+For customer deployment requirements and the supported single-node topology,
+see [docs/CUSTOMER_DEPLOYMENT.md](docs/CUSTOMER_DEPLOYMENT.md). For BPC
+composition, see [docs/BPC_INTEGRATION.md](docs/BPC_INTEGRATION.md). For local
+file-store evidence, see [docs/FILE_STORE_EVIDENCE.md](docs/FILE_STORE_EVIDENCE.md).
+Release and marketing claims are governed by
+[docs/PRODUCT_CLAIMS.md](docs/PRODUCT_CLAIMS.md).

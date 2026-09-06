@@ -95,7 +95,9 @@ that pin requires a reviewed repository change and a new compatibility run.
 BPC 0.2 returns a runtime-frozen point-in-time `AuthSnapshot`; the bridge does
 not accept the earlier mutable `pair` object or direct-scope fallbacks. It also
 requires a fresh snapshot, matching result/snapshot pair IDs, a legitimate
-kind, and one closed coarse scope: `read`, `read-write`, or `admin`.
+kind, and one closed coarse scope: `read`, `read-write`, or `admin`. A missing,
+wildcard, namespaced, or contradictory scope is a broken composition contract
+and is rejected on the same basis.
 
 The verified pair is resolved to an expected TSK client before TSK verification
 and compared with the claimed client header. Only then may TSK consume counter
@@ -106,3 +108,21 @@ denial to prove that the denial did not consume state.
 BPC's audit event remains stage-scoped. A `verify_pass` proves the BPC stage
 completed; it does not claim that identity binding, TSK, or application
 authorization succeeded. Deployments must record the final composed decision.
+
+## 2026-09-06: Failed persistence must not publish new live authority
+
+A real Windows failure mode preceded this fix: a failed rename could advance
+the live in-memory counter while the file on disk still held the prior value,
+two cached store instances could independently accept the same counter, and a
+missing timestamp could bypass TTL expiry entirely. Writes now publish a
+validated candidate only after `fsync`/rename, and an exclusive file
+transaction reloads authority before every operation rather than trusting a
+cached read. Own-key membership checking closes the related risk of an
+inherited `Object.prototype` name being read back as if it were a legitimately
+stored client. This is verified against a freshly installed npm tarball, not
+only against source; the original failure was reproduced on the real filesystem,
+without asserting that it was installation-specific;
+it does not extend to power failure, network filesystems, hostile local
+filesystem mutation, sustained high load, or automatic recovery of an abandoned
+lock, and a store outcome that cannot be confirmed after a possible commit is
+reported as unknown rather than assumed successful.

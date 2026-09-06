@@ -1,0 +1,10 @@
+# Local file-store evidence
+
+A real Windows failed rename previously advanced the live counter while disk retained the prior value. Two cached instances also accepted the same counter, and missing timestamps bypassed TTL. Writes now publish a validated candidate only after fsync/rename; an exclusive file transaction reloads authority before every operation. Own-key membership prevents inherited object names from bypassing capacity or appearing as stored clients.
+
+- `evidence/file-store-installed-313e4a6.json`: fresh npm tarball installation, six real Windows sharing-lock write failures, positive reopen, two-instance/two-process counter competition, malformed-state/configuration and TTL checks. It covers source revision313e4a6, before the final own-key repair.
+- `evidence/file-store-identity-39bf199.json`: fresh installed final own-key repair; all Object.prototype names checked against absent lookup/capacity, plus a legitimate own `toString` key. Only changed identity cases ran; previous write gates were not relabeled as rerun.
+
+Each receipt records the exact npm tarball and installed module hashes. Full operator artifacts remain retained locally. Reproduce the installed checks with `npm ci --ignore-scripts` then `python scripts/verify_file_store_install.py --output <new-evidence-directory>` on Windows. CI runs the installed Windows gate and a Linux authority counterpart, retaining Windows artifacts. Adding CI is enforcement configuration; remote success must be checked separately.
+
+Test credentials are synthetic. These checks use real local filesystem operations and child processes, no mocked storage or model calls. No claim covers power failure, network filesystems, hostile local filesystem mutation, high sustained load, or safe automatic resolution of abandoned locks. Store failures after a possible commit remain outcome-unknown; consumers must not automatically reissue replay-sensitive requests. The BPC HTTP adapter now preserves that distinction with a non-retryable unknown result. Actual combined cryptographic Android/server acceptance is a separate gate.

@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "baseUrl": ".",
+    "paths": {
+      "@tsk/server": ["../server/dist/index.d.ts"],
+      "@tsk/bpc-bridge": ["../bpc-bridge/dist/index.d.ts"]
+    }
+  },
+  "include": ["src/**/*"]
+}
