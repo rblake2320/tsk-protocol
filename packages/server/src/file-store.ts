@@ -28,6 +28,15 @@ function record(value: unknown): value is Record<string, any> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function validClientId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 128 &&
+    !['__proto__', 'constructor', 'prototype'].includes(value);
+}
+
+function requireClientId(value: unknown): asserts value is string {
+  if (!validClientId(value)) throw new Error('TSK_FILE_STORE_CLIENT_ID_INVALID');
+}
+
 function natural(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
@@ -36,7 +45,7 @@ function natural(value: unknown): value is number {
 function validateFileData(value: unknown): asserts value is FileTumblerData {
   if (!record(value) || !record(value.maps) || !record(value.lastAccess)) throw new Error('invalid store envelope');
   for (const [id, map] of Object.entries(value.maps)) {
-    if (!id || ['__proto__', 'constructor', 'prototype'].includes(id) || !record(map) || map.clientId !== id ||
+    if (!validClientId(id) || !record(map) || map.clientId !== id ||
         map.version !== '1' || typeof map.sharedSecret !== 'string' || !/^[0-9a-fA-F]{64}$/.test(map.sharedSecret) ||
         !natural(map.createdAt) || !natural(map.keyLength) || map.keyLength < 20 || map.keyLength > 512 ||
         !Array.isArray(map.segments) || !map.segments.length || !record(map.checksum)) throw new Error('invalid map');
@@ -158,6 +167,7 @@ export class FileTumblerStore implements TumblerMapStore {
   }
 
   async set(clientId: string, map: TumblerMap): Promise<void> {
+    requireClientId(clientId);
     return this.transaction(() => {
       const candidate = structuredClone(this.data);
       if (!candidate.maps[clientId] && Object.keys(candidate.maps).length >= this.maxEntries) {
@@ -171,6 +181,7 @@ export class FileTumblerStore implements TumblerMapStore {
   }
 
   async get(clientId: string): Promise<TumblerMap | null> {
+    requireClientId(clientId);
     return this.transaction(() => {
       const map = this.data.maps[clientId];
       if (!map) return null;
@@ -188,6 +199,7 @@ export class FileTumblerStore implements TumblerMapStore {
   }
 
   async delete(clientId: string): Promise<void> {
+    requireClientId(clientId);
     return this.transaction(() => {
       const candidate = structuredClone(this.data);
       delete candidate.maps[clientId];
@@ -205,6 +217,7 @@ export class FileTumblerStore implements TumblerMapStore {
   }
 
   async updateCounters(clientId: string, updates: Map<string, number>): Promise<void> {
+    requireClientId(clientId);
     return this.transaction(() => {
       const candidate = structuredClone(this.data);
       const map = candidate.maps[clientId];
@@ -226,6 +239,7 @@ export class FileTumblerStore implements TumblerMapStore {
    * For multi-process deployments, replace with a Lua Redis script or PG row lock.
    */
   consumeCounter(clientId: string, segmentId: string, matchedCounter: number): Promise<boolean> {
+    requireClientId(clientId);
     return Promise.resolve(this.transaction(() => {
       const candidate = structuredClone(this.data);
       const map = candidate.maps[clientId];
@@ -242,6 +256,7 @@ export class FileTumblerStore implements TumblerMapStore {
   }
 
   commitValidation(clientId: string, input: ValidationCommitInput): Promise<ValidationCommitResult> {
+    requireClientId(clientId);
     return Promise.resolve(this.transaction(() => {
       const candidate = structuredClone(this.data);
       const map = candidate.maps[clientId];
@@ -254,6 +269,8 @@ export class FileTumblerStore implements TumblerMapStore {
   }
 
   replaceCredential(oldClientId: string, replacement: TumblerMap): Promise<boolean> {
+    requireClientId(oldClientId);
+    requireClientId(replacement?.clientId);
     return Promise.resolve(this.transaction(() => {
       const candidate = structuredClone(this.data);
       const current = candidate.maps[oldClientId];

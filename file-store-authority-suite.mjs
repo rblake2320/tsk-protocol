@@ -26,6 +26,11 @@ if(mode==='child') {
   try {
     const file=resolve(out,'two-instances.json');
     const a=new FileTumblerStore(file,{maxAgeSec:0});await a.set('synthetic',map);
+    for(const id of ['__proto__','constructor','prototype','']) {
+      await assert.rejects(a.get(id),/CLIENT_ID_INVALID/);
+      await assert.rejects(a.set(id,{...map,clientId:id}),/CLIENT_ID_INVALID/);
+      check('reserved/empty identity rejected: '+id,true);
+    }
     const b=new FileTumblerStore(file,{maxAgeSec:0});
     const one=await a.commitValidation('synthetic',input);const two=await b.commitValidation('synthetic',input);
     check('two instances cannot both consume same counter',one.ok && !two.ok);
