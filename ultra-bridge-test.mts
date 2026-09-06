@@ -73,6 +73,12 @@ async function tskHeaders(nowMs = Date.now()): Promise<Record<string, string>> {
   };
 }
 
+async function requestCount(id: string): Promise<number> {
+  const stored = await store.get(id);
+  if (!stored) throw new Error(`TSK fixture disappeared: ${id}`);
+  return stored.requestCount ?? 0;
+}
+
 // Build a request object with both BPC and TSK headers (BPC headers are fake — verified by mock)
 async function makeReq(
   extraHeaders: Record<string, string> = {},
@@ -123,13 +129,18 @@ console.log('\n[1] Happy Path — BPC pass + TSK pass + identity match');
 console.log('\n[2] BPC Layer Failure — TSK never called');
 {
   const req = await makeReq();
-  const r = await verifyUltraRequest(req, bpcFail('SIGNATURE_INVALID'), { tskStore: store, identityBinding });
+  const before = await requestCount(clientId);
+  const r = await verifyUltraRequest(req, bpcFail('REPLAY_DETECTED'), { tskStore: store, identityBinding });
+  const after = await requestCount(clientId);
 
   assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
   assert("error starts with 'BPC:'", r.error?.startsWith('BPC:') ?? false, `Got: ${r.error}`);
-  assert("error includes the BPC error code", r.error?.includes('SIGNATURE_INVALID') ?? false, `Got: ${r.error}`);
+  assert("error includes the BPC error code", r.error?.includes('REPLAY_DETECTED') ?? false, `Got: ${r.error}`);
   assert("layers is empty (TSK not reached)", r.layers.length === 0, `Got: ${JSON.stringify(r.layers)}`);
   assert('pairId absent when BPC fails', r.pairId === undefined, `Got: ${r.pairId}`);
+  assert('BPC replay rejection leaves TSK request count unchanged', after === before, `Before=${before}, after=${after}`);
+  const retry = await verifyUltraRequest(req, bpcPass(), { tskStore: store, identityBinding });
+  assert('same TSK key remains usable after BPC replay rejection', retry.ok, `Got: ${retry.error}`);
 }
 
 // ── Group 3: TSK failure after BPC passes ────────────────────────────────────
@@ -165,7 +176,8 @@ console.log('\n[3] TSK Layer Failure — BPC passes, TSK key is expired');
       'x-tsk-version': '1',
     },
   };
-  const r = await verifyUltraRequest(req, bpcPass(), { tskStore: expiredStore, identityBinding });
+  const expiredBinding = { resolve: async (_pid: string) => expiredMap.clientId };
+  const r = await verifyUltraRequest(req, bpcPass(), { tskStore: expiredStore, identityBinding: expiredBinding });
 
   assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
   assert("error starts with 'TSK:'", r.error?.startsWith('TSK:') ?? false, `Got: ${r.error}`);
@@ -188,9 +200,8 @@ console.log('\n[4] TSK Headers Missing — request has BPC headers but no TSK la
   const r = await verifyUltraRequest(req, bpcPass(), { tskStore: store, identityBinding });
 
   assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error starts with 'TSK:'", r.error?.startsWith('TSK:') ?? false, `Got: ${r.error}`);
-  assert("error includes HEADERS_MISSING",
-    r.error?.includes('HEADERS_MISSING') ?? false, `Got: ${r.error}`);
+  assert("error is IDENTITY_BINDING_UNAVAILABLE before TSK",
+    r.error === 'IDENTITY_BINDING_UNAVAILABLE', `Got: ${r.error}`);
   assert("layers is ['bpc']",
     r.layers.length === 1 && r.layers[0] === 'bpc',
     `Got: ${JSON.stringify(r.layers)}`);
@@ -212,15 +223,23 @@ console.log('\n[5] Identity Binding Mismatch — BPC pairId maps to different cl
       'x-tsk-version': '1',
     },
   };
+  const before = await requestCount(map2.clientId);
   // BPC says pairId→clientId (client1), but TSK clientId is client2
   const r = await verifyUltraRequest(req, bpcPass(pairId), { tskStore: store, identityBinding });
 
   assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
   assert("error is IDENTITY_BINDING_MISMATCH",
     r.error === 'IDENTITY_BINDING_MISMATCH', `Got: ${r.error}`);
-  assert("layers includes both bpc and tsk (both passed individually)",
-    r.layers.includes('bpc') && r.layers.includes('tsk'),
+  assert("layers is ['bpc'] because mismatch is rejected before TSK",
+    r.layers.length === 1 && r.layers[0] === 'bpc',
     `Got: ${JSON.stringify(r.layers)}`);
+  assert('binding mismatch leaves TSK request count unchanged',
+    await requestCount(map2.clientId) === before, `Before=${before}, after=${await requestCount(map2.clientId)}`);
+  const boundPairId = 'bpc_pair_test_002';
+  identityMap.set(boundPairId, map2.clientId);
+  const bound = await verifyUltraRequest(req, bpcPass(boundPairId), { tskStore: store, identityBinding });
+  assert('genuinely bound TSK request consumes once', bound.ok && await requestCount(map2.clientId) === before + 1,
+    `Got ok=${bound.ok}, count=${await requestCount(map2.clientId)}`);
 }
 
 // ── Group 6: Identity binding — pairId resolves to null (unknown pair) ───────
@@ -228,11 +247,16 @@ console.log('\n[6] Identity Binding — pairId unknown (resolves to null)');
 {
   const req = await makeReq({}, NOW);
   const unknownPairId = 'bpc_pair_unknown_9999';
+  const before = await requestCount(clientId);
   const r = await verifyUltraRequest(req, bpcPass(unknownPairId), { tskStore: store, identityBinding });
 
   assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error is IDENTITY_BINDING_MISMATCH (null !== clientId)",
-    r.error === 'IDENTITY_BINDING_MISMATCH', `Got: ${r.error}`);
+  assert("error is IDENTITY_BINDING_UNAVAILABLE",
+    r.error === 'IDENTITY_BINDING_UNAVAILABLE', `Got: ${r.error}`);
+  assert('absent pair binding leaves TSK request count unchanged',
+    await requestCount(clientId) === before, `Before=${before}, after=${await requestCount(clientId)}`);
+  const retry = await verifyUltraRequest(req, bpcPass(), { tskStore: store, identityBinding });
+  assert('same TSK key remains usable after absent binding', retry.ok, `Got: ${retry.error}`);
 }
 
 // ── Group 7: Identity binding unavailable — BPC returns no pairId ─────────────
@@ -244,8 +268,8 @@ console.log('\n[7] Identity Binding Unavailable — BPC result missing pairId');
   assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
   assert("error is IDENTITY_BINDING_UNAVAILABLE",
     r.error === 'IDENTITY_BINDING_UNAVAILABLE', `Got: ${r.error}`);
-  assert("layers includes both (both layers validated individually)",
-    r.layers.includes('bpc') && r.layers.includes('tsk'),
+  assert("layers is ['bpc'] because missing pairId is rejected before TSK",
+    r.layers.length === 1 && r.layers[0] === 'bpc',
     `Got: ${JSON.stringify(r.layers)}`);
 }
 
@@ -271,7 +295,7 @@ console.log('\n[8] Tampered TSK Key — 1-char mutation at position 10');
 }
 
 // ── Group 9: Wrong TSK client ID — valid key for different client ─────────────
-console.log('\n[9] Wrong TSK Client ID — valid key but wrong clientId header');
+console.log('\n[9] Wrong TSK Client ID — claimed client conflicts with authoritative pair binding');
 {
   const req: TSKRequestData = {
     headers: {
@@ -283,9 +307,10 @@ console.log('\n[9] Wrong TSK Client ID — valid key but wrong clientId header')
   const r = await verifyUltraRequest(req, bpcPass(), { tskStore: store, identityBinding });
 
   assert('result.ok is false', !r.ok, `Got ok=${r.ok}`);
-  assert("error starts with 'TSK:'", r.error?.startsWith('TSK:') ?? false, `Got: ${r.error}`);
-  assert("error includes CLIENT_NOT_FOUND",
-    r.error?.includes('CLIENT_NOT_FOUND') ?? false, `Got: ${r.error}`);
+  assert("error is IDENTITY_BINDING_MISMATCH before TSK",
+    r.error === 'IDENTITY_BINDING_MISMATCH', `Got: ${r.error}`);
+  assert("layers is ['bpc'] because wrong claimed client is rejected before TSK",
+    r.layers.length === 1 && r.layers[0] === 'bpc', `Got: ${JSON.stringify(r.layers)}`);
 }
 
 // ── Group 10: ULTRA_SECURITY_LAYERS contract ─────────────────────────────────

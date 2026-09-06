@@ -138,6 +138,39 @@ export async function verifyUltraRequest(
     };
   }
 
+  // Resolve the authoritative BPC pair -> TSK client binding before TSK
+  // verification. TSK validation commits replay-sensitive counter/lifecycle
+  // state on success, so a missing or mismatched binding must never reach it.
+  const pairId = bpcResult.pairId;
+  const claimedClientId = singleHeader(req, 'x-tsk-client-id');
+  if (!pairId || !claimedClientId) {
+    return {
+      ok: false,
+      pairId,
+      error: 'IDENTITY_BINDING_UNAVAILABLE',
+      layers: ['bpc'],
+    };
+  }
+
+  const expectedClientId = await options.identityBinding.resolve(pairId);
+  if (!expectedClientId) {
+    return {
+      ok: false,
+      pairId,
+      error: 'IDENTITY_BINDING_UNAVAILABLE',
+      layers: ['bpc'],
+    };
+  }
+  if (expectedClientId !== claimedClientId) {
+    return {
+      ok: false,
+      pairId,
+      clientId: claimedClientId,
+      error: 'IDENTITY_BINDING_MISMATCH',
+      layers: ['bpc'],
+    };
+  }
+
   // --- Layers 6-7: TSK ---
   const tskResult: TSKVerifyResult = await verifyTSKRequest(req, options.tskStore, options.tskConfig);
   if (!tskResult.ok) {
@@ -149,22 +182,22 @@ export async function verifyUltraRequest(
     };
   }
 
-  // Identity binding: BPC and TSK must resolve to the same principal.
-  if (!bpcResult.pairId || !tskResult.clientId) {
+  // Preserve the post-verification invariant even though the claimed header
+  // was compared before verification: the cryptographic verifier must attest
+  // to the same client identity the authoritative pair binding selected.
+  if (!tskResult.clientId) {
     return {
       ok: false,
-      pairId: bpcResult.pairId,
+      pairId,
       clientId: tskResult.clientId,
       error: 'IDENTITY_BINDING_UNAVAILABLE',
       layers: ['bpc', 'tsk'],
     };
   }
-
-  const expectedClientId = await options.identityBinding.resolve(bpcResult.pairId);
   if (expectedClientId !== tskResult.clientId) {
     return {
       ok: false,
-      pairId: bpcResult.pairId,
+      pairId,
       clientId: tskResult.clientId,
       error: 'IDENTITY_BINDING_MISMATCH',
       layers: ['bpc', 'tsk'],
@@ -173,11 +206,17 @@ export async function verifyUltraRequest(
 
   return {
     ok: true,
-    pairId: bpcResult.pairId,
+    pairId,
     clientId: tskResult.clientId,
     layers: ['bpc', 'tsk'],
     scope: resolvedScope,
   };
+}
+
+/** Reject duplicate/non-string identity headers at the binding boundary. */
+function singleHeader(req: TSKRequestData, name: string): string | undefined {
+  const value = req.headers[name];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 /**
