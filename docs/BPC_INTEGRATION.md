@@ -4,12 +4,34 @@ Use the two protocols together when an API needs both BPC's signed-pair proof
 and TSK's server-authoritative, rotating credential state. The bridge requires
 both checks and binds the BPC `pairId` to exactly one TSK `clientId`.
 
+The deployment supplies the request/response, stores, and identity directory below.
+Use the BPC revision pinned by this repository's compatibility gate; older mutable
+verifier results are rejected. For requests with bodies, compute the body hash from
+the received bytes and validate it against the signed value before authorization;
+a client-supplied hash alone does not bind the actual payload.
+
 ```ts
 import { authenticateBpcTskHttpRequest } from '@tsk/node-http';
+import { verifyBPCRequest } from '@bpc/server';
 
 const auth = await authenticateBpcTskHttpRequest(request, response, {
   store: tskStore,
-  bpcVerify: request => verifyBPCRequest(toBpcRequest(request), registry, nonceStore, anomaly),
+  bpcVerify: request =>
+    verifyBPCRequest(
+      {
+        pairId: request.headers['x-bpc-pair-id']?.toString() ?? null,
+        signedData: request.headers['x-bpc-signed-data']?.toString() ?? null,
+        signature: request.headers['x-bpc-signature']?.toString() ?? null,
+        version: request.headers['x-bpc-version']?.toString() ?? null,
+        method: request.method ?? 'GET',
+        path: request.url ?? '/',
+        bodyHash: request.headers['x-bpc-body-hash']?.toString() ?? null,
+        ip: request.socket.remoteAddress,
+      },
+      registry,
+      nonceStore,
+      anomaly,
+    ),
   identityBinding: {
     resolve: pairId => customerDirectory.lookupTskClientId(pairId),
   },
