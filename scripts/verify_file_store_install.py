@@ -44,7 +44,9 @@ try:
     run('regression', [node, '--import', (root/'node_modules/tsx/dist/loader.mjs').as_uri(),
                        str(root/'file-store-failure-suite.mts'), str(out/'regression'), str(module), 'regression'], install)
     receipt['regression'] = json.loads((out/'regression/receipt.json').read_text())
-    receipt['ok'] = receipt['regression']['ok'] is True
+    run('authority', [node, str(root/'file-store-authority-suite.mjs'), str(out/'authority'), str(module)], install)
+    receipt['authority'] = json.loads((out/'authority/receipt.json').read_text())
+    receipt['ok'] = receipt['regression']['ok'] is True and receipt['authority']['ok'] is True
 except Exception as error:
     receipt['error'] = str(error)
 finally:
