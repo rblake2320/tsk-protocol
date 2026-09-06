@@ -69,6 +69,18 @@ export interface BpcTskAuthentication extends TSKAuthentication {
   scope: BPCScope;
 }
 
+/** Public-safe body for a replay-sensitive authentication outcome that is unknown. */
+export interface BpcTskUnknownOutcomeBody {
+  error: {
+    code: 'BPC_TSK_OUTCOME_UNKNOWN';
+    message: 'Authentication outcome is unknown';
+  };
+  meta: {
+    requestId: string;
+    retryable: false;
+  };
+}
+
 /** Authenticate BPC first, then TSK, and require the two identities to bind. */
 export async function authenticateBpcTskHttpRequest(
   request: IncomingMessage,
@@ -79,17 +91,35 @@ export async function authenticateBpcTskHttpRequest(
   response.setHeader('X-Request-ID', requestId);
   const result = await verifyUltraRequest(
     { headers: request.headers },
-    () => options.bpcVerify(request),
+    verifiedRequest => options.bpcVerify(requestWithHeaders(request, verifiedRequest.headers)),
     { tskStore: options.store, tskConfig: options.config, identityBinding: options.identityBinding },
   );
   if (!result.ok || !result.clientId || !result.pairId || !result.scope) {
-    writeJson(response, 401, { error: { code: 'BPC_TSK_AUTHENTICATION_FAILED', message: 'Authentication failed' }, meta: { requestId } });
+    if (result.outcomeUnknown === true) {
+      const body: BpcTskUnknownOutcomeBody = {
+        error: { code: 'BPC_TSK_OUTCOME_UNKNOWN', message: 'Authentication outcome is unknown' },
+        meta: { requestId, retryable: false },
+      };
+      writeJson(response, 409, body);
+    } else writeJson(response, 401, { error: { code: 'BPC_TSK_AUTHENTICATION_FAILED', message: 'Authentication failed' }, meta: { requestId } });
     return null;
   }
   // The bridge invokes the same TSK verifier; successful responses must carry
   // the wire-level confirmation required by @tsk/client-sdk.
   response.setHeader('x-tsk-authenticated', '1');
   return { clientId: result.clientId, pairId: result.pairId, scope: result.scope, requestId, rotationRequired: false };
+}
+
+/** Give the BPC integration the same immutable header snapshot used by TSK. */
+function requestWithHeaders(request: IncomingMessage, headers: IncomingMessage['headers']): IncomingMessage {
+  const snapshotRequest = Object.create(request) as IncomingMessage;
+  Object.defineProperty(snapshotRequest, 'headers', {
+    configurable: false,
+    enumerable: true,
+    value: headers,
+    writable: false,
+  });
+  return snapshotRequest;
 }
 
 export interface AdminPrincipal { operatorId: string; }

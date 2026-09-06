@@ -117,7 +117,16 @@ export async function verifyUltraRequest(
   // or trusted integration callback cannot switch the authenticated identity
   // between those checks. TSKRequestData currently contains headers only;
   // scalar values are copied and header arrays are copied then frozen.
-  const request = immutableRequest(req);
+  let request: TSKRequestData;
+  try {
+    request = immutableRequest(req);
+  } catch {
+    return {
+      ok: false,
+      error: 'BPC: REQUEST_INVALID',
+      layers: [],
+    };
+  }
 
   // --- Layers 1-5: BPC ---
   let bpcResult: BPCLikeResult;
@@ -267,13 +276,20 @@ function singleHeader(req: TSKRequestData, name: string): string | undefined {
 }
 
 function immutableRequest(req: TSKRequestData): TSKRequestData {
+  if (!req || typeof req !== 'object') throw new TypeError('request must be an object');
+  const sourceHeaders: unknown = req.headers;
+  if (!sourceHeaders || typeof sourceHeaders !== 'object' || Array.isArray(sourceHeaders)) {
+    throw new TypeError('request headers must be an object');
+  }
   const headers: Record<string, string | string[] | undefined> = {};
-  for (const [name, value] of Object.entries(req.headers)) {
+  for (const [name, value] of Object.entries(sourceHeaders)) {
     if (Array.isArray(value)) {
+      if (!value.every(item => typeof item === 'string')) throw new TypeError('request header array must contain strings');
       const copied = [...value];
       Object.freeze(copied);
       headers[name] = copied;
-    } else headers[name] = value;
+    } else if (typeof value === 'string' || value === undefined) headers[name] = value;
+    else throw new TypeError('request header must be a string');
   }
   Object.freeze(headers);
   return Object.freeze({ headers });

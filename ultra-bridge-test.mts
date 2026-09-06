@@ -493,8 +493,8 @@ console.log('\n[12] Dependency Exception Containment');
       identityBinding: { resolve: async () => null },
     },
   );
-  assert('HTTP adapter retains generic 401 failure shape for contained exception',
-    httpResult === null && response.statusCode === 401 && response.payload.includes('BPC_TSK_AUTHENTICATION_FAILED'),
+  assert('HTTP adapter exposes stable non-retryable unknown outcome for contained exception',
+    httpResult === null && response.statusCode === 409 && response.payload.includes('BPC_TSK_OUTCOME_UNKNOWN') && response.payload.includes('"retryable":false'),
     `Got: ${response.statusCode} ${response.payload}`);
   assert('HTTP adapter response exposes no thrown text', !response.payload.includes('secret'), `Got: ${response.payload}`);
 }
@@ -553,6 +553,104 @@ console.log('\n[13] Immutable Request Binding Across Awaits');
   });
   assert('unchanged bound request remains accepted once',
     positive.ok && (await positiveStore.get(positiveMap.clientId))?.requestCount === 1, `Got: ${JSON.stringify(positive)}`);
+}
+
+// ── Group 14: invalid runtime request values fail closed before BPC invocation ──
+console.log('\n[14] Invalid Request Snapshot Containment');
+{
+  const malformed: Array<{ name: string; request: unknown }> = [
+    { name: 'missing headers', request: {} },
+    { name: 'null headers', request: { headers: null } },
+    { name: 'throwing headers getter', request: Object.defineProperty({}, 'headers', {
+      get: () => { throw new Error('malformed request secret: never expose'); },
+    }) },
+  ];
+  for (const test of malformed) {
+    let bpcCalls = 0;
+    const result = await verifyUltraRequest(test.request as TSKRequestData, async () => {
+      bpcCalls++;
+      return { ok: true, pairId: 'never-reached', scope: 'read' };
+    }, { tskStore: new MemoryTumblerStore(), identityBinding: { resolve: async () => null } });
+    assert(`${test.name} returns stable request-invalid result`,
+      !result.ok && result.error === 'BPC: REQUEST_INVALID' && result.layers.length === 0 && result.outcomeUnknown === undefined,
+      `Got: ${JSON.stringify(result)}`);
+    assert(`${test.name} exposes no thrown text and skips BPC`,
+      bpcCalls === 0 && !JSON.stringify(result).includes('secret'), `Calls=${bpcCalls}, result=${JSON.stringify(result)}`);
+  }
+}
+
+// ── Group 15: adapter preserves the bridge snapshot and public disposition ──
+console.log('\n[15] BPC + TSK HTTP Adapter Boundary');
+{
+  const responseFor = () => new class {
+    headersSent = false; statusCode = 0; payload = ''; readonly headers = new Map<string, unknown>();
+    setHeader(name: string, value: unknown) { this.headers.set(name, value); }
+    writeHead(status: number) { this.statusCode = status; this.headersSent = true; return this; }
+    end(body?: unknown) { this.payload = String(body ?? ''); }
+  }();
+
+  const denialResponse = responseFor();
+  const denial = await authenticateBpcTskHttpRequest(
+    { headers: { 'x-request-id': 'adapter-denial-test' }, socket: { remoteAddress: '127.0.0.1' } } as any,
+    denialResponse as any,
+    { store: new MemoryTumblerStore(), bpcVerify: async () => ({ ok: false, error: 'REPLAY_DETECTED' }), identityBinding: { resolve: async () => null } },
+  );
+  assert('ordinary BPC denial retains generic 401 contract',
+    denial === null && denialResponse.statusCode === 401 && denialResponse.payload.includes('BPC_TSK_AUTHENTICATION_FAILED') && !denialResponse.payload.includes('retryable'),
+    `Got: ${denialResponse.statusCode} ${denialResponse.payload}`);
+
+  const { store: unknownStore, provisioner: unknownProvisioner } = createTSKServer();
+  const unknownProvisioned = await unknownProvisioner.provision({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+  if (!unknownProvisioned.ok || !unknownProvisioned.tumblerMap) throw new Error('adapter unknown fixture provision failed');
+  const unknownMap = unknownProvisioned.tumblerMap;
+  const actualUnknownCommit = unknownStore.commitValidation.bind(unknownStore);
+  unknownStore.commitValidation = async (id, input) => { await actualUnknownCommit(id, input); throw new Error('adapter store secret: never expose'); };
+  const unknownResponse = responseFor();
+  const unknown = await authenticateBpcTskHttpRequest(
+    { headers: { 'x-request-id': 'adapter-unknown-test', 'x-tsk-client-id': unknownMap.clientId, 'x-tsk-key': generateKeyFromMap(unknownMap), 'x-tsk-version': '1' }, socket: { remoteAddress: '127.0.0.1' } } as any,
+    unknownResponse as any,
+    { store: unknownStore, bpcVerify: async () => ({ ok: true, pairId: 'adapter-unknown-pair', scope: 'read' }), identityBinding: { resolve: async () => unknownMap.clientId } },
+  );
+  assert('post-commit unknown reaches HTTP as non-retryable 409',
+    unknown === null && unknownResponse.statusCode === 409 && unknownResponse.payload.includes('BPC_TSK_OUTCOME_UNKNOWN') && unknownResponse.payload.includes('"retryable":false'),
+    `Got: ${unknownResponse.statusCode} ${unknownResponse.payload}`);
+  assert('HTTP unknown result retains one consumption and no secret text',
+    (await unknownStore.get(unknownMap.clientId))?.requestCount === 1 && !unknownResponse.payload.includes('secret'),
+    `Got: ${unknownResponse.payload}`);
+
+  const { store: adapterStore, provisioner: adapterProvisioner } = createTSKServer();
+  const adapterA = await adapterProvisioner.provision({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+  const adapterB = await adapterProvisioner.provision({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+  if (!adapterA.ok || !adapterA.tumblerMap || !adapterB.ok || !adapterB.tumblerMap) throw new Error('adapter mutation fixture provision failed');
+  const adapterRequest: any = { headers: {
+    'x-request-id': 'adapter-snapshot-test',
+    'x-tsk-client-id': adapterA.tumblerMap.clientId,
+    'x-tsk-key': generateKeyFromMap(adapterA.tumblerMap),
+    'x-tsk-version': '1',
+  }, socket: { remoteAddress: '127.0.0.1' } };
+  const adapterBeforeB = JSON.stringify(await adapterStore.get(adapterB.tumblerMap.clientId));
+  let bpcObservedClient = '';
+  const adapterResponse = responseFor();
+  const adapterAuth = await authenticateBpcTskHttpRequest(adapterRequest, adapterResponse as any, {
+    store: adapterStore,
+    bpcVerify: async incoming => {
+      adapterRequest.headers = {
+        'x-request-id': 'adapter-snapshot-test',
+        'x-tsk-client-id': adapterB.tumblerMap!.clientId,
+        'x-tsk-key': generateKeyFromMap(adapterB.tumblerMap!),
+        'x-tsk-version': '1',
+      };
+      bpcObservedClient = incoming.headers['x-tsk-client-id']?.toString() ?? '';
+      return { ok: true, pairId: 'adapter-snapshot-pair', scope: 'read' };
+    },
+    identityBinding: { resolve: async () => adapterA.tumblerMap!.clientId },
+  });
+  assert('adapter BPC verifier receives bridge snapshot, not mutable IncomingMessage headers',
+    bpcObservedClient === adapterA.tumblerMap.clientId && adapterAuth?.clientId === adapterA.tumblerMap.clientId,
+    `Observed=${bpcObservedClient}, auth=${JSON.stringify(adapterAuth)}`);
+  assert('adapter mutation leaves alternate client byte-equivalent',
+    JSON.stringify(await adapterStore.get(adapterB.tumblerMap.clientId)) === adapterBeforeB,
+    'Adapter client B map changed');
 }
 // ─── Results ──────────────────────────────────────────────────────────────────
 
