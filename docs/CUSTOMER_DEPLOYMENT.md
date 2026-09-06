@@ -22,11 +22,18 @@ and support boundaries.
 
 ## Supported deployment shape today
 
-One Node process, one encrypted host volume, and `FileTumblerStore` is a real
-durable deployment shape. It survives a process restart and performs its
-counter/lifecycle commit atomically within that process. It **must not** be run
-behind multiple application processes, containers, or replicas because its JSON
-file has no cross-process transaction or lock.
+The bounded local deployment uses an encrypted host volume and `FileTumblerStore`.
+Each operation acquires an exclusive file lock and reloads persisted authority;
+successful writes fsync the candidate before rename and live publication. Tested
+Windows cases cover restart, failed rename, competing instances/processes, malformed
+state and inherited object-property names. See `FILE_STORE_EVIDENCE.md` for scope.
+
+Contended or abandoned locks fail closed without automatic retry or age-based
+removal. No stale-lock recovery command is shipped: an operator must resolve the
+owning process and retained state before reuse. Power-loss/directory-fsync,
+network-filesystem, malicious filesystem replacement, and sustained multi-process
+deployment are not certified by these tests. Do not deploy behind multiple replicas
+on the strength of the two-process contention check.
 
 For a multi-replica deployment, the customer needs a durable store that
 implements `TumblerMapStore.commitValidation()` and `replaceCredential()` as

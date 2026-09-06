@@ -29,6 +29,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run typecheck
+      - run: node file-store-authority-suite.mjs "$RUNNER_TEMP/tsk-authority" packages/server/dist/index.js
       - run: npm test
       - run: npm run test:ha
       - run: npm run test:redis
@@ -46,3 +47,28 @@ jobs:
         env:
           BPC_PROTOCOL_PATH: ${{ github.workspace }}/.compat/bpc-protocol
       - run: npm audit
+
+  installed-windows-store:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: python scripts/verify_file_store_install.py --output "$env:RUNNER_TEMP/tsk-installed-store"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: installed-windows-store-evidence
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/tsk-installed-store/*.json
+            ${{ runner.temp }}/tsk-installed-store/*.tgz
+            ${{ runner.temp }}/tsk-installed-store/*.stdout
+            ${{ runner.temp }}/tsk-installed-store/*.stderr
+            ${{ runner.temp }}/tsk-installed-store/regression/*.json
+            ${{ runner.temp }}/tsk-installed-store/authority/*.json
+            ${{ runner.temp }}/tsk-installed-store/identity/*.json
