@@ -170,7 +170,7 @@ export class FileTumblerStore implements TumblerMapStore {
     requireClientId(clientId);
     return this.transaction(() => {
       const candidate = structuredClone(this.data);
-      if (!candidate.maps[clientId] && Object.keys(candidate.maps).length >= this.maxEntries) {
+      if (!Object.hasOwn(candidate.maps, clientId) && Object.keys(candidate.maps).length >= this.maxEntries) {
         throw new Error('TSK_STORE_CAPACITY_REACHED');
       }
       candidate.maps[clientId] = structuredClone(map);
@@ -183,7 +183,7 @@ export class FileTumblerStore implements TumblerMapStore {
   async get(clientId: string): Promise<TumblerMap | null> {
     requireClientId(clientId);
     return this.transaction(() => {
-      const map = this.data.maps[clientId];
+      const map = Object.hasOwn(this.data.maps, clientId) ? this.data.maps[clientId] : undefined;
       if (!map) return null;
       if (this.maxAgeMs > 0 && Date.now() - map.createdAt > this.maxAgeMs) {
         const candidate = structuredClone(this.data);
@@ -220,7 +220,7 @@ export class FileTumblerStore implements TumblerMapStore {
     requireClientId(clientId);
     return this.transaction(() => {
       const candidate = structuredClone(this.data);
-      const map = candidate.maps[clientId];
+      const map = Object.hasOwn(candidate.maps, clientId) ? candidate.maps[clientId] : undefined;
       if (!map) throw new Error(`TSK_FILE_STORE_CLIENT_MISSING: ${clientId}`);
       if (this.expired(map)) throw new Error(`TSK_FILE_STORE_CLIENT_EXPIRED: ${clientId}`);
       for (const seg of map.segments) {
@@ -242,7 +242,7 @@ export class FileTumblerStore implements TumblerMapStore {
     requireClientId(clientId);
     return Promise.resolve(this.transaction(() => {
       const candidate = structuredClone(this.data);
-      const map = candidate.maps[clientId];
+      const map = Object.hasOwn(candidate.maps, clientId) ? candidate.maps[clientId] : undefined;
       if (!map || this.expired(map)) return false;
       const seg = map.segments.find(s => s.segmentId === segmentId);
       if (!seg || seg.type !== 'hotp') return false;
@@ -259,7 +259,7 @@ export class FileTumblerStore implements TumblerMapStore {
     requireClientId(clientId);
     return Promise.resolve(this.transaction(() => {
       const candidate = structuredClone(this.data);
-      const map = candidate.maps[clientId];
+      const map = Object.hasOwn(candidate.maps, clientId) ? candidate.maps[clientId] : undefined;
       if (!map || this.expired(map)) return { ok: false, error: 'TSK_KEY_EXPIRED' } as ValidationCommitResult;
       const result = commitValidationToMap(map, input);
       this.flush(candidate);
@@ -273,18 +273,18 @@ export class FileTumblerStore implements TumblerMapStore {
     requireClientId(replacement?.clientId);
     return Promise.resolve(this.transaction(() => {
       const candidate = structuredClone(this.data);
-      const current = candidate.maps[oldClientId];
+      const current = Object.hasOwn(candidate.maps, oldClientId) ? candidate.maps[oldClientId] : undefined;
       if (!current || this.expired(current) || (current.status !== undefined && current.status !== 'active' && current.status !== 'expiring')) {
         return false;
       }
-      if (candidate.maps[replacement.clientId]) return false;
+      if (Object.hasOwn(candidate.maps, replacement.clientId)) return false;
       current.status = 'revoked';
       if (Object.keys(candidate.maps).length >= this.maxEntries) {
         delete candidate.maps[oldClientId];
         delete candidate.lastAccess[oldClientId];
       }
       candidate.maps[replacement.clientId] = structuredClone(replacement);
-      if (candidate.maps[oldClientId]) candidate.lastAccess[oldClientId] = Date.now();
+      if (Object.hasOwn(candidate.maps, oldClientId)) candidate.lastAccess[oldClientId] = Date.now();
       candidate.lastAccess[replacement.clientId] = Date.now();
       this.flush(candidate);
       return true;

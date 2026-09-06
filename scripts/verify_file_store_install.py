@@ -9,6 +9,7 @@ import sys
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--output', required=True, type=Path)
+p.add_argument('--identity-only', action='store_true', help='Run only changed inherited-key boundary cases')
 a = p.parse_args()
 root = Path(__file__).resolve().parents[1]
 out = a.output.resolve()
@@ -41,12 +42,16 @@ try:
     run('install', [npm, 'install', '--ignore-scripts', '--no-audit', '--no-fund', *[str(out/name) for name in names]], install)
     module = install/'node_modules/@tsk/server/dist/index.js'
     receipt['installed_file_store_sha256'] = hashlib.sha256((module.parent/'file-store.js').read_bytes()).hexdigest()
-    run('regression', [node, '--import', (root/'node_modules/tsx/dist/loader.mjs').as_uri(),
-                       str(root/'file-store-failure-suite.mts'), str(out/'regression'), str(module), 'regression'], install)
-    receipt['regression'] = json.loads((out/'regression/receipt.json').read_text())
-    run('authority', [node, str(root/'file-store-authority-suite.mjs'), str(out/'authority'), str(module)], install)
-    receipt['authority'] = json.loads((out/'authority/receipt.json').read_text())
-    receipt['ok'] = receipt['regression']['ok'] is True and receipt['authority']['ok'] is True
+    if not a.identity_only:
+        run('regression', [node, '--import', (root/'node_modules/tsx/dist/loader.mjs').as_uri(),
+                           str(root/'file-store-failure-suite.mts'), str(out/'regression'), str(module), 'regression'], install)
+        receipt['regression'] = json.loads((out/'regression/receipt.json').read_text())
+        run('authority', [node, str(root/'file-store-authority-suite.mjs'), str(out/'authority'), str(module)], install)
+        receipt['authority'] = json.loads((out/'authority/receipt.json').read_text())
+    run('identity', [node, str(root/'file-store-identity-suite.mjs'), str(out/'identity'), str(module)], install)
+    receipt['identity'] = json.loads((out/'identity/receipt.json').read_text())
+    receipt['scope'] = 'installed package; inherited-key boundary only' if a.identity_only else receipt['scope']
+    receipt['ok'] = all(receipt[name]['ok'] is True for name in ('regression', 'authority', 'identity') if name in receipt)
 except Exception as error:
     receipt['error'] = str(error)
 finally:
