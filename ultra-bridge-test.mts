@@ -19,6 +19,7 @@ import { createTSKServer } from './packages/server/src/index.js';
 import { generateKeyFromMap } from './packages/core/src/key-gen.js';
 import { generateSharedSecret, generateClientId, generateSegmentId } from './packages/core/src/crypto.js';
 import { MemoryTumblerStore } from './packages/server/src/store.js';
+import { authenticateBpcTskHttpRequest } from './packages/node-http/src/adapter.js';
 import type { TumblerMap } from './packages/core/src/types.js';
 import type { TSKRequestData } from './packages/server/src/middleware.js';
 import type { BPCLikeResult } from './packages/bpc-bridge/src/ultra-verify.js';
@@ -409,11 +410,93 @@ console.log('\n[11] BPC Scope Propagation (HIGH-03)');
   assert('namespaced BPC scope is rejected',
     !r11f.ok && r11f.error === 'BPC: INVALID_SCOPE', `Got: ${r11f.error}`);
 
-  const matchingAdmin = async () => (
+const matchingAdmin = async () => (
     { ok: true, pairId, scope: 'admin', pair: { scope: 'admin', id: pairId } }
   ) satisfies BPCLikeResult;
   const r11g = await verifyUltraRequest(req11e, matchingAdmin, { tskStore: store, identityBinding });
   assert('matching closed admin scope is accepted', r11g.ok && r11g.scope === 'admin', `Got: ${r11g.error}`);
+}
+
+// ── Group 12: dependency exceptions are contained and never become retryable denials ──
+console.log('\n[12] Dependency Exception Containment');
+{
+  const beforeBpcThrow = await requestCount(clientId);
+  const bpcThrow = await verifyUltraRequest(await makeReq(), async () => {
+    throw new Error('bpc verifier secret: never expose');
+  }, { tskStore: store, identityBinding });
+  assert('BPC verifier exception is contained as unknown',
+    !bpcThrow.ok && bpcThrow.error === 'BPC: VERIFICATION_UNKNOWN' && bpcThrow.outcomeUnknown === true,
+    `Got: ${JSON.stringify(bpcThrow)}`);
+  assert('BPC verifier exception exposes no thrown text',
+    !JSON.stringify(bpcThrow).includes('secret'), `Got: ${JSON.stringify(bpcThrow)}`);
+  assert('BPC verifier exception does not reach TSK in this injected boundary',
+    await requestCount(clientId) === beforeBpcThrow, `Before=${beforeBpcThrow}, after=${await requestCount(clientId)}`);
+
+  const { store: bindingStore, provisioner: bindingProvisioner } = createTSKServer();
+  const bindingProvisioned = await bindingProvisioner.provision({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+  if (!bindingProvisioned.ok || !bindingProvisioned.tumblerMap) throw new Error('binding exception fixture provision failed');
+  const bindingMap = bindingProvisioned.tumblerMap;
+  const bindingReq: TSKRequestData = { headers: {
+    'x-tsk-client-id': bindingMap.clientId,
+    'x-tsk-key': generateKeyFromMap(bindingMap),
+    'x-tsk-version': '1',
+  } };
+  const bindingThrow = await verifyUltraRequest(bindingReq, bpcPass('pair-binding-throw'), {
+    tskStore: bindingStore,
+    identityBinding: { resolve: async () => { throw new Error('directory credential: never expose'); } },
+  });
+  assert('binding resolver exception is contained as unknown',
+    !bindingThrow.ok && bindingThrow.error === 'IDENTITY_BINDING_UNKNOWN' && bindingThrow.outcomeUnknown === true,
+    `Got: ${JSON.stringify(bindingThrow)}`);
+  assert('binding resolver exception exposes no thrown text',
+    !JSON.stringify(bindingThrow).includes('credential'), `Got: ${JSON.stringify(bindingThrow)}`);
+  assert('binding resolver exception does not reach TSK',
+    (await bindingStore.get(bindingMap.clientId))?.requestCount === 0, 'TSK request count changed');
+
+  const { store: afterCommitStore, provisioner: afterCommitProvisioner } = createTSKServer();
+  const afterCommitProvisioned = await afterCommitProvisioner.provision({ keyLength: 64, minTumblers: 2, maxTumblers: 2 });
+  if (!afterCommitProvisioned.ok || !afterCommitProvisioned.tumblerMap) throw new Error('after-commit exception fixture provision failed');
+  const afterCommitMap = afterCommitProvisioned.tumblerMap;
+  const actualCommit = afterCommitStore.commitValidation.bind(afterCommitStore);
+  afterCommitStore.commitValidation = async (id, input) => {
+    await actualCommit(id, input);
+    throw new Error('store receipt secret: never expose');
+  };
+  const afterCommit = await verifyUltraRequest({ headers: {
+    'x-tsk-client-id': afterCommitMap.clientId,
+    'x-tsk-key': generateKeyFromMap(afterCommitMap),
+    'x-tsk-version': '1',
+  } }, bpcPass('pair-after-commit'), {
+    tskStore: afterCommitStore,
+    identityBinding: { resolve: async pair => pair === 'pair-after-commit' ? afterCommitMap.clientId : null },
+  });
+  assert('TSK/store exception after commit is contained as unknown',
+    !afterCommit.ok && afterCommit.error === 'TSK: VERIFICATION_UNKNOWN' && afterCommit.outcomeUnknown === true,
+    `Got: ${JSON.stringify(afterCommit)}`);
+  assert('TSK/store exception exposes no thrown text',
+    !JSON.stringify(afterCommit).includes('secret'), `Got: ${JSON.stringify(afterCommit)}`);
+  assert('post-commit exception retains exactly one observed TSK consumption',
+    (await afterCommitStore.get(afterCommitMap.clientId))?.requestCount === 1, 'Expected one consumed request');
+
+  const response = new class {
+    headersSent = false; statusCode = 0; payload = ''; readonly headers = new Map<string, unknown>();
+    setHeader(name: string, value: unknown) { this.headers.set(name, value); }
+    writeHead(status: number) { this.statusCode = status; this.headersSent = true; return this; }
+    end(body?: unknown) { this.payload = String(body ?? ''); }
+  }();
+  const httpResult = await authenticateBpcTskHttpRequest(
+    { headers: { 'x-request-id': 'exception-boundary-test' }, socket: { remoteAddress: '127.0.0.1' } } as any,
+    response as any,
+    {
+      store: new MemoryTumblerStore(),
+      bpcVerify: async () => { throw new Error('HTTP boundary secret: never expose'); },
+      identityBinding: { resolve: async () => null },
+    },
+  );
+  assert('HTTP adapter retains generic 401 failure shape for contained exception',
+    httpResult === null && response.statusCode === 401 && response.payload.includes('BPC_TSK_AUTHENTICATION_FAILED'),
+    `Got: ${response.statusCode} ${response.payload}`);
+  assert('HTTP adapter response exposes no thrown text', !response.payload.includes('secret'), `Got: ${response.payload}`);
 }
 // ─── Results ──────────────────────────────────────────────────────────────────
 

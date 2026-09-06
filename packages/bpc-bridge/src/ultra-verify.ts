@@ -65,6 +65,12 @@ export interface UltraVerifyResult {
   layers: ('bpc' | 'tsk')[];
   error?: string;
   /**
+   * The verifier boundary failed after a request may have reached a
+   * replay-sensitive component. Callers must preserve the operation and must
+   * not infer denial, authentication, or permission to replay.
+   */
+  outcomeUnknown?: true;
+  /**
    * HIGH-03 FIX: The BPC scope that was verified and is now propagated to
    * the caller. Callers MUST use this scope to enforce access control on
    * the downstream resource — the TSK layer alone does not enforce scope.
@@ -107,7 +113,17 @@ export async function verifyUltraRequest(
   options: UltraVerifyOptions,
 ): Promise<UltraVerifyResult> {
   // --- Layers 1-5: BPC ---
-  const bpcResult = await bpcVerify(req);
+  let bpcResult: BPCLikeResult;
+  try {
+    bpcResult = await bpcVerify(req);
+  } catch {
+    return {
+      ok: false,
+      error: 'BPC: VERIFICATION_UNKNOWN',
+      outcomeUnknown: true,
+      layers: [],
+    };
+  }
   if (!bpcResult.ok) {
     return {
       ok: false,
@@ -152,7 +168,18 @@ export async function verifyUltraRequest(
     };
   }
 
-  const expectedClientId = await options.identityBinding.resolve(pairId);
+  let expectedClientId: string | null;
+  try {
+    expectedClientId = await options.identityBinding.resolve(pairId);
+  } catch {
+    return {
+      ok: false,
+      pairId,
+      error: 'IDENTITY_BINDING_UNKNOWN',
+      outcomeUnknown: true,
+      layers: ['bpc'],
+    };
+  }
   if (!expectedClientId) {
     return {
       ok: false,
@@ -172,7 +199,18 @@ export async function verifyUltraRequest(
   }
 
   // --- Layers 6-7: TSK ---
-  const tskResult: TSKVerifyResult = await verifyTSKRequest(req, options.tskStore, options.tskConfig);
+  let tskResult: TSKVerifyResult;
+  try {
+    tskResult = await verifyTSKRequest(req, options.tskStore, options.tskConfig);
+  } catch {
+    return {
+      ok: false,
+      pairId,
+      error: 'TSK: VERIFICATION_UNKNOWN',
+      outcomeUnknown: true,
+      layers: ['bpc'],
+    };
+  }
   if (!tskResult.ok) {
     return {
       ok: false,
@@ -191,6 +229,7 @@ export async function verifyUltraRequest(
       pairId,
       clientId: tskResult.clientId,
       error: 'IDENTITY_BINDING_UNAVAILABLE',
+      outcomeUnknown: true,
       layers: ['bpc', 'tsk'],
     };
   }
@@ -200,6 +239,7 @@ export async function verifyUltraRequest(
       pairId,
       clientId: tskResult.clientId,
       error: 'IDENTITY_BINDING_MISMATCH',
+      outcomeUnknown: true,
       layers: ['bpc', 'tsk'],
     };
   }
